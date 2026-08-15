@@ -25,6 +25,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -56,6 +57,16 @@ func main() {
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "freebuff-proxy: invalid config:", err)
 		os.Exit(1)
+	}
+
+	// Vercel / generic container runtimes inject the per-instance listen
+	// port via PORT (a bare number, e.g. "44465"). The platform health check
+	// dials exactly that port, so prefer it over LISTEN_ADDR whenever PORT is
+	// present; LISTEN_ADDR remains the fallback for local / self-hosted runs.
+	if port := strings.TrimSpace(os.Getenv("PORT")); port != "" {
+		if port = strings.TrimPrefix(port, ":"); port != "" {
+			cfg.ListenAddr = ":" + port
+		}
 	}
 
 	// Effective log level: LOG_LEVEL config wins, else -v → debug, else info.

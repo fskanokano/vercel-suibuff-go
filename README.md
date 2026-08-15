@@ -19,7 +19,7 @@ codebuff.com 上游
 ## 为什么 Vercel Go Framework Preset
 
 - **原生 Linux 容器**（非 WASM）：uTLS TLS 指纹、SOCKS5/HTTP 代理全部可用 —— stealth 层完整保留
-- **零源码改动**：`LISTEN_ADDR=:$PORT`（环境变量覆盖）。唯一新增的是根目录 `main.go` —— Vercel Go preset 只识别根级入口（`main.go`/`cmd/api/main.go`/`cmd/server/main.go`），而上游入口在 `cmd/freebuff-proxy/main.go`，所以根目录提供一个**精简镜像入口**（完整代理能力，去掉云上无意义的 `-doctor/-update/-setup`），`internal/` 全部原样
+- **零源码改动**：`internal/` 全部原样。唯一新增的是根目录 `main.go` —— Vercel Go preset 只识别根级入口（`main.go`/`cmd/api/main.go`/`cmd/server/main.go`），而上游入口在 `cmd/freebuff-proxy/main.go`，所以根目录提供一个**精简镜像入口**（完整代理能力，去掉云上无意义的 `-doctor/-update/-setup`，并遵循 12-factor：`PORT` 存在时优先监听它）
 - **免费**（Hobby）：100 万 Function Invocations/月 + 360 GB-h + 4 CPU-h + 100 GB 带宽，美东 `iad1` 出口，**无需绑卡**
 - **限制**：单次请求最长 300s（含 SSE 流式，单次 AI 推理足够）；实例空闲 scale-to-zero → 内存态会话/run 池会被重置（每次冷启动重新握手，功能不受影响）
 
@@ -32,7 +32,6 @@ codebuff.com 上游
 3. **Environment Variables**（Settings → Environment Variables）：
    | 变量 | 必填 | 说明 |
    |---|---|---|
-   | `LISTEN_ADDR` | ✅ | `:3000`（Vercel 注入 PORT） |
    | `AUTH_TOKENS` | 二选一 | `cb_...`，多个逗号分隔（Pooled 模式） |
    | （不设 `AUTH_TOKENS`） | 二选一 | Bridge 模式：客户端自带上游 token |
    | `AUTO_DISCOVER_TOKEN` | ✅ | `false`（云上没有本地 CLI 登录文件） |
@@ -48,7 +47,7 @@ curl -H "Authorization: Bearer <key>" https://<your-project>.vercel.app/v1/model
 
 ```bash
 npm i -g vercel
-vercel env add LISTEN_ADDR        # :3000
+vercel env add AUTH_TOKENS        # cb_...
 vercel env add AUTH_TOKENS        # cb_...
 vercel env add AUTO_DISCOVER_TOKEN  # false
 vercel --prod
@@ -70,7 +69,7 @@ export OPENAI_API_KEY=<API_KEYS 或 cb_ token>
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `LISTEN_ADDR` | `127.0.0.1:3457` | **必须**设为 `:3000`（绑平台 PORT） |
+| `LISTEN_ADDR` | `127.0.0.1:3457` | 无需设置；Vercel 注入 `PORT` 时优先监听它（本地自建才需要） |
 | `AUTH_TOKENS` | 空 | Pooled 模式 token 列表；空 = Bridge 模式 |
 | `AUTO_DISCOVER_TOKEN` | true | **必须**设为 `false` |
 | `API_KEYS` | 空 | 代理自身客户端鉴权 |
