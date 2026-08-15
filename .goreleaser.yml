@@ -1,0 +1,39 @@
+# GoReleaser configuration (v2) — cross-compiled release binaries + SBOM.
+# Docs: https://goreleaser.com
+version: 2
+
+project_name: freebuff-proxy
+
+builds:
+  - id: freebuff-proxy
+    main: ./cmd/freebuff-proxy
+    binary: freebuff-proxy
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w -X main.version={{.Version}}
+
+archives:
+  - name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    files:
+      - LICENSE
+      - .env.example
+checksum:
+  name_template: "checksums.txt"
+
+release:
+  draft: false
+  github:
+    owner: trefeon
+    name: freebuff-proxy

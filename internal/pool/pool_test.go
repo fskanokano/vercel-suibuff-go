@@ -1,0 +1,1668 @@
+package pool
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"freebuff-proxy/internal/config"
+	"freebuff-proxy/internal/registry"
+	"freebuff-proxy/internal/session"
+	"freebuff-proxy/internal/testutil"
+	"freebuff-proxy/internal/upstream"
+)
+
+// Test models must map to agents with EXCLUSIVE ownership in the registry
+// FALLBACK map (see internal/registry/registry_test.go expectedFallback):
+// the five base2-free models are first-seen-assigned to the generic
+// base2-free agent, while glm-5.2 and laguna-s-2.1 are owned by their
+// dedicated one-model agents. Tests pin the offline (fallback) state.
+const (
+	modelA = "z-ai/glm-5.2"
+	modelB = "poolside/laguna-s-2.1"
+	agentA = "base2-free-glm"
+	agentB = "base2-free-laguna-s-2-1"
+)
+
+// newTestPool wires one mock upstream per token through real clients and
+// session managers, backed by the registry fallback map.
+func newTestPool(t *testing.T, mocks ...*testutil.MockUpstream) *Pool {
+	return newTestPoolCfg(t, nil, mocks...)
+}
+
+// newTestPoolCfg is newTestPool with a config mutation hook (e.g. enabling
+// TRANSIENT_RETRIES / TLS_FINGERPRINT for retry tests).
+func newTestPoolCfg(t *testing.T, mut func(*config.Config), mocks ...*testutil.MockUpstream) *Pool {
+	t.Helper()
+	cfg := &config.Config{
+		AuthTokens:         make([]string, len(mocks)),
+		RotationInterval:   time.Hour,
+		RequestTimeout:     15 * time.Minute,
+		SessionCallTimeout: 5 * time.Second,
+		RegistryRefresh:    6 * time.Hour,
+		UpstreamBaseURL:    "https://www.codebuff.com",
+	}
+	if mut != nil {
+		mut(cfg)
+	}
+	clients := make([]*upstream.Client, 0, len(mocks))
+	sessions := make([]*session.Manager, 0, len(mocks))
+	for i, mock := range mocks {
+		cfg.AuthTokens[i] = fmt.Sprintf("tok-%d", i)
+		clientCfg := *cfg
+		clientCfg.UpstreamBaseURL = mock.URL()
+		client, err := upstream.New(cfg.AuthTokens[i], &clientCfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		clients = append(clients, client)
+		sessions = append(sessions, session.NewManager(client))
+	}
+	reg := registry.New(cfg, nil)
+	reg.LoadFallback()
+	p, err := New(cfg, clients, sessions, reg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+func TestNewLengthMismatch(t *testing.T) {
+	cfg := &config.Config{AuthTokens: []string{"a", "b"}, RotationInterval: time.Hour}
+	if _, err := New(cfg, nil, nil, registry.New(cfg, nil)); err == nil {
+		t.Fatal("want error for client/session count mismatch")
+	}
+}
+
+func TestRoundRobinDistribution(t *testing.T) {
+	mock0 := testutil.NewMock()
+	defer mock0.Close()
+	mock1 := testutil.NewMock()
+	defer mock1.Close()
+	p := newTestPool(t, mock0, mock1)
+
+	// Strict round-robin only applies while no token holds a live session:
+	// hot-session-first selection routes every acquire to a live session
+	// once one exists. Invalidate both cached sessions before each acquire
+	// so the cold path is exercised, and assert the historical order is
+	// unchanged (selection-order change must not regress cold failover).
+	const n = 6
+	got := make([]int, n)
+	for i := 0; i < n; i++ {
+		p.InvalidateSession(0)
+		p.InvalidateSession(1)
+		lease, err := p.Acquire(context.Background(), modelA)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got[i] = lease.Token
+		if lease.AgentID != agentA {
+			t.Errorf("lease agent = %q, want %q", lease.AgentID, agentA)
+		}
+		p.LeaseRelease(lease)
+	}
+	for i, want := range []int{0, 1, 0, 1, 0, 1} {
+		if got[i] != want {
+			t.Errorf("acquire %d token = %d, want %d", i, got[i], want)
+		}
+	}
+	// Both tokens created the run for the agent exactly once (runs survive
+	// session invalidation).
+	for i, mock := range []*testutil.MockUpstream{mock0, mock1} {
+		if len(mock.StartedRuns) != 1 || mock.StartedRuns[0] != agentA {
+			t.Errorf("mock%d started runs = %v, want [%s]", i, mock.StartedRuns, agentA)
+		}
+		if len(mock.FinishedRuns) != 0 {
+			t.Errorf("mock%d finished runs = %v, want none", i, mock.FinishedRuns)
+		}
+	}
+
+	snaps := p.Snapshot()
+	for i, snap := range snaps {
+		if snap.ActiveRuns != 1 || snap.Requests != 3 {
+			t.Errorf("token %d snapshot: active=%d requests=%d, want 1/3", i, snap.ActiveRuns, snap.Requests)
+		}
+	}
+	// The last acquire (round-robin start 1) re-created token 1's session
+	// fresh; token 0's was invalidated before it and is gone. Every acquire
+	// admitted a fresh session: the cold path never reused a live one (3
+	// creates per token, one per acquire).
+	if snaps[1].SessionStatus != "active" || snaps[1].SessionInstanceID != "inst-abc-123" {
+		t.Errorf("token 1 session snapshot = %q/%q, want active/inst-abc-123", snaps[1].SessionStatus, snaps[1].SessionInstanceID)
+	}
+	if mock0.SessionCreates != 3 || mock1.SessionCreates != 3 {
+		t.Errorf("session creates = %d/%d, want 3/3 (cold path only)", mock0.SessionCreates, mock1.SessionCreates)
+	}
+}
+
+func TestAcquirePrefersTokenWithLiveSession(t *testing.T) {
+	mock1 := testutil.NewMock() // token 1 (index 0): will hold the live session
+	defer mock1.Close()
+	mock2 := testutil.NewMock() // token 2 (index 1): stays fresh
+	defer mock2.Close()
+	p := newTestPool(t, mock1, mock2)
+
+	// First acquire lands on token 1 (round-robin start) and admits its
+	// session; token 2 remains fresh.
+	first, err := p.Acquire(context.Background(), modelA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Token != 0 {
+		t.Fatalf("first lease token = %d, want 0", first.Token)
+	}
+	p.LeaseRelease(first)
+	if mock1.SessionCreates != 1 {
+		t.Fatalf("token 1 session creates = %d, want 1", mock1.SessionCreates)
+	}
+	if mock2.SessionCreates != 0 {
+		t.Fatalf("token 2 session creates = %d, want 0", mock2.SessionCreates)
+	}
+
+	// Successive acquires all land on token 1 (hot-session-first): its live
+	// session is reused and token 2 never gets a session admitted — the
+	// round-robin start alternates back to token 2, but the hot token wins.
+	for i := 0; i < 5; i++ {
+		lease, err := p.Acquire(context.Background(), modelA)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if lease.Token != 0 {
+			t.Errorf("acquire %d token = %d, want 0 (hot-session-first)", i, lease.Token)
+		}
+		p.LeaseRelease(lease)
+	}
+	if mock2.SessionCreates != 0 {
+		t.Errorf("token 2 session creates = %d, want 0 (never admitted)", mock2.SessionCreates)
+	}
+	if got := mock2.StartedRunsSnapshot(); len(got) != 0 {
+		t.Errorf("token 2 started runs = %v, want none", got)
+	}
+
+	// Cool token 1 down: the next acquire falls back to token 2 and admits
+	// its session on demand.
+	p.CooldownToken(0, time.Hour)
+	lease, err := p.Acquire(context.Background(), modelA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lease.Token != 1 {
+		t.Errorf("lease token = %d, want 1 (cold fallback after cooldown)", lease.Token)
+	}
+	p.LeaseRelease(lease)
+	if mock2.SessionCreates != 1 {
+		t.Errorf("token 2 session creates = %d, want 1 after token 1 cooldown", mock2.SessionCreates)
+	}
+}
+
+func TestFailoverOnAuthReject(t *testing.T) {
+	bad := testutil.NewMock() // token-1: 401 on every route
+	defer bad.Close()
+	bad.AuthReject = true
+	good := testutil.NewMock() // token-2: healthy
+	defer good.Close()
+	p := newTestPool(t, bad, good)
+
+	lease, err := p.Acquire(context.Background(), modelA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lease.Token != 1 {
+		t.Errorf("lease token = %d, want 1 (failover to healthy)", lease.Token)
+	}
+	if lease.SessionInstanceID != "inst-abc-123" {
+		t.Errorf("session instance = %q, want inst-abc-123", lease.SessionInstanceID)
+	}
+	p.LeaseRelease(lease)
+
+	if len(bad.StartedRuns) != 0 {
+		t.Errorf("rejecting token started runs: %v", bad.StartedRuns)
+	}
+	if len(good.StartedRuns) != 1 {
+		t.Errorf("healthy token started runs = %v, want 1", good.StartedRuns)
+	}
+
+	// The dead token must be on a 30-min cooldown; subsequent acquires skip
+	// it entirely (round-robin returns to it on the 3rd acquire).
+	snap := p.Snapshot()[0]
+	if snap.CooldownUntil.Before(time.Now().Add(29 * time.Minute)) {
+		t.Errorf("cooldown until = %v, want ~now+30m", snap.CooldownUntil)
+	}
+	for i := 0; i < 2; i++ {
+		lease, err := p.Acquire(context.Background(), modelA)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if lease.Token != 1 {
+			t.Errorf("acquire %d token = %d, want 1 (dead token skipped)", i, lease.Token)
+		}
+		p.LeaseRelease(lease)
+	}
+	if len(good.StartedRuns) != 1 {
+		t.Errorf("healthy token re-STARTed: %v", good.StartedRuns)
+	}
+}
+
+func TestWaitingRoomBestPosition(t *testing.T) {
+	mock0 := testutil.NewMock()
+	defer mock0.Close()
+	mock0.SessionMode = "queued"
+	mock0.QueuePosition = 3
+	mock0.QueueDepth = 7
+	mock0.EstimatedWaitMs = 5000
+	mock1 := testutil.NewMock()
+	defer mock1.Close()
+	mock1.SessionMode = "queued"
+	mock1.QueuePosition = 1
+	mock1.QueueDepth = 9
+	mock1.EstimatedWaitMs = 5000
+	p := newTestPool(t, mock0, mock1)
+
+	_, err := p.Acquire(context.Background(), modelA)
+	var wr *session.WaitingRoomError
+	if !errors.As(err, &wr) {
+		t.Fatalf("want session.WaitingRoomError, got %v", err)
+	}
+	if wr.Position != 1 || wr.QueueDepth != 9 {
+		t.Errorf("waiting room = position %d depth %d, want 1/9 (best position)", wr.Position, wr.QueueDepth)
+	}
+	if wr.RetryAfter < 4*time.Second {
+		t.Errorf("RetryAfter = %s, want ~5s", wr.RetryAfter)
+	}
+}
+
+func TestWaitingRoomTieBreaksByQueueDepth(t *testing.T) {
+	mock0 := testutil.NewMock()
+	defer mock0.Close()
+	mock0.SessionMode = "queued"
+	mock0.QueuePosition = 3
+	mock0.QueueDepth = 7
+	mock0.EstimatedWaitMs = 5000
+	mock1 := testutil.NewMock()
+	defer mock1.Close()
+	mock1.SessionMode = "queued"
+	mock1.QueuePosition = 3
+	mock1.QueueDepth = 4
+	mock1.EstimatedWaitMs = 5000
+	p := newTestPool(t, mock0, mock1)
+
+	_, err := p.Acquire(context.Background(), modelA)
+	var wr *session.WaitingRoomError
+	if !errors.As(err, &wr) {
+		t.Fatalf("want session.WaitingRoomError, got %v", err)
+	}
+	if wr.Position != 3 || wr.QueueDepth != 4 {
+		t.Errorf("waiting room = position %d depth %d, want 3/4 (lowest depth on tie)", wr.Position, wr.QueueDepth)
+	}
+}
+
+func TestAllFailedCombinedError(t *testing.T) {
+	mock0 := testutil.NewMock()
+	defer mock0.Close()
+	mock0.AuthReject = true
+	mock1 := testutil.NewMock()
+	defer mock1.Close()
+	mock1.AuthReject = true
+	p := newTestPool(t, mock0, mock1)
+
+	_, err := p.Acquire(context.Background(), modelA)
+	if err == nil {
+		t.Fatal("want combined error")
+	}
+	if !strings.Contains(err.Error(), "unable to acquire run from any token") {
+		t.Errorf("error = %q, want combined-error prefix", err)
+	}
+	for _, tok := range []string{"token-1", "token-2"} {
+		if !strings.Contains(err.Error(), tok) {
+			t.Errorf("combined error missing %s: %q", tok, err)
+		}
+	}
+	for _, snap := range p.Snapshot() {
+		if snap.CooldownUntil.Before(time.Now().Add(29 * time.Minute)) {
+			t.Errorf("token %d not cooled down: %v", snap.Token, snap.CooldownUntil)
+		}
+	}
+}
+
+func TestWaitingRoomOnlyWhenEveryTokenQueued(t *testing.T) {
+	mock0 := testutil.NewMock()
+	defer mock0.Close()
+	mock0.SessionMode = "queued"
+	mock0.QueuePosition = 2
+	mock0.QueueDepth = 5
+	mock0.EstimatedWaitMs = 5000
+	mock1 := testutil.NewMock()
+	defer mock1.Close()
+	mock1.AuthReject = true
+	p := newTestPool(t, mock0, mock1)
+
+	_, err := p.Acquire(context.Background(), modelA)
+	if err == nil {
+		t.Fatal("want error")
+	}
+	var wr *session.WaitingRoomError
+	if errors.As(err, &wr) {
+		t.Fatalf("waiting-room error surfaced although only one token is queued: %v", err)
+	}
+	if !strings.Contains(err.Error(), "unable to acquire run from any token") {
+		t.Errorf("error = %q, want combined error", err)
+	}
+}
+
+func TestSessionInstanceIDOnLease(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	p := newTestPool(t, mock)
+
+	lease, err := p.Acquire(context.Background(), modelA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lease.SessionInstanceID != "inst-abc-123" {
+		t.Errorf("instance = %q, want inst-abc-123", lease.SessionInstanceID)
+	}
+	p.LeaseRelease(lease)
+}
+
+func TestPoolSnapshotQuotaByModel(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mock.RateLimitsByModel = map[string]any{
+		"z-ai/glm-5.2": map[string]any{
+			"model":       "z-ai/glm-5.2",
+			"limit":       5,
+			"recentCount": 4,
+			"period":      "pacific_day",
+			"resetAt":     "2026-08-16T07:00:00.000Z",
+			"entitlementBreakdown": map[string]any{
+				"base":     1,
+				"referral": 1,
+				"streak":   3,
+			},
+		},
+	}
+	p := newTestPool(t, mock)
+
+	// Acquire admits the session (with rateLimitsByModel); the lease is left
+	// unreleased so the session cache stays populated for Snapshot().
+	lease, err := p.Acquire(context.Background(), modelA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = lease
+
+	snaps := p.Snapshot()
+	if len(snaps) != 1 {
+		t.Fatalf("snapshots = %d, want 1", len(snaps))
+	}
+	q, ok := snaps[0].QuotaByModel["z-ai/glm-5.2"]
+	if !ok {
+		t.Fatalf("QuotaByModel missing z-ai/glm-5.2: %+v", snaps[0].QuotaByModel)
+	}
+	if q.Limit != 5 || q.RecentCount != 4 {
+		t.Errorf("quota limit/recentCount = %v/%v, want 5/4", q.Limit, q.RecentCount)
+	}
+	if q.Period != "pacific_day" {
+		t.Errorf("period = %q, want pacific_day", q.Period)
+	}
+	if q.ResetAt.IsZero() {
+		t.Error("resetAt not surfaced")
+	}
+	if q.Entitlement["referral"] != 1 {
+		t.Errorf("entitlement = %+v, want referral=1", q.Entitlement)
+	}
+	if len(snaps[0].Entitlement) != 0 {
+		t.Errorf("top-level Entitlement = %+v, want empty", snaps[0].Entitlement)
+	}
+}
+
+func TestDisabledSessionLease(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mock.SessionMode = "disabled"
+	p := newTestPool(t, mock)
+
+	lease, err := p.Acquire(context.Background(), modelA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lease.SessionInstanceID != "" {
+		t.Errorf("instance = %q, want empty for disabled session", lease.SessionInstanceID)
+	}
+	p.LeaseRelease(lease)
+}
+
+func TestInvalidateSessionRecreates(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	p := newTestPool(t, mock)
+
+	lease, err := p.Acquire(context.Background(), modelA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.LeaseRelease(lease)
+	if mock.SessionCreates != 1 {
+		t.Fatalf("session creates = %d, want 1", mock.SessionCreates)
+	}
+
+	p.InvalidateSession(lease.Token)
+	lease2, err := p.Acquire(context.Background(), modelA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.LeaseRelease(lease2)
+	if mock.SessionCreates != 2 {
+		t.Errorf("session creates = %d, want 2 (recreated after invalidate)", mock.SessionCreates)
+	}
+	if lease2.SessionInstanceID != "inst-abc-123" {
+		t.Errorf("recreated instance = %q, want inst-abc-123", lease2.SessionInstanceID)
+	}
+
+	// Out-of-range tokens are ignored without panicking.
+	p.InvalidateSession(-1)
+	p.InvalidateSession(99)
+}
+
+func TestInvalidateRunRestarts(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	p := newTestPool(t, mock)
+
+	lease, err := p.Acquire(context.Background(), modelA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.LeaseRelease(lease)
+	if len(mock.StartedRuns) != 1 {
+		t.Fatalf("started runs = %v, want 1", mock.StartedRuns)
+	}
+
+	p.InvalidateRun(lease.Token, lease.AgentID)
+	lease2, err := p.Acquire(context.Background(), modelA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.LeaseRelease(lease2)
+	if len(mock.StartedRuns) != 2 {
+		t.Errorf("started runs = %d, want 2 (restart after invalidate)", len(mock.StartedRuns))
+	}
+	if len(mock.FinishedRuns) != 0 {
+		t.Errorf("finished runs = %v, want none (invalidated run is not FINISHed)", mock.FinishedRuns)
+	}
+
+	// Out-of-range tokens are ignored without panicking.
+	p.InvalidateRun(-1, agentA)
+	p.InvalidateRun(99, agentA)
+}
+
+func TestCooldownToken(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	p := newTestPool(t, mock)
+
+	p.CooldownToken(0, time.Hour)
+	snap := p.Snapshot()[0]
+	if snap.CooldownUntil.Before(time.Now().Add(59 * time.Minute)) {
+		t.Errorf("cooldown until = %v, want ~now+1h", snap.CooldownUntil)
+	}
+
+	_, err := p.Acquire(context.Background(), modelA)
+	if err == nil {
+		t.Fatal("want error while the only token is cooling down")
+	}
+	if !strings.Contains(err.Error(), "cooling down") {
+		t.Errorf("error = %q, want cooldown message", err)
+	}
+
+	// Out-of-range tokens are ignored without panicking.
+	p.CooldownToken(99, time.Hour)
+	p.CooldownToken(-1, time.Hour)
+}
+
+func TestAcquireRateLimitCooldowns(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mock.RateLimit = true
+	p := newTestPool(t, mock)
+
+	_, err := p.Acquire(context.Background(), modelA)
+	var rle *upstream.RateLimitError
+	if !errors.As(err, &rle) {
+		t.Fatalf("want *upstream.RateLimitError, got %v", err)
+	}
+	if rle.RetryAfter != 48549499*time.Millisecond {
+		t.Errorf("RetryAfter = %s, want 48549499ms", rle.RetryAfter)
+	}
+	if rle.Limit != 6 || rle.RecentCount != 6.6 {
+		t.Errorf("quota = %v/%v, want 6/6.6", rle.RecentCount, rle.Limit)
+	}
+
+	// The token cooled down for the upstream retry window, so subsequent
+	// acquires skip it AND still surface the remembered 429 (not a generic
+	// combined error) — the client keeps getting Retry-After.
+	snap := p.Snapshot()[0]
+	if snap.CooldownUntil.Before(time.Now().Add(13 * time.Hour)) {
+		t.Errorf("cooldown until = %v, want ~now+13.5h", snap.CooldownUntil)
+	}
+	_, err = p.Acquire(context.Background(), modelA)
+	var rle2 *upstream.RateLimitError
+	if !errors.As(err, &rle2) {
+		t.Fatalf("second acquire: want *upstream.RateLimitError, got %v", err)
+	}
+	if rle2.RetryAfter != 48549499*time.Millisecond {
+		t.Errorf("second acquire RetryAfter = %s, want 48549499ms (remembered)", rle2.RetryAfter)
+	}
+}
+
+func TestAcquireRateLimitBestWindow(t *testing.T) {
+	// Both tokens rate-limited with different windows: the pool surfaces the
+	// longest one (the token that unblocks last bounds the wait).
+	mock0 := testutil.NewMock()
+	defer mock0.Close()
+	mock0.RateLimit = true
+	mock1 := testutil.NewMock()
+	defer mock1.Close()
+	mock1.RateLimit = true
+	p := newTestPool(t, mock0, mock1)
+
+	_, err := p.Acquire(context.Background(), modelA)
+	var rle *upstream.RateLimitError
+	if !errors.As(err, &rle) {
+		t.Fatalf("want *upstream.RateLimitError, got %v", err)
+	}
+	if rle.RetryAfter != 48549499*time.Millisecond {
+		t.Errorf("RetryAfter = %s, want 48549499ms (best window)", rle.RetryAfter)
+	}
+	if err.Error() == "" || !strings.Contains(err.Error(), "upstream rate limited") {
+		t.Errorf("error = %q, want rate-limit message", err)
+	}
+}
+
+func TestAcquireBanCooldowns(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mock.Ban = true
+	p := newTestPool(t, mock)
+
+	_, err := p.Acquire(context.Background(), modelA)
+	var be *upstream.BanError
+	if !errors.As(err, &be) {
+		t.Fatalf("want *upstream.BanError, got %v", err)
+	}
+	if !errors.Is(err, upstream.ErrBanned) {
+		t.Errorf("errors.Is(ErrBanned) = false")
+	}
+
+	// The token cooled down for the ban window, so subsequent acquires skip
+	// it AND still surface the remembered 403 banned.
+	snap := p.Snapshot()[0]
+	if snap.CooldownUntil.Before(time.Now().Add(59 * time.Minute)) {
+		t.Errorf("cooldown until = %v, want ~now+1h", snap.CooldownUntil)
+	}
+	_, err = p.Acquire(context.Background(), modelA)
+	var be2 *upstream.BanError
+	if !errors.As(err, &be2) {
+		t.Fatalf("second acquire: want *upstream.BanError, got %v", err)
+	}
+	if !errors.Is(err, upstream.ErrBanned) {
+		t.Errorf("second acquire errors.Is(ErrBanned) = false")
+	}
+}
+
+func TestPoolChat(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mock.ChatBody = testutil.SSEEvent(`{"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"` + modelA + `","choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":"stop"}]}`)
+	p := newTestPool(t, mock)
+
+	lease, err := p.Acquire(context.Background(), modelA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.LeaseRelease(lease)
+
+	opts := upstream.ChatOptions{Model: modelA, RunID: lease.Run.RunID, SessionInstanceID: lease.SessionInstanceID}
+	body := []byte(`{"model":"` + modelA + `","messages":[{"role":"user","content":"ping"}]}`)
+	rc, err := p.Chat(context.Background(), lease, opts, body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := io.ReadAll(rc)
+	_ = rc.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(got), `"content":"hi"`) {
+		t.Errorf("stream = %q, want content chunk", got)
+	}
+
+	// The chat went out with the CLI envelope on the leased token.
+	if len(mock.RecordedChatBodies) != 1 {
+		t.Fatalf("upstream chat calls = %d, want 1", len(mock.RecordedChatBodies))
+	}
+	recorded := mock.RecordedChatBodies[0]
+	for _, want := range []string{`"codebuff_metadata"`, `"data_collection":"deny"`, `"stream":true`, `"stop":["cb_easp"]`} {
+		if !strings.Contains(recorded, want) {
+			t.Errorf("upstream body missing %s: %s", want, recorded)
+		}
+	}
+	if !strings.Contains(recorded, `"run_id":"run-0001"`) {
+		t.Errorf("upstream body missing the leased run id: %s", recorded)
+	}
+	h := mock.RecordedChatHeaders[0]
+	if got := h.Get("x-freebuff-model"); got != modelA {
+		t.Errorf("x-freebuff-model = %q, want %q", got, modelA)
+	}
+	if got := h.Get("x-freebuff-instance-id"); got != "inst-abc-123" {
+		t.Errorf("x-freebuff-instance-id = %q, want inst-abc-123", got)
+	}
+
+	// Invalid leases fail without panicking.
+	if _, err := p.Chat(context.Background(), nil, opts, body); err == nil {
+		t.Error("want error for nil lease")
+	}
+	if _, err := p.Chat(context.Background(), &Lease{Token: 99}, opts, body); err == nil {
+		t.Error("want error for out-of-range lease token")
+	}
+}
+
+func TestUnknownModel(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	p := newTestPool(t, mock)
+
+	_, err := p.Acquire(context.Background(), "no/such-model")
+	if !errors.Is(err, registry.ErrModelNotFound) {
+		t.Fatalf("want registry.ErrModelNotFound, got %v", err)
+	}
+}
+
+func TestStartPrewarmsAndShutdownDrains(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	ids := make([]string, 100)
+	for i := range ids {
+		ids[i] = fmt.Sprintf("run-%04d", i)
+	}
+	mock.RunIDs = ids
+	p := newTestPool(t, mock)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	p.Start(ctx)
+	defer cancel()
+
+	// Prewarm runs in the background: wait until every registry agent has a
+	// STARTed run.
+	agentCount := len(p.regAgentIDs(t))
+	eventually(t, "prewarm of all agents", func() bool {
+		return len(mock.StartedRunsSnapshot()) >= agentCount
+	})
+
+	p.Shutdown(context.Background())
+
+	eventually(t, "shutdown drain FINISHes", func() bool {
+		return len(mock.FinishedRunsSnapshot()) >= agentCount
+	})
+	for _, f := range mock.FinishedRunsSnapshot() {
+		if f.Status != "completed" {
+			t.Errorf("run %s finished with status %q, want completed", f.RunID, f.Status)
+		}
+	}
+}
+
+// regAgentIDs re-reads the pool's registry agent list through a fresh
+// fallback registry (the pool does not export its registry).
+func (p *Pool) regAgentIDs(t *testing.T) []string {
+	t.Helper()
+	reg := registry.New(p.cfg, nil)
+	reg.LoadFallback()
+	return reg.AgentIDs()
+}
+
+func TestConcurrentAcquireHammer(t *testing.T) {
+	mocks := []*testutil.MockUpstream{testutil.NewMock(), testutil.NewMock(), testutil.NewMock()}
+	defer func() {
+		for _, m := range mocks {
+			m.Close()
+		}
+	}()
+	for _, m := range mocks {
+		ids := make([]string, 100)
+		for i := range ids {
+			ids[i] = fmt.Sprintf("run-%04d", i)
+		}
+		m.RunIDs = ids
+	}
+	p := newTestPool(t, mocks...)
+
+	models := []string{modelA, modelB}
+	const goroutines = 8
+	const perGoroutine = 25
+	var wg sync.WaitGroup
+	var failures atomicErr
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			for i := 0; i < perGoroutine; i++ {
+				lease, err := p.Acquire(context.Background(), models[(g+i)%len(models)])
+				if err != nil {
+					failures.set(err)
+					continue
+				}
+				p.LeaseRelease(lease)
+			}
+		}(g)
+	}
+	wg.Wait()
+
+	if err := failures.get(); err != nil {
+		t.Fatalf("acquire failed: %v", err)
+	}
+	// Hot-session-first selection concentrates traffic on tokens that
+	// already hold a live session, so the exact per-token distribution is
+	// interleaving-dependent. Assert the deterministic invariants instead:
+	// every acquire was served by a run, and both agents have runs on at
+	// least one token (each token holds at most one run per agent).
+	var totalRequests, activeRuns int
+	for _, snap := range p.Snapshot() {
+		totalRequests += snap.Requests
+		activeRuns += snap.ActiveRuns
+	}
+	if totalRequests != goroutines*perGoroutine {
+		t.Errorf("total requests = %d, want %d", totalRequests, goroutines*perGoroutine)
+	}
+	if activeRuns < 2 || activeRuns > len(mocks)*2 {
+		t.Errorf("active runs = %d, want within [2, %d] (both agents on at least one token)", activeRuns, len(mocks)*2)
+	}
+}
+
+// chatOnce sends one chat through the leased token against the mock
+// upstream and closes the body; used to accumulate successful chats for the
+// daily-cap tests.
+func chatOnce(t *testing.T, p *Pool, lease *Lease) {
+	t.Helper()
+	opts := upstream.ChatOptions{Model: modelA, RunID: lease.Run.RunID, SessionInstanceID: lease.SessionInstanceID}
+	body := []byte(`{"model":"` + modelA + `","messages":[{"role":"user","content":"ping"}]}`)
+	rc, err := p.Chat(context.Background(), lease, opts, body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = rc.Close()
+}
+
+func TestDailyMessageCap(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	p := newTestPool(t, mock)
+	p.cfg.MaxMessagesPerDay = 2
+
+	for i := 0; i < 2; i++ {
+		lease, err := p.Acquire(context.Background(), modelA)
+		if err != nil {
+			t.Fatal(err)
+		}
+		chatOnce(t, p, lease)
+		p.LeaseRelease(lease)
+	}
+	if got := p.Snapshot()[0].Messages24h; got != 2 {
+		t.Errorf("Messages24h = %d, want 2", got)
+	}
+
+	// The third acquire hits the cap: the only token is daily-limited, so
+	// the pool surfaces a 429 with the time until a slot frees.
+	_, err := p.Acquire(context.Background(), modelA)
+	var rle *upstream.RateLimitError
+	if !errors.As(err, &rle) {
+		t.Fatalf("want *upstream.RateLimitError for capped token, got %v", err)
+	}
+	if !errors.Is(err, upstream.ErrRateLimited) {
+		t.Error("errors.Is(ErrRateLimited) = false")
+	}
+	if rle.RetryAfter <= 0 || rle.RetryAfter > usageWindow {
+		t.Errorf("RetryAfter = %s, want within (0, 24h]", rle.RetryAfter)
+	}
+	if rle.Limit != 2 || rle.RecentCount != 2 {
+		t.Errorf("quota = %v/%v, want 2/2", rle.RecentCount, rle.Limit)
+	}
+	if !strings.Contains(err.Error(), "daily message limit reached") {
+		t.Errorf("error = %q, want daily-limit message", err)
+	}
+	if got := p.Snapshot()[0].Messages24h; got != 2 {
+		t.Errorf("Messages24h = %d, want 2 (usage still visible)", got)
+	}
+}
+
+func TestDailyMessageCapFailover(t *testing.T) {
+	mock0 := testutil.NewMock()
+	defer mock0.Close()
+	mock1 := testutil.NewMock()
+	defer mock1.Close()
+	p := newTestPool(t, mock0, mock1)
+	p.cfg.MaxMessagesPerDay = 1
+
+	// Round-robin: first acquire lands on token-1; cap it with a chat.
+	lease, err := p.Acquire(context.Background(), modelA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lease.Token != 0 {
+		t.Fatalf("first lease token = %d, want 0", lease.Token)
+	}
+	chatOnce(t, p, lease)
+	p.LeaseRelease(lease)
+
+	// Second acquire fails over to token-2 (token-1 is capped); cap it too.
+	lease, err = p.Acquire(context.Background(), modelA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lease.Token != 1 {
+		t.Fatalf("second lease token = %d, want 1 (failover to uncapped)", lease.Token)
+	}
+	chatOnce(t, p, lease)
+	p.LeaseRelease(lease)
+
+	// Both tokens capped: the pool surfaces the daily-limit 429 (not a
+	// combined error).
+	_, err = p.Acquire(context.Background(), modelA)
+	var rle *upstream.RateLimitError
+	if !errors.As(err, &rle) {
+		t.Fatalf("want *upstream.RateLimitError when every token is capped, got %v", err)
+	}
+	if rle.RetryAfter <= 0 || rle.RetryAfter > usageWindow {
+		t.Errorf("RetryAfter = %s, want within (0, 24h]", rle.RetryAfter)
+	}
+}
+
+func TestDailyMessageCapDisabled(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	p := newTestPool(t, mock) // MaxMessagesPerDay = 0: unlimited
+
+	for i := 0; i < 3; i++ {
+		lease, err := p.Acquire(context.Background(), modelA)
+		if err != nil {
+			t.Fatal(err)
+		}
+		chatOnce(t, p, lease)
+		p.LeaseRelease(lease)
+	}
+	lease, err := p.Acquire(context.Background(), modelA)
+	if err != nil {
+		t.Fatalf("acquire with cap 0 must not be limited, got %v", err)
+	}
+	p.LeaseRelease(lease)
+	if got := p.Snapshot()[0].Messages24h; got != 3 {
+		t.Errorf("Messages24h = %d, want 3 (usage still tracked)", got)
+	}
+}
+
+func TestIdleRotationFinishesRuns(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	p := newTestPool(t, mock)
+	p.cfg.IdleRotationTimeout = 10 * time.Millisecond
+
+	lease, err := p.Acquire(context.Background(), modelA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.LeaseRelease(lease)
+	if got := mock.StartedRunsSnapshot(); len(got) != 1 {
+		t.Fatalf("started runs = %v, want 1", got)
+	}
+
+	// Not idle yet: a maintain pass runs normally (no FINISH).
+	p.maintainTick(context.Background())
+	if got := mock.FinishedRunsSnapshot(); len(got) != 0 {
+		t.Fatalf("finished runs = %v before idle, want none", got)
+	}
+
+	// Past the idle threshold: one pass FINISHes all runs...
+	time.Sleep(30 * time.Millisecond)
+	p.maintainTick(context.Background())
+	finished := mock.FinishedRunsSnapshot()
+	if len(finished) != 1 || finished[0].Status != "completed" {
+		t.Fatalf("finished runs after idle = %v, want 1 completed", finished)
+	}
+
+	// ...and later idle passes stay dormant (no further FINISH or START).
+	for i := 0; i < 2; i++ {
+		p.maintainTick(context.Background())
+	}
+	if got := mock.FinishedRunsSnapshot(); len(got) != 1 {
+		t.Errorf("finished runs = %v, want still 1 (dormant while idle)", got)
+	}
+	if got := mock.StartedRunsSnapshot(); len(got) != 1 {
+		t.Errorf("started runs = %v, want still 1", got)
+	}
+
+	// The next request re-creates the run on demand.
+	lease, err = p.Acquire(context.Background(), modelA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.LeaseRelease(lease)
+	if got := mock.StartedRunsSnapshot(); len(got) != 2 {
+		t.Errorf("started runs = %v, want 2 (re-created on demand)", got)
+	}
+}
+
+func TestIdleRotationDisabled(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	p := newTestPool(t, mock) // IdleRotationTimeout = 0: never idle-pauses
+
+	lease, err := p.Acquire(context.Background(), modelA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.LeaseRelease(lease)
+
+	p.maintainTick(context.Background())
+	if got := mock.FinishedRunsSnapshot(); len(got) != 0 {
+		t.Fatalf("finished runs = %v with idle rotation disabled, want none", got)
+	}
+}
+
+func TestMaintainTickSkipsCooldownToken(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	p := newTestPool(t, mock)
+
+	// An active session + run: a normal maintain pass would heartbeat the
+	// session (GET) and may rotate the run. With the token cooling down the
+	// pass must not touch the upstream at all.
+	lease, err := p.Acquire(context.Background(), modelA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.LeaseRelease(lease)
+
+	p.CooldownToken(0, time.Hour)
+
+	before := mock.Requests
+	p.maintainTick(context.Background())
+	if got := mock.Requests; got != before {
+		t.Errorf("upstream requests during cooldown maintain = %d, want %d (no heartbeat/rotate)", got, before)
+	}
+}
+func TestBridgeLRUEviction(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	ids := make([]string, 40)
+	for i := range ids {
+		ids[i] = fmt.Sprintf("run-%04d", i)
+	}
+	mock.RunIDs = ids
+	p := newBridgePool(t, mock)
+
+	for i := 0; i < 35; i++ {
+		token := fmt.Sprintf("bridge-token-%d", i)
+		lease, err := p.AcquireBridge(context.Background(), token, modelA)
+		if err != nil {
+			t.Fatalf("AcquireBridge token %d failed: %v", i, err)
+		}
+		p.LeaseRelease(lease)
+	}
+
+	if count := p.BridgeCount(); count > 32 {
+		t.Errorf("BridgeCount = %d, want <= 32 (LRU eviction)", count)
+	}
+}
+
+func TestWaitingRoomRankings(t *testing.T) {
+	err1 := &session.WaitingRoomError{Position: 5, QueueDepth: 10, RetryAfter: time.Second}
+	err2 := &session.WaitingRoomError{Position: 2, QueueDepth: 10, RetryAfter: time.Second}
+	errUnknown := &session.WaitingRoomError{Position: 0, QueueDepth: 10, RetryAfter: time.Second}
+
+	if !betterWait(err2, err1) {
+		t.Errorf("betterWait position 2 vs 5: want true")
+	}
+	if betterWait(err1, err2) {
+		t.Errorf("betterWait position 5 vs 2: want false")
+	}
+	if betterWait(errUnknown, err1) {
+		t.Errorf("betterWait position 0 vs 5: want false (unknown ranks lower)")
+	}
+}
+
+func TestPoolCooldownRateLimitAndBan(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	p := newTestPool(t, mock)
+
+	rle := &upstream.RateLimitError{Body: "rate limit", RetryAfter: 10 * time.Minute}
+	p.CooldownTokenRateLimit(0, rle)
+
+	be := &upstream.BanError{Body: "account banned", ResumesAt: time.Now().Add(1 * time.Hour)}
+	p.CooldownTokenBan(0, be)
+
+	snap := p.Snapshot()[0]
+	if snap.RiskLevel != "critical" && snap.RiskLevel != "high" {
+		t.Errorf("RiskLevel = %q, want high or critical", snap.RiskLevel)
+	}
+}
+
+func TestBridgeInvalidationAndCooldowns(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	p := newBridgePool(t, mock)
+
+	lease, err := p.AcquireBridge(context.Background(), "bridge-tok-1", modelA)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	p.InvalidateBridgeSession(lease)
+	p.InvalidateBridgeRun(lease, lease.AgentID)
+	p.CooldownBridge(lease, 5*time.Minute)
+	p.CooldownBridgeRateLimit(lease, &upstream.RateLimitError{Body: "rate limit", RetryAfter: 5 * time.Minute})
+	p.CooldownBridgeBan(lease, &upstream.BanError{Body: "banned", ResumesAt: time.Now().Add(5 * time.Minute)})
+
+	p.LeaseRelease(lease)
+}
+
+func TestPoolInvalidateToken(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	p := newTestPool(t, mock)
+
+	p.InvalidateSession(0)
+	p.InvalidateSession(999) // out of range safe
+	p.InvalidateRun(0, "base2-free")
+	p.InvalidateRun(999, "base2-free") // out of range safe
+	p.CooldownToken(0, 5*time.Minute)
+	p.CooldownToken(999, 5*time.Minute)
+	p.CooldownTokenRateLimit(999, nil)
+	p.CooldownTokenBan(999, nil)
+}
+
+func TestMultiTokenRateLimitAndBanFailover(t *testing.T) {
+	mock0 := testutil.NewMock()
+	defer mock0.Close()
+	mock1 := testutil.NewMock()
+	defer mock1.Close()
+
+	p := newTestPool(t, mock0, mock1)
+
+	rle := &upstream.RateLimitError{Body: "rate limit", RetryAfter: 10 * time.Minute}
+	be := &upstream.BanError{Body: "banned", ResumesAt: time.Now().Add(1 * time.Hour)}
+
+	p.CooldownTokenRateLimit(0, rle)
+	p.CooldownTokenRateLimit(1, rle)
+
+	_, err := p.Acquire(context.Background(), modelA)
+	if err == nil || !errors.Is(err, upstream.ErrRateLimited) {
+		t.Errorf("Acquire with all rate limited = %v, want rate limit error", err)
+	}
+
+	p.CooldownTokenBan(0, be)
+	p.CooldownTokenBan(1, be)
+
+	_, err = p.Acquire(context.Background(), modelA)
+	if err == nil || !errors.Is(err, upstream.ErrBanned) {
+		t.Errorf("Acquire with all banned = %v, want ban error", err)
+	}
+}
+
+// eventually polls cond until it holds or the deadline passes.
+func eventually(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timeout waiting for %s", what)
+}
+
+// atomicErr is a thread-safe first-error holder for the hammer.
+type atomicErr struct {
+	mu  sync.Mutex
+	err error
+}
+
+func (e *atomicErr) set(err error) {
+	e.mu.Lock()
+	if e.err == nil {
+		e.err = err
+	}
+	e.mu.Unlock()
+}
+
+func (e *atomicErr) get() error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.err
+}
+
+// --- bridge mode ---
+
+// newBridgePool wires a pool in bridge mode (no AUTH_TOKENS) whose lazily
+// created per-client-token clients talk to the given mock upstream.
+func newBridgePool(t *testing.T, mock *testutil.MockUpstream) *Pool {
+	t.Helper()
+	cfg := &config.Config{
+		RotationInterval:   time.Hour,
+		RequestTimeout:     15 * time.Minute,
+		SessionCallTimeout: 5 * time.Second,
+		RegistryRefresh:    6 * time.Hour,
+		UpstreamBaseURL:    mock.URL(),
+	}
+	reg := registry.New(cfg, nil)
+	reg.LoadFallback()
+	p, err := New(cfg, nil, nil, reg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+func TestBridgeAcquireReusesEntry(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	p := newBridgePool(t, mock)
+
+	const clientToken = "client-tok-1"
+	lease1, err := p.AcquireBridge(context.Background(), clientToken, modelA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lease1.Token != -1 {
+		t.Errorf("bridge lease token = %d, want -1", lease1.Token)
+	}
+	if lease1.Bridge == nil {
+		t.Fatal("bridge lease missing Bridge entry")
+	}
+	if lease1.SessionInstanceID != "inst-abc-123" {
+		t.Errorf("instance = %q, want inst-abc-123", lease1.SessionInstanceID)
+	}
+	p.LeaseRelease(lease1)
+
+	lease2, err := p.AcquireBridge(context.Background(), clientToken, modelA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.LeaseRelease(lease2)
+
+	// One entry per client token: the second acquire reused the first.
+	if got := p.bridgeLen(); got != 1 {
+		t.Errorf("bridge entries = %d, want 1 (reused)", got)
+	}
+	if entry := p.bridgeToken(clientToken); entry == nil {
+		t.Fatal("bridge entry missing after two acquires")
+	}
+	// The shared entry started the run and created the session exactly once.
+	if got := mock.StartedRunsSnapshot(); len(got) != 1 {
+		t.Errorf("started runs = %v, want 1 (single entry reused)", got)
+	}
+	if mock.SessionCreates != 1 {
+		t.Errorf("session creates = %d, want 1 (single entry reused)", mock.SessionCreates)
+	}
+
+	// Chat through the bridge lease goes out with the CLIENT's token.
+	mock.ChatBody = testutil.SSEEvent(`{"id":"chatcmpl-b1","object":"chat.completion.chunk","created":1,"model":"` + modelA + `","choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":"stop"}]}`)
+	opts := upstream.ChatOptions{Model: modelA, RunID: lease2.Run.RunID, SessionInstanceID: lease2.SessionInstanceID}
+	body := []byte(`{"model":"` + modelA + `","messages":[{"role":"user","content":"ping"}]}`)
+	rc, err := p.Chat(context.Background(), lease2, opts, body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = rc.Close()
+	if len(mock.RecordedChatHeaders) != 1 {
+		t.Fatalf("upstream chat calls = %d, want 1", len(mock.RecordedChatHeaders))
+	}
+	if got := mock.RecordedChatHeaders[0].Get("Authorization"); got != "Bearer "+clientToken {
+		t.Errorf("upstream Authorization = %q, want %q", got, "Bearer "+clientToken)
+	}
+}
+
+func TestBridgeEviction(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	ids := make([]string, maxBridgeEntries+4)
+	for i := range ids {
+		ids[i] = fmt.Sprintf("run-%04d", i)
+	}
+	mock.RunIDs = ids
+	p := newBridgePool(t, mock)
+
+	// Create more distinct client tokens than the cache cap; the oldest
+	// entries must be LRU-evicted.
+	for i := 0; i < maxBridgeEntries+2; i++ {
+		lease, err := p.AcquireBridge(context.Background(), fmt.Sprintf("client-tok-%02d", i), modelA)
+		if err != nil {
+			t.Fatal(err)
+		}
+		p.LeaseRelease(lease)
+	}
+	if got := p.bridgeLen(); got != maxBridgeEntries {
+		t.Errorf("bridge entries = %d, want %d (LRU cap)", got, maxBridgeEntries)
+	}
+	// The two oldest tokens were evicted; the newest is cached.
+	if e := p.bridgeToken("client-tok-00"); e != nil {
+		t.Error("oldest bridge entry still cached, want evicted")
+	}
+	if e := p.bridgeToken("client-tok-01"); e != nil {
+		t.Error("second-oldest bridge entry still cached, want evicted")
+	}
+	if e := p.bridgeToken(fmt.Sprintf("client-tok-%02d", maxBridgeEntries+1)); e == nil {
+		t.Error("newest bridge entry not cached")
+	}
+	// An evicted entry's run was FINISHed best-effort.
+	if got := mock.FinishedRunsSnapshot(); len(got) < 2 {
+		t.Errorf("finished runs = %d, want >= 2 (evicted entries finished)", len(got))
+	}
+}
+
+// TestBridgeEvictionFinishOutsideLock is the regression guard for the P1
+// "FINISH under bridgeMu" bug: eviction used to run FinishAllRuns (a
+// sequential upstream call bounded by the session-call timeout) while
+// holding bridgeMu, stalling every other bridge operation for the whole
+// eviction. Here the evicted entry's FINISH is held in flight for
+// FinishDelay: a concurrent BridgeCount (which takes bridgeMu) must return
+// immediately, proving the FINISH no longer runs under the lock.
+func TestBridgeEvictionFinishOutsideLock(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	ids := make([]string, maxBridgeEntries+8)
+	for i := range ids {
+		ids[i] = fmt.Sprintf("run-%04d", i)
+	}
+	mock.RunIDs = ids
+	// Slow FINISH responses hold the eviction's upstream call in flight long
+	// enough to probe the lock: with the old code BridgeCount would block
+	// for the full delay; with the fix it returns in microseconds.
+	mock.FinishDelay = 300 * time.Millisecond
+	p := newBridgePool(t, mock)
+
+	// Fill the cache to the cap.
+	for i := range maxBridgeEntries {
+		lease, err := p.AcquireBridge(context.Background(), fmt.Sprintf("client-tok-%02d", i), modelA)
+		if err != nil {
+			t.Fatal(err)
+		}
+		p.LeaseRelease(lease)
+	}
+
+	// A 33rd distinct token evicts the oldest entry; its FINISH is held in
+	// flight by FinishDelay while the rest of the acquire proceeds.
+	evictDone := make(chan error, 1)
+	go func() {
+		lease, err := p.AcquireBridge(context.Background(), "client-tok-evict", modelA)
+		if err == nil {
+			p.LeaseRelease(lease)
+		}
+		evictDone <- err
+	}()
+
+	// Wait until the eviction FINISH is actually being served by the mock
+	// (the handler counts it before sleeping the delay).
+	eventually(t, "eviction FINISH in flight", func() bool {
+		return mock.FinishesStartedSnapshot() >= 1
+	})
+
+	// While the FINISH is in flight, bridge operations must not block:
+	// BridgeCount takes bridgeMu, which eviction holds only for the
+	// map/order mutation, never across the upstream FINISH.
+	start := time.Now()
+	count := p.BridgeCount()
+	if elapsed := time.Since(start); elapsed >= mock.FinishDelay/2 {
+		t.Errorf("BridgeCount during eviction FINISH took %v, want < %v (FINISH ran under bridgeMu)", elapsed, mock.FinishDelay/2)
+	}
+	if count > maxBridgeEntries {
+		t.Errorf("BridgeCount = %d, want <= %d", count, maxBridgeEntries)
+	}
+
+	// The evicting acquire completes, the evicted run is FINISHed, and the
+	// oldest entry is gone.
+	if err := <-evictDone; err != nil {
+		t.Fatal(err)
+	}
+	if got := mock.FinishedRunsSnapshot(); len(got) < 1 {
+		t.Errorf("finished runs = %d, want >= 1 (evicted entry finished)", len(got))
+	}
+	if p.bridgeToken("client-tok-00") != nil {
+		t.Error("oldest bridge entry still cached, want evicted")
+	}
+}
+
+func TestBridgeAcquireEmptyToken(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	p := newBridgePool(t, mock)
+
+	if _, err := p.AcquireBridge(context.Background(), "", modelA); err == nil {
+		t.Fatal("want error for empty client token")
+	}
+	if _, err := p.AcquireBridge(context.Background(), "   ", modelA); err == nil {
+		t.Fatal("want error for whitespace-only client token")
+	}
+	if got := p.bridgeLen(); got != 0 {
+		t.Errorf("bridge entries = %d, want 0 (no entry for empty token)", got)
+	}
+}
+
+// flakyFirstRT fails the very first request with a transient transport error
+// and delegates everything else to base. It drives a real retry through the
+// full stack deterministically (a live connection teardown surfaces as
+// context.Canceled on some platforms, which must never be retried).
+type flakyFirstRT struct {
+	mu     sync.Mutex
+	failed bool
+	base   http.RoundTripper
+}
+
+func (f *flakyFirstRT) RoundTrip(req *http.Request) (*http.Response, error) {
+	f.mu.Lock()
+	shouldFail := !f.failed
+	if shouldFail {
+		f.failed = true
+	}
+	f.mu.Unlock()
+	if shouldFail {
+		return nil, errors.New("read tcp 127.0.0.1:443: connection reset by peer")
+	}
+	return f.base.RoundTrip(req)
+}
+
+func TestPoolSnapshotTransientRetryCounters(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mock.ChatBody = testutil.SSEEvent(`{"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"` + modelA + `","choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":"stop"}]}`)
+
+	cfg := &config.Config{
+		AuthTokens:         []string{"tok-0"},
+		RotationInterval:   time.Hour,
+		RequestTimeout:     15 * time.Minute,
+		SessionCallTimeout: 5 * time.Second,
+		RegistryRefresh:    6 * time.Hour,
+		UpstreamBaseURL:    mock.URL(),
+		TransientRetries:   1,
+		TLSFingerprint:     "chrome126",
+	}
+	client, err := upstream.New("tok-0", cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The first upstream call (agent-runs START during Acquire) fails at the
+	// transport level once; TRANSIENT_RETRIES replays it and succeeds.
+	client.SetTransport(&flakyFirstRT{base: http.DefaultTransport})
+
+	sess := session.NewManager(client)
+	reg := registry.New(cfg, nil)
+	reg.LoadFallback()
+	p, err := New(cfg, []*upstream.Client{client}, []*session.Manager{sess}, reg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	lease, err := p.Acquire(context.Background(), modelA)
+	if err != nil {
+		t.Fatalf("acquire failed after transient retry: %v", err)
+	}
+	defer p.LeaseRelease(lease)
+
+	opts := upstream.ChatOptions{Model: modelA, RunID: lease.Run.RunID, SessionInstanceID: lease.SessionInstanceID}
+	body := []byte(`{"model":"` + modelA + `","messages":[{"role":"user","content":"ping"}]}`)
+	rc, err := p.Chat(context.Background(), lease, opts, body)
+	if err != nil {
+		t.Fatalf("pool chat failed: %v", err)
+	}
+	got, _ := io.ReadAll(rc)
+	_ = rc.Close()
+	if !strings.Contains(string(got), `"content":"hi"`) {
+		t.Errorf("stream = %q, want content chunk", got)
+	}
+
+	// Pool-wide totals and the per-token row both surface the counters.
+	ps := p.PoolSnapshot()
+	if ps.TransientRetries != 1 {
+		t.Errorf("PoolSnapshot.TransientRetries = %d, want 1", ps.TransientRetries)
+	}
+	if ps.FingerprintRotations != 1 {
+		t.Errorf("PoolSnapshot.FingerprintRotations = %d, want 1 (pinned chrome126 rotated on retry)", ps.FingerprintRotations)
+	}
+	if len(ps.Tokens) != 1 {
+		t.Fatalf("PoolSnapshot.Tokens = %d rows, want 1", len(ps.Tokens))
+	}
+	if ps.Tokens[0].TransientRetries != 1 {
+		t.Errorf("TokenSnapshot.TransientRetries = %d, want 1", ps.Tokens[0].TransientRetries)
+	}
+	if ps.Tokens[0].FingerprintRotations != 1 {
+		t.Errorf("TokenSnapshot.FingerprintRotations = %d, want 1", ps.Tokens[0].FingerprintRotations)
+	}
+
+	// Snapshot() (healthz) carries the same per-token counters.
+	snaps := p.Snapshot()
+	if len(snaps) != 1 || snaps[0].TransientRetries != 1 || snaps[0].FingerprintRotations != 1 {
+		t.Errorf("Snapshot() = %+v, want 1/1 retry counters", snaps)
+	}
+}
+
+func TestPoolSnapshotZeroCountersWhenNoRetries(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	p := newTestPool(t, mock)
+
+	ps := p.PoolSnapshot()
+	if ps.TransientRetries != 0 || ps.FingerprintRotations != 0 {
+		t.Errorf("PoolSnapshot = %+v, want zero counters without retries", ps)
+	}
+	if len(ps.Tokens) != 1 || ps.Tokens[0].TransientRetries != 0 {
+		t.Errorf("per-token counters = %+v, want zero", ps.Tokens)
+	}
+}
+
+// TestSnapshotBanRiskLevel is the regression guard for the P2 ban
+// mislabeling: a banned token must show "critical" during the ban window
+// (not "high" from the cooldown case shadowing it), and the risk must drop
+// after the window expires instead of staying sticky "critical" forever.
+func TestSnapshotBanRiskLevel(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	p := newTestPool(t, mock)
+
+	// Short ban window: CooldownBan also fills the shared cooldown
+	// deadline, so before the fix the cooldown case matched first ("high")
+	// and the remembered BanError stayed non-nil past the window.
+	p.CooldownTokenBan(0, &upstream.BanError{Body: "banned", ResumesAt: time.Now().Add(60 * time.Millisecond)})
+
+	if got := p.Snapshot()[0].RiskLevel; got != "critical" {
+		t.Errorf("RiskLevel during ban = %q, want critical", got)
+	}
+
+	// Once the ban window expires the label must drop (not sticky).
+	eventually(t, "risk drop after ban window", func() bool {
+		return p.Snapshot()[0].RiskLevel != "critical"
+	})
+	if got := p.Snapshot()[0].RiskLevel; got != "low" {
+		t.Errorf("RiskLevel after ban window = %q, want low", got)
+	}
+}
+
+// TestIdleFinishAllRunsHonorsMaintainCtx is the regression guard for the P2
+// context.Background bug in the idle FINISH: Pool.Shutdown cancels the
+// maintain ctx first and waits on the maintain goroutine, so a mid-drain
+// FinishAllRuns must abort on cancel instead of blocking shutdown for the
+// full upstream call timeout.
+func TestIdleFinishAllRunsHonorsMaintainCtx(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	p := newTestPool(t, mock)
+	p.cfg.IdleRotationTimeout = time.Millisecond
+
+	lease, err := p.Acquire(context.Background(), modelA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.LeaseRelease(lease)
+
+	time.Sleep(20 * time.Millisecond) // past the idle threshold
+
+	// Hold every FINISH upstream: only ctx cancellation can end it.
+	mock.FinishDelay = time.Hour
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		p.maintainTick(ctx)
+		close(done)
+	}()
+
+	eventually(t, "idle FINISH in flight", func() bool {
+		return mock.FinishesStartedSnapshot() >= 1
+	})
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("maintainTick did not return after ctx cancel (FinishAllRuns used context.Background)")
+	}
+}
+
+// TestBridgeMaintainEvictHonorsCtx is the bridge-mode half of the same P2
+// fix: the idle-eviction FinishAllRuns in bridgeMaintain must honor the
+// maintain ctx so shutdown is not blocked by an in-flight FINISH.
+func TestBridgeMaintainEvictHonorsCtx(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	p := newBridgePool(t, mock)
+
+	lease, err := p.AcquireBridge(context.Background(), "idle-bridge-tok", modelA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.LeaseRelease(lease)
+
+	// Age the entry past bridgeIdleEvict so the sweep evicts it.
+	entry := p.bridgeToken("idle-bridge-tok")
+	if entry == nil {
+		t.Fatal("bridge entry missing")
+	}
+	entry.lastUsed = time.Now().Add(-bridgeIdleEvict - time.Minute)
+
+	mock.FinishDelay = time.Hour
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		p.bridgeMaintain(ctx)
+		close(done)
+	}()
+
+	eventually(t, "idle-eviction FINISH in flight", func() bool {
+		return mock.FinishesStartedSnapshot() >= 1
+	})
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("bridgeMaintain did not return after ctx cancel (FinishAllRuns used context.Background)")
+	}
+}
+
+// TestBridgeEvictionSkipsBusyEntry is the regression guard for the P2
+// eviction bug: LRU eviction used to FINISH the runs of any victim, even
+// one with an outstanding lease, killing the in-flight request. Eviction
+// must skip busy entries (the idle sweep handles them once leases drain).
+func TestBridgeEvictionSkipsBusyEntry(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	ids := make([]string, maxBridgeEntries+8)
+	for i := range ids {
+		ids[i] = fmt.Sprintf("run-%04d", i)
+	}
+	mock.RunIDs = ids
+	p := newBridgePool(t, mock)
+
+	// Fill the cache to the cap, holding an ACTIVE LEASE on the oldest
+	// entry (client-tok-00) so it must survive eviction.
+	var busy *Lease
+	for i := 0; i < maxBridgeEntries; i++ {
+		lease, err := p.AcquireBridge(context.Background(), fmt.Sprintf("client-tok-%02d", i), modelA)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if i == 0 {
+			busy = lease
+		} else {
+			p.LeaseRelease(lease)
+		}
+	}
+
+	// A new distinct token pushes the cache over the cap: eviction must
+	// pick an idle victim, not the busy oldest entry.
+	lease, err := p.AcquireBridge(context.Background(), "client-tok-new", modelA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.LeaseRelease(lease)
+
+	if e := p.bridgeToken("client-tok-00"); e == nil {
+		t.Fatal("busy bridge entry was evicted while its lease is outstanding")
+	}
+	finished := mock.FinishedRunsSnapshot()
+	if len(finished) != 1 {
+		t.Errorf("finished runs = %d, want 1 (only the idle evicted entry)", len(finished))
+	}
+	for _, f := range finished {
+		if f.RunID == busy.Run.RunID {
+			t.Errorf("busy entry's run %s FINISHed during eviction", f.RunID)
+		}
+	}
+	if got := p.bridgeLen(); got != maxBridgeEntries {
+		t.Errorf("bridge entries = %d, want %d", got, maxBridgeEntries)
+	}
+	p.LeaseRelease(busy)
+}
+
+// TestShutdownDrainsBridgeEntries is the regression guard for the P3 gap:
+// Pool.Shutdown only drained the fixed tokens, leaving cached bridge
+// entries' runs and sessions alive upstream. Shutdown must drain them
+// best-effort after the fixed-token pass.
+func TestShutdownDrainsBridgeEntries(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	p := newBridgePool(t, mock)
+
+	lease1, err := p.AcquireBridge(context.Background(), "shutdown-tok-1", modelA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.LeaseRelease(lease1)
+	lease2, err := p.AcquireBridge(context.Background(), "shutdown-tok-2", modelA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.LeaseRelease(lease2)
+
+	p.Shutdown(context.Background())
+
+	// Both bridge entries' runs were FINISHed and sessions ended.
+	finished := mock.FinishedRunsSnapshot()
+	if len(finished) != 2 {
+		t.Errorf("finished runs = %d, want 2 (bridge runs drained on shutdown)", len(finished))
+	}
+	for _, f := range finished {
+		if f.Status != "completed" {
+			t.Errorf("run %s finished with status %q, want completed", f.RunID, f.Status)
+		}
+	}
+	if mock.SessionEnds != 2 {
+		t.Errorf("session ends = %d, want 2 (bridge sessions ended on shutdown)", mock.SessionEnds)
+	}
+}

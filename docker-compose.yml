@@ -1,0 +1,18 @@
+# freebuff-proxy deployment configuration
+
+services:
+  freebuff-proxy:
+    build: .
+    image: freebuff-proxy:latest
+    container_name: freebuff-proxy
+    env_file: .env
+    environment:
+      - LISTEN_ADDR=:3457
+    ports:
+      - "3457:3457"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3457/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3

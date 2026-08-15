@@ -1,0 +1,51 @@
+# ── third-party reference clones (CodebuffAI/freebuff, 9router, etc.) ──
+reference/
+
+# ── local secrets / credentials ──
+.env
+.env.local
+config.json
+*.pem
+*.key
+
+# ── runtime artifacts ──
+dump/
+*.log
+dist/
+out/
+bin/
+tmp/
+
+# ── build outputs (Go binaries) ──
+/freebuff-proxy
+/freebuff-proxy.exe
+/server
+*.test
+*.out
+coverage.out
+coverage.html
+*.prof
+
+# ── editors / IDEs ──
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# ── OS cruft ──
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# ── misc ──
+node_modules/
+*.tmp
+*.bak
+
+# ── agent handoff docs (local only, not repo content) ──
+HANDOFF.md
+*.handoff.md
+
+# ── dev docs (local only, not repo content); guides/ is public ──
+docs/*
+!docs/guides/
