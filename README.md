@@ -19,7 +19,7 @@ codebuff.com 上游
 ## 为什么 Vercel Go Framework Preset
 
 - **原生 Linux 容器**（非 WASM）：uTLS TLS 指纹、SOCKS5/HTTP 代理全部可用 —— stealth 层完整保留
-- **零代码改动**：`LISTEN_ADDR=:$PORT`（环境变量覆盖），main.go 原样
+- **零源码改动**：`LISTEN_ADDR=:$PORT`（环境变量覆盖）。唯一新增的是根目录 `main.go` —— Vercel Go preset 只识别根级入口（`main.go`/`cmd/api/main.go`/`cmd/server/main.go`），而上游入口在 `cmd/freebuff-proxy/main.go`，所以根目录提供一个**精简镜像入口**（完整代理能力，去掉云上无意义的 `-doctor/-update/-setup`），`internal/` 全部原样
 - **免费**（Hobby）：100 万 Function Invocations/月 + 360 GB-h + 4 CPU-h + 100 GB 带宽，美东 `iad1` 出口，**无需绑卡**
 - **限制**：单次请求最长 300s（含 SSE 流式，单次 AI 推理足够）；实例空闲 scale-to-zero → 内存态会话/run 池会被重置（每次冷启动重新握手，功能不受影响）
 
@@ -86,14 +86,16 @@ export OPENAI_API_KEY=<API_KEYS 或 cb_ token>
 ## 本地运行 / 测试
 
 ```bash
-go build -o server ./cmd/freebuff-proxy   # 与 Vercel buildCommand 一致
+go build -o server .                     # 与 Vercel buildCommand 一致（根目录入口）
 LISTEN_ADDR=:3457 AUTO_DISCOVER_TOKEN=false API_KEYS=test \
   AUTH_TOKENS=cb_your_token ./server
 # 另开终端：
 curl http://127.0.0.1:3457/healthz
 curl -H "Authorization: Bearer test" http://127.0.0.1:3457/v1/models
-go test ./...                              # 上游完整测试套件（11 包全过）
+go test ./...                            # 上游完整测试套件（11 包全过）
 ```
+
+> 根目录 `main.go` 是 Vercel 检测入口（镜像上游启动逻辑，去掉 `-doctor/-update/-setup`）；完整版入口在 `cmd/freebuff-proxy/main.go`，本地自建部署可用它。
 
 ## 与上游的差异（云环境所致，非代码改动）
 
