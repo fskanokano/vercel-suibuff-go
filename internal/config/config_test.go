@@ -17,7 +17,7 @@ var envKeys = []string{
 	"LISTEN_ADDR", "UPSTREAM_BASE_URL", "AUTH_TOKENS", "ROTATION_INTERVAL",
 	"REQUEST_TIMEOUT", "SESSION_CALL_TIMEOUT", "API_KEYS", "HTTP_PROXY",
 	"SOCKS5_PROXY", "SOCKS5_PROXIES", "COST_MODE", "TLS_FINGERPRINT", "REGISTRY_REFRESH", "DEBUG_DUMP", "LOG_FILE", "LOG_LEVEL",
-	"MAX_MESSAGES_PER_DAY", "IDLE_ROTATION_TIMEOUT", "SAFE_MODE", "REQUEST_JITTER", "CLI_VERSION", "MODEL_ALIASES", "AUTO_DISCOVER_TOKEN",
+	"MAX_MESSAGES_PER_DAY", "IDLE_ROTATION_TIMEOUT", "SAFE_MODE", "HYBRID_MODE", "REQUEST_JITTER", "CLI_VERSION", "MODEL_ALIASES", "AUTO_DISCOVER_TOKEN",
 	"TRANSIENT_RETRIES", "ADMIN_TOKEN",
 }
 
@@ -27,6 +27,15 @@ func clearEnv(t *testing.T) {
 	// a gitignored .env with real tokens) — Load() reads it by default.
 	t.Chdir(t.TempDir())
 	for _, k := range envKeys {
+		// AUTH_TOKENS is presence-sensitive (an empty value is an explicit
+		// bridge-mode choice), so the neutral test state is ABSENT, not
+		// empty: setting it to "" would record presence and suppress
+		// auto-discovery in every test. Unsetting also blocks a
+		// machine-level AUTH_TOKENS leak into assertions.
+		if k == "AUTH_TOKENS" {
+			_ = os.Unsetenv(k)
+			continue
+		}
 		t.Setenv(k, "")
 	}
 	t.Setenv("AUTO_DISCOVER_TOKEN", "false")
@@ -67,6 +76,12 @@ func TestDefaults(t *testing.T) {
 	}
 	if !cfg.SafeMode {
 		t.Error("SafeMode = false, want true (default)")
+	}
+	if cfg.HybridMode {
+		t.Error("HybridMode = true, want false (default)")
+	}
+	if got := cfg.EffectiveMode(); got != "pooled" {
+		t.Errorf("EffectiveMode = %q, want pooled", got)
 	}
 	if cfg.LogFile != "" {
 		t.Errorf("LogFile = %q, want empty", cfg.LogFile)
@@ -511,6 +526,9 @@ func TestValidate(t *testing.T) {
 		{"zero request timeout", func(c *Config) { c.RequestTimeout = 0 }},
 		{"zero session timeout", func(c *Config) { c.SessionCallTimeout = 0 }},
 		{"zero registry refresh", func(c *Config) { c.RegistryRefresh = 0 }},
+		{"bad cost mode", func(c *Config) { c.CostMode = "Free" }},
+		{"bad proxy rotation", func(c *Config) { c.ProxyRotation = "round robin" }},
+		{"negative max messages", func(c *Config) { c.MaxMessagesPerDay = -1 }},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -520,6 +538,100 @@ func TestValidate(t *testing.T) {
 				t.Error("Validate succeeded, want error")
 			}
 		})
+	}
+}
+
+// TestValidateModeKnobs pins the accepted values for the routing knobs that
+// otherwise silently change behavior (a COST_MODE typo routes requests as
+// PAID → 402; an unknown PROXY_ROTATION silently falls back).
+func TestValidateModeKnobs(t *testing.T) {
+	good := Config{
+		ListenAddr:         ":3457",
+		UpstreamBaseURL:    "https://www.codebuff.com",
+		AuthTokens:         []string{"tok"},
+		RotationInterval:   6 * time.Hour,
+		RequestTimeout:     15 * time.Minute,
+		SessionCallTimeout: 30 * time.Second,
+		RegistryRefresh:    6 * time.Hour,
+	}
+	for _, cost := range []string{"", "free"} {
+		for _, rot := range []string{"", "per-token", "round-robin", "random"} {
+			for _, mmd := range []int{0, 1} {
+				c := good
+				c.CostMode, c.ProxyRotation, c.MaxMessagesPerDay = cost, rot, mmd
+				if err := c.Validate(); err != nil {
+					t.Errorf("Validate(COST_MODE=%q PROXY_ROTATION=%q MAX=%d) = %v, want nil", cost, rot, mmd, err)
+				}
+			}
+		}
+	}
+}
+
+// TestHybridMode verifies HYBRID_MODE loads from env and .env, EffectiveMode
+// reports hybrid before bridge/pooled, and Validate accepts hybrid with and
+// without AUTH_TOKENS (token-less requests 502 until a token is added, but
+// client-token requests relay like bridge).
+func TestHybridMode(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("AUTH_TOKENS", "tok-1")
+
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.HybridMode {
+		t.Error("HybridMode = true by default, want false")
+	}
+	if got := cfg.EffectiveMode(); got != "pooled" {
+		t.Errorf("EffectiveMode = %q, want pooled", got)
+	}
+
+	// HYBRID_MODE=true via env.
+	clearEnv(t)
+	t.Setenv("AUTH_TOKENS", "tok-1")
+	t.Setenv("HYBRID_MODE", "true")
+	cfg, err = Load("")
+	if err != nil {
+		t.Fatalf("Load(HYBRID_MODE=true): %v", err)
+	}
+	if !cfg.HybridMode {
+		t.Error("HybridMode = false, want true (from env)")
+	}
+	if got := cfg.EffectiveMode(); got != "hybrid" {
+		t.Errorf("EffectiveMode = %q, want hybrid", got)
+	}
+
+	// Hybrid without tokens is legal; EffectiveMode still wins over bridge.
+	clearEnv(t)
+	t.Setenv("HYBRID_MODE", "true")
+	cfg, err = Load("")
+	if err != nil {
+		t.Fatalf("Load(HYBRID_MODE=true, no tokens): %v", err)
+	}
+	if !cfg.BridgeMode() {
+		t.Error("BridgeMode = false, want true (no AUTH_TOKENS)")
+	}
+	if got := cfg.EffectiveMode(); got != "hybrid" {
+		t.Errorf("EffectiveMode = %q, want hybrid (hybrid beats bridge)", got)
+	}
+
+	// Validate accepts hybrid in both token configurations.
+	c := Config{
+		ListenAddr:         ":3457",
+		UpstreamBaseURL:    "https://www.codebuff.com",
+		AuthTokens:         []string{"tok"},
+		RotationInterval:   6 * time.Hour,
+		RequestTimeout:     15 * time.Minute,
+		SessionCallTimeout: 30 * time.Second,
+		RegistryRefresh:    6 * time.Hour,
+		HybridMode:         true,
+	}
+	if err := c.Validate(); err != nil {
+		t.Fatalf("hybrid with tokens Validate: %v", err)
+	}
+	c.AuthTokens = nil
+	if err := c.Validate(); err != nil {
+		t.Fatalf("hybrid without tokens Validate: %v", err)
 	}
 }
 
@@ -556,6 +668,25 @@ func TestDotenv(t *testing.T) {
 	}
 }
 
+func TestDotenvStripsBOM(t *testing.T) {
+	clearEnv(t)
+
+	// A UTF-8 BOM on the first line would corrupt the first key into
+	// "\ufeffAUTH_TOKENS" and the token would silently drop out of the pool;
+	// PowerShell writers with a UTF-8-with-BOM default produce this shape.
+	if err := os.WriteFile(".env", []byte("\xef\xbb\xbfAUTH_TOKENS=tok-1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := cfg.AuthTokens; len(got) != 1 || got[0] != "tok-1" {
+		t.Errorf("AuthTokens = %v, want [tok-1] (BOM must not corrupt the first key)", got)
+	}
+}
+
 func TestDotenvEnvWins(t *testing.T) {
 	clearEnv(t)
 
@@ -576,6 +707,21 @@ func TestDotenvEnvWins(t *testing.T) {
 	}
 }
 
+// TestModelsHideUnavailableEnv verifies MODELS_HIDE_UNAVAILABLE loads from
+// env and lands in Config.
+func TestModelsHideUnavailableEnv(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("AUTH_TOKENS", "tok-1")
+	t.Setenv("MODELS_HIDE_UNAVAILABLE", "true")
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.ModelsHideUnavailable {
+		t.Error("ModelsHideUnavailable = false, want true (from env)")
+	}
+}
+
 func TestDotenvJSONWins(t *testing.T) {
 	clearEnv(t)
 
@@ -590,10 +736,100 @@ func TestDotenvJSONWins(t *testing.T) {
 	// the README rule "environment overrides the JSON config file".
 	cfg, err := Load("cfg.json")
 	if err != nil {
-		t.Fatalf("Load: %v", err)
+		t.Fatal(err)
 	}
 	if got := cfg.AuthTokens; len(got) != 1 || got[0] != "from-dotenv" {
 		t.Errorf("AuthTokens = %v, want [from-dotenv] (.env beats JSON)", got)
+	}
+}
+
+// TestDotenvEmptyAuthTokensClearsJSON is the regression for the dashboard
+// mode switch: it persists exactly "AUTH_TOKENS=" into .env, which must
+// clear tokens that came from a -config JSON file — otherwise the reload
+// keeps the old tokens, BridgeMode() stays false, and the dashboard pill
+// still shows the old mode after "Switch to bridge mode".
+func TestDotenvEmptyAuthTokensClearsJSON(t *testing.T) {
+	clearEnv(t)
+
+	if err := os.WriteFile(".env", []byte("AUTH_TOKENS=\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile("cfg.json", []byte(`{"AUTH_TOKENS":["from-json"]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load("cfg.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.AuthTokens) != 0 {
+		t.Errorf("AuthTokens = %v, want empty (empty .env AUTH_TOKENS clears JSON tokens)", cfg.AuthTokens)
+	}
+	if !cfg.BridgeMode() {
+		t.Error("BridgeMode() = false, want true after explicit empty AUTH_TOKENS")
+	}
+	if cfg.DiscoveredSource != "" {
+		t.Errorf("DiscoveredSource = %q, want empty (auto-discovery must stay suppressed)", cfg.DiscoveredSource)
+	}
+}
+
+// TestEnvEmptyAuthTokensBridgeMode verifies that an explicitly-empty
+// AUTH_TOKENS in the real environment (the shape systemd/Docker unit files
+// use to force bridge mode) records presence: cfg.AuthTokens stays empty,
+// BridgeMode() is true, and CLI auto-discovery must NOT refill the pool.
+// Regression: overrideCSV skipped empty values, so AUTH_TOKENS= left
+// AuthTokensSet false and a local CLI login silently flipped bridge mode to
+// pooled mode under systemd/Docker.
+func TestEnvEmptyAuthTokensBridgeMode(t *testing.T) {
+	clearEnv(t)
+	// Re-enable auto-discovery; the explicit-empty AUTH_TOKENS below is what
+	// must suppress it (not the AUTO_DISCOVER_TOKEN=off switch).
+	t.Setenv("AUTO_DISCOVER_TOKEN", "")
+	t.Setenv("AUTH_TOKENS", "")
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	credDir := filepath.Join(home, ".config", "manicode")
+	if err := os.MkdirAll(credDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fixture := `{"default": {"authToken": "cb_discovered", "email": "dev@example.com"}}`
+	if err := os.WriteFile(filepath.Join(credDir, "credentials.json"), []byte(fixture), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(cfg.AuthTokens) != 0 {
+		t.Errorf("AuthTokens = %v, want empty (explicit bridge mode, not refilled by discovery)", cfg.AuthTokens)
+	}
+	if !cfg.BridgeMode() {
+		t.Error("BridgeMode() = false, want true with explicitly-empty AUTH_TOKENS")
+	}
+	if cfg.DiscoveredSource != "" {
+		t.Errorf("DiscoveredSource = %q, want empty (auto-discovery must be suppressed)", cfg.DiscoveredSource)
+	}
+}
+
+// TestEnvAuthTokensSetsTokens verifies the non-empty AUTH_TOKENS=a,b env
+// path lands in cfg.AuthTokens with explicit-presence semantics (a partial
+// pool must never trigger CLI auto-discovery either).
+func TestEnvAuthTokensSetsTokens(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("AUTH_TOKENS", "a,b")
+
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if want := []string{"a", "b"}; !equalStrings(cfg.AuthTokens, want) {
+		t.Errorf("AuthTokens = %v, want %v", cfg.AuthTokens, want)
+	}
+	if cfg.BridgeMode() {
+		t.Error("BridgeMode() = true, want false with AUTH_TOKENS=a,b")
 	}
 }
 
@@ -945,6 +1181,7 @@ func TestDotenvFullKeySet(t *testing.T) {
 
 	content := strings.Join([]string{
 		"SAFE_MODE=false",
+		"HYBRID_MODE=true",
 		"REQUEST_JITTER=5s",
 		"CLI_VERSION=9.9.9",
 		"MODEL_ALIASES=gpt-4o:deepseek/deepseek-v4-flash,glm:z-ai/glm-5.2",
@@ -961,6 +1198,9 @@ func TestDotenvFullKeySet(t *testing.T) {
 	}
 	if cfg.SafeMode {
 		t.Error("SafeMode = true, want false (from .env)")
+	}
+	if !cfg.HybridMode {
+		t.Error("HybridMode = false, want true (from .env)")
 	}
 	if cfg.RequestJitter != 5*time.Second {
 		t.Errorf("RequestJitter = %v, want 5s (from .env)", cfg.RequestJitter)
@@ -984,10 +1224,11 @@ func TestDotenvFullKeySet(t *testing.T) {
 func TestDotenvFullKeySetEnvWins(t *testing.T) {
 	clearEnv(t)
 
-	if err := os.WriteFile(".env", []byte("SAFE_MODE=false\nCLI_VERSION=9.9.9\nTRANSIENT_RETRIES=2\nPROXY_ROTATION=round-robin\n"), 0o644); err != nil {
+	if err := os.WriteFile(".env", []byte("SAFE_MODE=false\nHYBRID_MODE=true\nCLI_VERSION=9.9.9\nTRANSIENT_RETRIES=2\nPROXY_ROTATION=round-robin\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("SAFE_MODE", "true")
+	t.Setenv("HYBRID_MODE", "false")
 	t.Setenv("CLI_VERSION", "1.2.3")
 	t.Setenv("TRANSIENT_RETRIES", "5")
 	t.Setenv("PROXY_ROTATION", "random")
@@ -999,6 +1240,9 @@ func TestDotenvFullKeySetEnvWins(t *testing.T) {
 	if !cfg.SafeMode {
 		t.Error("SafeMode = false, want true (env wins over .env)")
 	}
+	if cfg.HybridMode {
+		t.Error("HybridMode = true, want false (env wins over .env)")
+	}
 	if cfg.CLIVersion != "1.2.3" {
 		t.Errorf("CLIVersion = %q, want 1.2.3 (env wins)", cfg.CLIVersion)
 	}
@@ -1007,6 +1251,37 @@ func TestDotenvFullKeySetEnvWins(t *testing.T) {
 	}
 	if cfg.ProxyRotation != "random" {
 		t.Errorf("ProxyRotation = %q, want random (env wins)", cfg.ProxyRotation)
+	}
+}
+
+// TestAutoDiscoverStripsCredentialsBOM verifies that a UTF-8 BOM at the
+// start of the CLI credentials file (a Windows writer artifact) does not
+// break json.Unmarshal and silently disable auto-discovery.
+func TestAutoDiscoverStripsCredentialsBOM(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("AUTO_DISCOVER_TOKEN", "")
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	credDir := filepath.Join(home, ".config", "manicode")
+	if err := os.MkdirAll(credDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fixture := "\xef\xbb\xbf" + `{"default": {"authToken": "cb_discovered", "email": "dev@example.com"}}`
+	if err := os.WriteFile(filepath.Join(credDir, "credentials.json"), []byte(fixture), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := cfg.AuthTokens; len(got) != 1 || got[0] != "cb_discovered" {
+		t.Fatalf("AuthTokens = %v, want [cb_discovered] (BOM must not break credentials parsing)", got)
+	}
+	if cfg.DiscoveredSource == "" {
+		t.Fatal("DiscoveredSource = empty, want the credentials file path")
 	}
 }
 
@@ -1050,6 +1325,48 @@ func TestAutoDiscoverWarnsOnBridgeToPooled(t *testing.T) {
 	}
 	if !strings.Contains(out, "manicode") {
 		t.Errorf("warning missing source file name, got: %q", out)
+	}
+}
+
+// TestAutoDiscoverSkippedWhenTokensExplicitlyCleared verifies that an
+// explicitly-empty AUTH_TOKENS (the shape the dashboard mode switch persists
+// as "AUTH_TOKENS=" in .env) suppresses CLI auto-discovery — the operator
+// chose bridge mode, so a local CLI login must not silently refill the pool.
+func TestAutoDiscoverSkippedWhenTokensExplicitlyCleared(t *testing.T) {
+	clearEnv(t)
+	// Re-enable auto-discovery; the explicit-empty AUTH_TOKENS below is what
+	// must suppress it (not the AUTO_DISCOVER_TOKEN=off switch).
+	t.Setenv("AUTO_DISCOVER_TOKEN", "")
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	credDir := filepath.Join(home, ".config", "manicode")
+	if err := os.MkdirAll(credDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fixture := `{"default": {"authToken": "cb_discovered", "email": "dev@example.com"}}`
+	if err := os.WriteFile(filepath.Join(credDir, "credentials.json"), []byte(fixture), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// The dashboard mode switch writes exactly "AUTH_TOKENS=" into .env.
+	if err := os.WriteFile(".env", []byte("AUTH_TOKENS=\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(cfg.AuthTokens) != 0 {
+		t.Errorf("AuthTokens = %v, want empty (explicit bridge mode, not refilled by discovery)", cfg.AuthTokens)
+	}
+	if !cfg.BridgeMode() {
+		t.Error("BridgeMode() = false, want true with explicitly-cleared AUTH_TOKENS")
+	}
+	if cfg.DiscoveredSource != "" {
+		t.Errorf("DiscoveredSource = %q, want empty (auto-discovery must be suppressed)", cfg.DiscoveredSource)
 	}
 }
 

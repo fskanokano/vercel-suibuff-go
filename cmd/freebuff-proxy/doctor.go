@@ -12,8 +12,83 @@ import (
 	"time"
 
 	"freebuff-proxy/internal/config"
+	"freebuff-proxy/internal/egress"
 	"freebuff-proxy/internal/registry"
+	"freebuff-proxy/internal/upstream"
 )
+
+// egressRegionRow renders the doctor's egress region line from the direct
+// probe cache entry: "Egress region: <country> (<ip>)" on success, an
+// "(unavailable)" warning when the probe failed or no result is cached.
+func egressRegionRow(cache *egress.Cache) (line string, warn bool) {
+	r, ok := cache.Get("direct")
+	if !ok || r.Err != nil || r.Country == "" || r.IP == "" {
+		reason := "no direct probe result"
+		if ok && r.Err != nil {
+			reason = fmt.Sprintf("direct probe failed: %v", r.Err)
+		}
+		return fmt.Sprintf("Egress region: unavailable (%s)", reason), true
+	}
+	return fmt.Sprintf("Egress region: %s (%s)", r.Country, r.IP), false
+}
+
+// runTokenTest probes the first configured token with a real session
+// handshake (the same path the pool uses) and exits 0 on success, 1 on
+// failure. Exposed as -test-token for installers and scripts.
+// probeModel returns the safest model to probe a token with: the fallback
+// default (deepseek-v4-flash — the model every account gets, incl. limited
+// tier) when in the catalog, else the first catalog model. The alphabetical
+// first model (anthropic/claude-fable-5) is a capacity-gated offer model
+// that makes token tests fail on most accounts.
+func probeModel(reg *registry.Registry) string {
+	models := reg.Models()
+	if len(models) == 0 {
+		return ""
+	}
+	for _, id := range models {
+		if id == "deepseek/deepseek-v4-flash" {
+			return id
+		}
+	}
+	return models[0]
+}
+
+func runTokenTest(configPath string) {
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "freebuff-proxy: -test-token: config load failed: %v\n", err)
+		os.Exit(1)
+	}
+	if cfg.BridgeMode() {
+		fmt.Fprintln(os.Stderr, "freebuff-proxy: -test-token: no AUTH_TOKENS configured (bridge mode); nothing to probe")
+		os.Exit(1)
+	}
+	reg := registry.New(&cfg, &http.Client{Timeout: 10 * time.Second})
+	reg.LoadFallback()
+	model := probeModel(reg)
+	if model == "" {
+		fmt.Fprintln(os.Stderr, "freebuff-proxy: -test-token: registry has no models to probe against")
+		os.Exit(1)
+	}
+	clientCfg := cfg
+	client, err := upstream.New(cfg.AuthTokens[0], &clientCfg)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "freebuff-proxy: -test-token: %v\n", err)
+		os.Exit(1)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	st, err := client.CreateSessionForModel(ctx, model)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "freebuff-proxy: -test-token: token rejected upstream: %v\n", err)
+		os.Exit(1)
+	}
+	endCtx, endCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	_ = client.EndSession(endCtx, st.InstanceID)
+	endCancel()
+	fmt.Printf("freebuff-proxy: token OK (%s, session %s)\n", model, st.InstanceID)
+	os.Exit(0)
+}
 
 func runDoctor(configPath string) {
 	fmt.Println("freebuff-proxy doctor diagnostic tool")
@@ -92,6 +167,21 @@ func runDoctor(configPath string) {
 		ok(fmt.Sprintf("TLS connection to %s:443 succeeded", targetHost))
 	}
 
+	// Egress region check: one live probe of the direct outbound path
+	// through a plain dialer, read back from the cache the doctor shares
+	// with the runtime. A failed probe is a warning, not a doctor failure —
+	// the proxy keeps working, only the region readout is missing.
+	egressCache := egress.NewCache()
+	probeCtx, probeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	res := egress.Probe(probeCtx, egress.DirectDialer(5*time.Second), 5*time.Second)
+	probeCancel()
+	egressCache.Set("direct", res)
+	if line, isWarn := egressRegionRow(egressCache); isWarn {
+		warn(line)
+	} else {
+		ok(line)
+	}
+
 	// Registry test
 	reg := registry.New(&cfg, &http.Client{Timeout: 10 * time.Second})
 	reg.LoadFallback()
@@ -101,6 +191,36 @@ func runDoctor(configPath string) {
 		warn(fmt.Sprintf("Registry live refresh warning: %v (offline fallback retained)", err))
 	} else {
 		ok(fmt.Sprintf("Registry live refresh succeeded (%d models)", reg.ModelCount()))
+	}
+
+	// Token validity probe: one real session handshake per configured token,
+	// through the same client path the pool uses. This is the check that
+	// catches expired/revoked tokens before the first chat 401s.
+	if !cfg.BridgeMode() {
+		probe := probeModel(reg)
+		if probe == "" {
+			warn("Cannot probe tokens: registry has no models")
+		} else {
+			for i, tok := range cfg.AuthTokens {
+				clientCfg := cfg
+				client, err := upstream.New(tok, &clientCfg)
+				if err != nil {
+					fail(fmt.Sprintf("Token #%d: cannot build client: %v", i+1, err))
+					continue
+				}
+				probeCtx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+				st, err := client.CreateSessionForModel(probeCtx, probe)
+				cancel()
+				if err != nil {
+					fail(fmt.Sprintf("Token #%d validity probe failed: %v (re-run the upstream CLI to refresh the token)", i+1, err))
+					continue
+				}
+				endCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				_ = client.EndSession(endCtx, st.InstanceID)
+				cancel()
+				ok(fmt.Sprintf("Token #%d validity probe succeeded (session handshake)", i+1))
+			}
+		}
 	}
 
 	fmt.Printf("\nSummary: %d passed, %d warnings, %d failed\n", passed, warnings, failed)

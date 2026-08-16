@@ -330,7 +330,13 @@ func TestAllFailedCombinedError(t *testing.T) {
 	}
 }
 
-func TestWaitingRoomOnlyWhenEveryTokenQueued(t *testing.T) {
+func TestWaitingRoomSurfacesOnAnyQueuedToken(t *testing.T) {
+	// Precedence-chain failover (ban > country > rate > waiting > daily)
+	// surfaces the waiting-room error as soon as ANY token is queued — a
+	// queued token is the only actionable signal — instead of requiring
+	// every token to be queued. Buckets lower than waiting (daily cap) and
+	// the generic fallback lose to it; here the second token's auth-reject
+	// is not a matrix bucket, so waiting wins.
 	mock0 := testutil.NewMock()
 	defer mock0.Close()
 	mock0.SessionMode = "queued"
@@ -347,11 +353,11 @@ func TestWaitingRoomOnlyWhenEveryTokenQueued(t *testing.T) {
 		t.Fatal("want error")
 	}
 	var wr *session.WaitingRoomError
-	if errors.As(err, &wr) {
-		t.Fatalf("waiting-room error surfaced although only one token is queued: %v", err)
+	if !errors.As(err, &wr) {
+		t.Fatalf("want session.WaitingRoomError when any token is queued, got %v", err)
 	}
-	if !strings.Contains(err.Error(), "unable to acquire run from any token") {
-		t.Errorf("error = %q, want combined error", err)
+	if wr.Position != 2 {
+		t.Errorf("waiting room position = %d, want 2", wr.Position)
 	}
 }
 
@@ -721,7 +727,7 @@ func TestStartPrewarmsAndShutdownDrains(t *testing.T) {
 // fallback registry (the pool does not export its registry).
 func (p *Pool) regAgentIDs(t *testing.T) []string {
 	t.Helper()
-	reg := registry.New(p.cfg, nil)
+	reg := registry.New(p.cfg.Load(), nil)
 	reg.LoadFallback()
 	return reg.AgentIDs()
 }
@@ -802,7 +808,9 @@ func TestDailyMessageCap(t *testing.T) {
 	mock := testutil.NewMock()
 	defer mock.Close()
 	p := newTestPool(t, mock)
-	p.cfg.MaxMessagesPerDay = 2
+	cfg := p.cfg.Load()
+	cfg.MaxMessagesPerDay = 2
+	p.cfg.Store(cfg)
 
 	for i := 0; i < 2; i++ {
 		lease, err := p.Acquire(context.Background(), modelA)
@@ -846,7 +854,9 @@ func TestDailyMessageCapFailover(t *testing.T) {
 	mock1 := testutil.NewMock()
 	defer mock1.Close()
 	p := newTestPool(t, mock0, mock1)
-	p.cfg.MaxMessagesPerDay = 1
+	cfg := p.cfg.Load()
+	cfg.MaxMessagesPerDay = 1
+	p.cfg.Store(cfg)
 
 	// Round-robin: first acquire lands on token-1; cap it with a chat.
 	lease, err := p.Acquire(context.Background(), modelA)
@@ -905,11 +915,50 @@ func TestDailyMessageCapDisabled(t *testing.T) {
 	}
 }
 
+// TestSetConfigReloadsDailyLimit is the regression guard for the P1 stale
+// config bug: the pool kept the *config.Config it was built with, so a
+// reloaded config (dashboard save / admin reload) never took effect for
+// the daily message cap. SetConfig must swap the pointer the pool reads.
+func TestSetConfigReloadsDailyLimit(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	p := newTestPool(t, mock)
+
+	// One successful chat under the default (unlimited) config.
+	lease, err := p.Acquire(context.Background(), modelA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	chatOnce(t, p, lease)
+	p.LeaseRelease(lease)
+
+	// Reload a config with a daily cap of 1.
+	newCfg := *p.cfg.Load()
+	newCfg.MaxMessagesPerDay = 1
+	p.SetConfig(&newCfg)
+
+	// The next acquire must respect the NEW limit: one chat is already on
+	// the books, so the cap bites immediately.
+	_, err = p.Acquire(context.Background(), modelA)
+	var rle *upstream.RateLimitError
+	if !errors.As(err, &rle) {
+		t.Fatalf("want *upstream.RateLimitError after SetConfig cap, got %v", err)
+	}
+	if !errors.Is(err, upstream.ErrRateLimited) {
+		t.Error("errors.Is(ErrRateLimited) = false")
+	}
+	if rle.Limit != 1 {
+		t.Errorf("quota limit = %v, want 1 (reloaded config)", rle.Limit)
+	}
+}
+
 func TestIdleRotationFinishesRuns(t *testing.T) {
 	mock := testutil.NewMock()
 	defer mock.Close()
 	p := newTestPool(t, mock)
-	p.cfg.IdleRotationTimeout = 10 * time.Millisecond
+	cfg := p.cfg.Load()
+	cfg.IdleRotationTimeout = 10 * time.Millisecond
+	p.cfg.Store(cfg)
 
 	lease, err := p.Acquire(context.Background(), modelA)
 	if err != nil {
@@ -953,6 +1002,42 @@ func TestIdleRotationFinishesRuns(t *testing.T) {
 	p.LeaseRelease(lease)
 	if got := mock.StartedRunsSnapshot(); len(got) != 2 {
 		t.Errorf("started runs = %v, want 2 (re-created on demand)", got)
+	}
+}
+
+// TestIdleRotationSkipsInflight is the regression guard for the P1 idle
+// rotation bug: the idle FINISH pass used to FinishAllRuns every token,
+// killing in-flight chats. Tokens holding a lease must be skipped — their
+// runs stay live until the lease drains (mirrors the bridge idle sweep's
+// busy-entry rule).
+func TestIdleRotationSkipsInflight(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	p := newTestPool(t, mock)
+	cfg := p.cfg.Load()
+	cfg.IdleRotationTimeout = 10 * time.Millisecond
+	p.cfg.Store(cfg)
+
+	// Acquire a lease and HOLD it: the run stays in the run manager.
+	lease, err := p.Acquire(context.Background(), modelA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.LeaseRelease(lease)
+	if got := mock.StartedRunsSnapshot(); len(got) != 1 {
+		t.Fatalf("started runs = %v, want 1", got)
+	}
+
+	// Past the idle threshold: an idle pass must NOT FINISH the held run.
+	time.Sleep(30 * time.Millisecond)
+	p.maintainTick(context.Background())
+	if got := mock.FinishedRunsSnapshot(); len(got) != 0 {
+		t.Fatalf("finished runs = %v, want none (in-flight lease held)", got)
+	}
+
+	// The held lease's run is still live in the manager.
+	if got := p.Snapshot()[0].ActiveRuns; got != 1 {
+		t.Errorf("ActiveRuns = %d, want 1 (run not finished)", got)
 	}
 }
 
@@ -1111,6 +1196,170 @@ func TestMultiTokenRateLimitAndBanFailover(t *testing.T) {
 	_, err = p.Acquire(context.Background(), modelA)
 	if err == nil || !errors.Is(err, upstream.ErrBanned) {
 		t.Errorf("Acquire with all banned = %v, want ban error", err)
+	}
+}
+
+// TestAcquirePrecedenceBannedOverRateLimit pins the mixed-bucket precedence
+// chain: a banned token outranks a rate-limited one, so the pool surfaces
+// 403 banned instead of the generic 502 the historical all-or-nothing
+// aggregation produced.
+func TestAcquirePrecedenceBannedOverRateLimit(t *testing.T) {
+	mock0 := testutil.NewMock()
+	defer mock0.Close()
+	mock1 := testutil.NewMock()
+	defer mock1.Close()
+	p := newTestPool(t, mock0, mock1)
+
+	be := &upstream.BanError{Body: "banned", ResumesAt: time.Now().Add(time.Hour)}
+	rle := &upstream.RateLimitError{Body: "rate limit", RetryAfter: 10 * time.Minute}
+	p.CooldownTokenBan(0, be)
+	p.CooldownTokenRateLimit(1, rle)
+
+	_, err := p.Acquire(context.Background(), modelA)
+	if err == nil || !errors.Is(err, upstream.ErrBanned) {
+		t.Fatalf("banned + rate-limited = %v, want ban (highest precedence)", err)
+	}
+}
+
+// TestAcquirePrecedenceCountryOverRateLimit pins country > rate: a
+// country-blocked token outranks a rate-limited one.
+func TestAcquirePrecedenceCountryOverRateLimit(t *testing.T) {
+	mock0 := testutil.NewMock()
+	defer mock0.Close()
+	mock1 := testutil.NewMock()
+	defer mock1.Close()
+	p := newTestPool(t, mock0, mock1)
+
+	cbe := &upstream.CountryBlockedError{CountryCode: "CN", CountryBlockReason: "region_restricted"}
+	rle := &upstream.RateLimitError{Body: "rate limit", RetryAfter: 10 * time.Minute}
+	p.CooldownTokenCountryBlocked(0, cbe)
+	p.CooldownTokenRateLimit(1, rle)
+
+	_, err := p.Acquire(context.Background(), modelA)
+	if err == nil || !errors.Is(err, upstream.ErrCountryBlocked) {
+		t.Fatalf("country-blocked + rate-limited = %v, want country (precedence over rate)", err)
+	}
+}
+
+// TestAcquirePrecedenceRateOverWaiting pins rate > waiting: with one token
+// queued and another rate-limited, the remembered 429 wins.
+func TestAcquirePrecedenceRateOverWaiting(t *testing.T) {
+	mock0 := testutil.NewMock()
+	defer mock0.Close()
+	mock0.SessionMode = "queued"
+	mock0.QueuePosition = 1
+	mock0.QueueDepth = 3
+	mock1 := testutil.NewMock()
+	defer mock1.Close()
+	p := newTestPool(t, mock0, mock1)
+	p.CooldownTokenRateLimit(1, &upstream.RateLimitError{Body: "rate limit", RetryAfter: 10 * time.Minute})
+
+	_, err := p.Acquire(context.Background(), modelA)
+	if err == nil || !errors.Is(err, upstream.ErrRateLimited) {
+		t.Fatalf("waiting + rate-limited = %v, want rate limit (precedence over waiting)", err)
+	}
+}
+
+// TestAcquireAllCountryBlocked drives the country bucket end-to-end through
+// the session layer: every token's admission returns a 403 country_blocked,
+// the pool cools each down ~15m, records the block for the snapshot, and
+// surfaces the CountryBlockedError (not a generic 502) while remembered.
+func TestAcquireAllCountryBlocked(t *testing.T) {
+	mock0 := testutil.NewMock()
+	defer mock0.Close()
+	mock0.SessionMode = "country_blocked"
+	mock1 := testutil.NewMock()
+	defer mock1.Close()
+	mock1.SessionMode = "country_blocked"
+	p := newTestPool(t, mock0, mock1)
+
+	_, err := p.Acquire(context.Background(), modelA)
+	var cbe *upstream.CountryBlockedError
+	if !errors.As(err, &cbe) {
+		t.Fatalf("want *upstream.CountryBlockedError, got %v", err)
+	}
+	if !errors.Is(err, upstream.ErrCountryBlocked) {
+		t.Errorf("errors.Is(ErrCountryBlocked) = false")
+	}
+
+	// The token cooled down ~15m and the block is recorded in the snapshot
+	// even though the session never admitted (session snapshot is empty).
+	snap := p.Snapshot()[0]
+	if snap.CooldownUntil.Before(time.Now().Add(14 * time.Minute)) {
+		t.Errorf("cooldown until = %v, want ~now+15m", snap.CooldownUntil)
+	}
+	if snap.CountryCode != "CN" || snap.CountryBlockReason != "region_restricted" {
+		t.Errorf("snapshot country = %q/%q, want CN/region_restricted (remembered block)", snap.CountryCode, snap.CountryBlockReason)
+	}
+
+	// The remembered error keeps surfacing on the cooldown skip, and the
+	// blocked tokens are not re-hit upstream.
+	creates := mock0.SessionCreates + mock1.SessionCreates
+	_, err = p.Acquire(context.Background(), modelA)
+	var cbe2 *upstream.CountryBlockedError
+	if !errors.As(err, &cbe2) {
+		t.Fatalf("second acquire: want *upstream.CountryBlockedError, got %v", err)
+	}
+	if got := mock0.SessionCreates + mock1.SessionCreates; got != creates {
+		t.Errorf("session creates after cooldown = %d, want %d (country-cooled tokens must not re-hit)", got, creates)
+	}
+}
+
+// TestTokenSnapshotTierAndCountry pins the TokenSnapshot region/tier fields
+// carried from the admitted session (healthz / /v1/models annotation).
+func TestTokenSnapshotTierAndCountry(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mock.AccessTier = "limited"
+	mock.CountryCode = "US"
+	p := newTestPool(t, mock)
+
+	lease, err := p.Acquire(context.Background(), modelA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lease.TierAccess != "limited" || lease.TierCountry != "US" {
+		t.Errorf("lease tier/country = %q/%q, want limited/US", lease.TierAccess, lease.TierCountry)
+	}
+	p.LeaseRelease(lease)
+
+	snap := p.Snapshot()[0]
+	if snap.TierAccess != "limited" || snap.CountryCode != "US" {
+		t.Errorf("snapshot tier/country = %q/%q, want limited/US", snap.TierAccess, snap.CountryCode)
+	}
+	if snap.CountryBlockReason != "" {
+		t.Errorf("CountryBlockReason = %q, want empty for an admitted session", snap.CountryBlockReason)
+	}
+}
+
+// TestAcquireBridgeCountryCooldown pins the bridge-mode country cooldown: a
+// country_blocked admission cools the entry ~15m, and the cooldown skip
+// surfaces the remembered block instead of re-hitting upstream.
+func TestAcquireBridgeCountryCooldown(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mock.SessionMode = "country_blocked"
+	p := newBridgePool(t, mock)
+
+	_, err := p.AcquireBridge(context.Background(), "client-tok", modelA)
+	var cbe *upstream.CountryBlockedError
+	if !errors.As(err, &cbe) {
+		t.Fatalf("want *upstream.CountryBlockedError, got %v", err)
+	}
+	if !errors.Is(err, upstream.ErrCountryBlocked) {
+		t.Errorf("errors.Is(ErrCountryBlocked) = false")
+	}
+
+	// The entry cooled down: the next acquire skips it and surfaces the
+	// remembered block without a second admission attempt.
+	creates := mock.SessionCreates
+	_, err = p.AcquireBridge(context.Background(), "client-tok", modelA)
+	var cbe2 *upstream.CountryBlockedError
+	if !errors.As(err, &cbe2) {
+		t.Fatalf("second acquire: want *upstream.CountryBlockedError, got %v", err)
+	}
+	if mock.SessionCreates != creates {
+		t.Errorf("session creates = %d, want %d (country-cooled entry must not re-hit upstream)", mock.SessionCreates, creates)
 	}
 }
 
@@ -1501,7 +1750,9 @@ func TestIdleFinishAllRunsHonorsMaintainCtx(t *testing.T) {
 	mock := testutil.NewMock()
 	defer mock.Close()
 	p := newTestPool(t, mock)
-	p.cfg.IdleRotationTimeout = time.Millisecond
+	cfg := p.cfg.Load()
+	cfg.IdleRotationTimeout = time.Millisecond
+	p.cfg.Store(cfg)
 
 	lease, err := p.Acquire(context.Background(), modelA)
 	if err != nil {
@@ -1665,4 +1916,305 @@ func TestShutdownDrainsBridgeEntries(t *testing.T) {
 	if mock.SessionEnds != 2 {
 		t.Errorf("session ends = %d, want 2 (bridge sessions ended on shutdown)", mock.SessionEnds)
 	}
+}
+
+// Runtime token management: AddToken/RemoveLastToken/RemoveAllTokens mutate
+// the pool safely, and a chat through an added token works end to end.
+func TestRuntimeTokenManagement(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	// Bridge-mode pool (zero fixed tokens) pointed at the mock.
+	p := newTestPoolCfg(t, func(c *config.Config) {
+		c.AuthTokens = nil
+		c.UpstreamBaseURL = mock.URL()
+	})
+	if p.TokenCount() != 0 {
+		t.Fatalf("TokenCount = %d, want 0 at start", p.TokenCount())
+	}
+
+	idx, err := p.AddToken("rt-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if idx != 0 || p.TokenCount() != 1 {
+		t.Fatalf("after AddToken: idx=%d count=%d, want 0/1", idx, p.TokenCount())
+	}
+
+	// A real chat through the added token works (mock upstream).
+	lease, err := p.Acquire(context.Background(), modelA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mock.ChatBody = testutil.SSEEvent(`data: {"choices":[{"delta":{"content":"hi"}}]}` + "\n\n")
+	rc, err := p.Chat(context.Background(), lease, upstream.ChatOptions{Model: modelA}, []byte(`{"model":"z-ai/glm-5.2"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = rc.Close()
+	p.LeaseRelease(lease)
+
+	// RemoveLastToken refuses while a lease is in flight.
+	lease2, err := p.Acquire(context.Background(), modelA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.RemoveLastToken(); err == nil {
+		t.Fatal("RemoveLastToken succeeded with an in-flight lease, want refusal")
+	}
+	p.LeaseRelease(lease2)
+
+	if err := p.RemoveLastToken(); err != nil {
+		t.Fatalf("RemoveLastToken: %v", err)
+	}
+	if p.TokenCount() != 0 {
+		t.Fatalf("TokenCount = %d, want 0 after removal", p.TokenCount())
+	}
+
+	// Re-add + remove-all path.
+	if _, err := p.AddToken("rt-2"); err != nil {
+		t.Fatal(err)
+	}
+	p.RemoveAllTokens(context.Background())
+	if p.TokenCount() != 0 {
+		t.Fatalf("TokenCount = %d, want 0 after RemoveAllTokens", p.TokenCount())
+	}
+}
+
+// TestAcquireChatConcurrentTokenMutation is the P1 regression guard for the
+// snapshot double-load race: Acquire used to load p.toks once, then
+// acquireOrder loaded it AGAIN and built indices against the newer
+// (longer) snapshot — an AddToken between the two loads made the failover
+// loop index the stale snapshot past its end and panic with
+// index-out-of-range. The fix passes the single snapshot into acquireOrder
+// (plus a defensive bounds check in the loop), so this hammers Acquire+Chat
+// while a driver goroutine churns AddToken/RemoveLastToken/RemoveAllTokens.
+// The panic window is narrow, so the loop repeats many times; with -race any
+// reintroduced double-load that survives the panics still trips the race
+// detector. Assertion: no panic, and every attempt either succeeds or fails
+// cleanly (never an index-out-of-range).
+func TestAcquireChatConcurrentTokenMutation(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mock.ChatBody = testutil.SSEEvent(`data: {"choices":[{"delta":{"content":"hi"}}]}` + "\n\n")
+	// Session-admission churn: ~2/3 of admits fail (404) in adjacent pairs,
+	// so an Acquire pass walks PAST every failing token to the end of the
+	// order — exactly the path that indexed past the stale snapshot in the
+	// original double-load bug (a success early in the order would return
+	// before the out-of-range index was reached). The sequence is long
+	// enough to cover the whole hammer so the failure mix never exhausts.
+	seq := make([]string, 8000)
+	for i := range seq {
+		if i%3 == 2 {
+			seq[i] = "active"
+		} else {
+			seq[i] = "404"
+		}
+	}
+	mock.SessionSequence = seq
+	// Two fixed tokens to start; the driver churns the list from there.
+	p := newTestPoolCfg(t, func(c *config.Config) {
+		c.UpstreamBaseURL = mock.URL()
+	}, mock, mock)
+
+	ctx := context.Background()
+	body := []byte(`{"model":"z-ai/glm-5.2"}`)
+	const (
+		workers = 8
+		iters   = 250
+		cycles  = 8
+	)
+
+	var (
+		mu       sync.Mutex
+		panics   []string
+		attempts int
+		success  int
+		failure  int
+	)
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < iters; i++ {
+				func() {
+					defer func() {
+						if r := recover(); r != nil {
+							mu.Lock()
+							panics = append(panics, fmt.Sprintf("%v", r))
+							mu.Unlock()
+						}
+					}()
+					lease, err := p.Acquire(ctx, modelA)
+					if err != nil {
+						mu.Lock()
+						attempts++
+						failure++
+						mu.Unlock()
+						return
+					}
+					rc, err := p.Chat(ctx, lease, upstream.ChatOptions{Model: modelA}, body)
+					if err == nil {
+						_ = rc.Close()
+					}
+					p.LeaseRelease(lease)
+					mu.Lock()
+					attempts++
+					success++
+					mu.Unlock()
+				}()
+			}
+		}()
+	}
+
+	// Driver: churn the token list while the workers acquire/chat. AddToken
+	// is the dangerous direction (it grows the snapshot acquireOrder builds
+	// indices against); RemoveLastToken is refused while a lease is in
+	// flight (ignored here), RemoveAllTokens empties the list.
+	for i := 0; i < cycles; i++ {
+		if _, err := p.AddToken(fmt.Sprintf("hammer-%d", i)); err != nil {
+			t.Fatalf("AddToken: %v", err)
+		}
+		_ = p.RemoveLastToken()
+		if _, err := p.AddToken(fmt.Sprintf("hammer-%d", i+100)); err != nil {
+			t.Fatalf("AddToken: %v", err)
+		}
+		p.RemoveAllTokens(ctx)
+		if _, err := p.AddToken(fmt.Sprintf("hammer-%d", i+200)); err != nil {
+			t.Fatalf("AddToken: %v", err)
+		}
+	}
+	wg.Wait()
+
+	if len(panics) > 0 {
+		t.Fatalf("panic(s) under concurrent token mutation: %v", panics)
+	}
+	if attempts != success+failure {
+		t.Fatalf("attempts=%d but success=%d failure=%d", attempts, success, failure)
+	}
+	if success == 0 {
+		t.Fatal("no chat succeeded under the hammer; mutation churn starved the workers")
+	}
+}
+
+// TestUsageAccountingConcurrentTokenMutation is the P2 regression guard for
+// the usage-slice indexing race: recordChat/usageCount/usageResetIn index
+// p.msgsPerToken, which RemoveAllTokens (nil) and RemoveLastToken (truncate)
+// mutate concurrently — usageResetIn previously had no bounds check at all
+// and panicked the moment a capped Acquire raced a removal. This hammers the
+// daily-cap path (usageCount + dailyLimitError -> usageResetIn) and feeds
+// usage via recordChat from a seeder goroutine while the driver churns the
+// token list. Assertion: no panic, every Acquire succeeds or fails cleanly,
+// and the cap path actually fired.
+func TestUsageAccountingConcurrentTokenMutation(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	p := newTestPoolCfg(t, func(c *config.Config) {
+		c.UpstreamBaseURL = mock.URL()
+		c.MaxMessagesPerDay = 3
+	}, mock)
+
+	ctx := context.Background()
+	const (
+		workers = 8
+		iters   = 250
+		cycles  = 6
+	)
+
+	// Deterministic mechanism check: with token 0 pre-seeded past the cap,
+	// a single-threaded Acquire MUST surface the daily-cap 429. This pins
+	// the usageCount + dailyLimitError -> usageResetIn path (the functions
+	// that index p.msgsPerToken) without depending on goroutine scheduling;
+	// the concurrent hammer below covers the mutation race.
+	for range 5 {
+		p.recordChat(0)
+	}
+	if _, err := p.Acquire(ctx, modelA); !errors.Is(err, upstream.ErrRateLimited) {
+		t.Fatalf("capped Acquire err = %v, want ErrRateLimited", err)
+	}
+
+	var (
+		mu        sync.Mutex
+		panics    []string
+		attempts  int
+		success   int
+		failure   int
+		capped429 int
+	)
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < iters; i++ {
+				func() {
+					defer func() {
+						if r := recover(); r != nil {
+							mu.Lock()
+							panics = append(panics, fmt.Sprintf("%v", r))
+							mu.Unlock()
+						}
+					}()
+					lease, err := p.Acquire(ctx, modelA)
+					if err != nil {
+						mu.Lock()
+						attempts++
+						failure++
+						if errors.Is(err, upstream.ErrRateLimited) {
+							capped429++
+						}
+						mu.Unlock()
+						return
+					}
+					p.LeaseRelease(lease)
+					mu.Lock()
+					attempts++
+					success++
+					mu.Unlock()
+				}()
+			}
+		}()
+	}
+
+	// Seeder: record usage on arbitrary indices (valid and stale) so
+	// recordChat itself runs under the driver's mutations (P2 class).
+	seedDone := make(chan struct{})
+	go func() {
+		defer close(seedDone)
+		for i := range cycles * workers * 20 {
+			p.recordChat(i % 8)
+		}
+	}()
+
+	for i := 0; i < cycles; i++ {
+		idx, err := p.AddToken(fmt.Sprintf("usage-%d", i))
+		if err != nil {
+			t.Fatalf("AddToken: %v", err)
+		}
+		// Seed the fresh generation past the cap immediately so the pool is
+		// capped for nearly its whole lifetime: a worker Acquire that lands
+		// here hits the daily-cap path instead of a fresh-token success.
+		for range 3 {
+			p.recordChat(idx)
+		}
+		_ = p.RemoveLastToken() // refused while a lease is in flight — fine
+		p.RemoveAllTokens(ctx)
+		idx, err = p.AddToken(fmt.Sprintf("usage-%d", i+100))
+		if err != nil {
+			t.Fatalf("AddToken: %v", err)
+		}
+		for range 3 {
+			p.recordChat(idx)
+		}
+	}
+	wg.Wait()
+	<-seedDone
+
+	if len(panics) > 0 {
+		t.Fatalf("panic(s) under concurrent token mutation: %v", panics)
+	}
+	if attempts != success+failure {
+		t.Fatalf("attempts=%d but success=%d failure=%d", attempts, success, failure)
+	}
+	t.Logf("hammer: attempts=%d success=%d failure=%d capped429=%d", attempts, success, failure, capped429)
 }

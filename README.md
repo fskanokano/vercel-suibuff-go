@@ -2,7 +2,9 @@
 
 FreeBuff/Codebuff → OpenAI 兼容网关的 **Vercel 部署版**。
 
-上游 [trefeon/freebuff-proxy](https://github.com/trefeon/freebuff-proxy)（Go 网关，把 Codebuff CLI 私有协议翻译成 OpenAI API，带 token 池化、TLS 隐身、配额锁）**零源码改动**直接部署到 Vercel —— 借助 Vercel 的 **Go Framework Preset**（原生 `net/http` Go 服务器，监听 `$PORT`）。
+上游 [trefeon/freebuff-proxy](https://github.com/trefeon/freebuff-proxy)（Go 网关，把 Codebuff CLI 私有协议翻译成 OpenAI API，带 token 池化、TLS 隐身、配额锁、hybrid 模式、内嵌 admin dashboard）**逻辑代码零改动**部署到 Vercel —— 根目录 `main.go` 是原生 `net/http` Go 服务器，监听 `$PORT`，由 `vercel.json` 的 `buildCommand: go build -o server .` 构建。
+
+> ⚠️ **部署模型未验证**：Vercel 官方文档的 Go 支持是 **serverless 函数**（`@vercel/go`，每请求导出 `Handler(w, r)`），并未文档化「Go Framework Preset」或「持久化 net/http 二进制」的部署方式。本仓库 `vercel.json` 能否让 Vercel 把 `go build` 产物作为常驻服务器运行，**尚未经真实部署验证**。上线前请先做一次真实 `vercel --prod` 部署确认，或改用原生支持常驻 Go 二进制的平台（Render / Fly.io / Railway）。
 
 ```
 客户端 (OpenCode/Continue/Cursor/aider/9router)
@@ -16,19 +18,27 @@ codebuff.com 上游
 
 > ⚠️ **ToS 风险**：使用 FreeBuff token 经由代理违反 Codebuff/FreeBuff 服务条款，账号可能被上游风控封禁。请 `SAFE_MODE=true`、控制用量、勿 7×24 无人值守。
 
-## 为什么 Vercel Go Framework Preset
+## 为什么用 Go 二进制（部署模型，未验证）
 
 - **原生 Linux 容器**（非 WASM）：uTLS TLS 指纹、SOCKS5/HTTP 代理全部可用 —— stealth 层完整保留
-- **零源码改动**：`internal/` 全部原样。唯一新增的是根目录 `main.go` —— Vercel Go preset 只识别根级入口（`main.go`/`cmd/api/main.go`/`cmd/server/main.go`），而上游入口在 `cmd/freebuff-proxy/main.go`，所以根目录提供一个**精简镜像入口**（完整代理能力，去掉云上无意义的 `-doctor/-update/-setup`，并遵循 12-factor：`PORT` 存在时优先监听它）
+- **逻辑代码零改动**：`internal/` 全部原样（含 dashboard / egress / logring）。唯一新增的是根目录 `main.go` —— 作为 `vercel.json` 的构建目标（上游入口在 `cmd/freebuff-proxy/main.go`），根目录提供一个**镜像入口**（完整代理能力，去掉云上无意义的 `-doctor/-update/-setup/-test-token` 与交互 banner，并遵循 12-factor：`PORT` 存在时优先监听它）
 - **免费**（Hobby）：100 万 Function Invocations/月 + 360 GB-h + 4 CPU-h + 100 GB 带宽，美东 `iad1` 出口，**无需绑卡**
-- **限制**：单次请求最长 300s（含 SSE 流式，单次 AI 推理足够）；实例空闲 scale-to-zero → 内存态会话/run 池会被重置（每次冷启动重新握手，功能不受影响）
+- **限制**：单次请求最长 300s（含 SSE 流式，单次 AI 推理足够）；实例空闲 scale-to-zero → 内存态会话/run 池、dashboard 状态、日志环会被重置（每次冷启动重新握手，功能不受影响）
+
+## 新特性（本次同步跟进上游）
+
+- **Admin Dashboard**：内嵌单二进制 Web UI（`/admin`，htmx + Pico）。见下方「Admin Dashboard（云端说明）」。
+- **egress 出口探测**：启动时对 Cloudflare trace 探测出口国家/IP（region/tier 模型可用性的依据）。
+- **Hybrid 模式**：`HYBRID_MODE=true` 时 pooled + bridge 共存。
+- **quota 透明**：`/healthz` 新增 per-token `quota` map（上次 admission 携带时）；`/v1/models` 携带 `available`/`status`/`current_access_tier`。
+- **region/tier 模型可用性**：`MODELS_HIDE_UNAVAILABLE=true` 时 `/v1/models` 裁剪不可用模型。
 
 ## 快速部署
 
 ### 方式一：Vercel Dashboard（推荐）
 
 1. 把本仓库导入 Vercel（Import Git Repository）
-2. Framework Preset 自动检测为 **Go**（检测到根目录 `go.mod` + `vercel.json`）
+2. Build 命令为 `go build -o server .`（由 `vercel.json` 指定）。⚠️ 该常驻二进制部署方式未经验证（见顶部警告）
 3. **Environment Variables**（Settings → Environment Variables）：
    | 变量 | 必填 | 说明 |
    |---|---|---|
@@ -36,6 +46,7 @@ codebuff.com 上游
    | （不设 `AUTH_TOKENS`） | 二选一 | Bridge 模式：客户端自带上游 token |
    | `AUTO_DISCOVER_TOKEN` | ✅ | `false`（云上没有本地 CLI 登录文件） |
    | `API_KEYS` | 可选 | 代理自身鉴权 key |
+   | `ADMIN_TOKEN` | **强烈建议** | 保护 `/admin` dashboard 与 `/admin/reload`（公网可达，见下文） |
 4. Deploy。完成后：
 
 ```bash
@@ -48,8 +59,8 @@ curl -H "Authorization: Bearer <key>" https://<your-project>.vercel.app/v1/model
 ```bash
 npm i -g vercel
 vercel env add AUTH_TOKENS        # cb_...
-vercel env add AUTH_TOKENS        # cb_...
 vercel env add AUTO_DISCOVER_TOKEN  # false
+vercel env add ADMIN_TOKEN          # openssl rand -hex 16
 vercel --prod
 ```
 
@@ -65,22 +76,36 @@ export OPENAI_API_KEY=<API_KEYS 或 cb_ token>
 
 ## 环境变量（云上适用子集）
 
-完整清单见上游 README；云端只需要这些：
+完整清单见上游 README；云端关注这些：
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `LISTEN_ADDR` | `127.0.0.1:3457` | 无需设置；Vercel 注入 `PORT` 时优先监听它（本地自建才需要） |
 | `AUTH_TOKENS` | 空 | Pooled 模式 token 列表；空 = Bridge 模式 |
+| `HYBRID_MODE` | false | pooled + bridge 共存：客户端自带 token 走 bridge，无 token 走池 |
+| `MODELS_HIDE_UNAVAILABLE` | false | `/v1/models` 裁剪 region/tier 不可用模型 |
 | `AUTO_DISCOVER_TOKEN` | true | **必须**设为 `false` |
 | `API_KEYS` | 空 | 代理自身客户端鉴权 |
+| `ADMIN_TOKEN` | 空 | 保护 `/admin` dashboard 与 `/admin/reload`（**公网必设**，见下文） |
 | `SAFE_MODE` | true | 反封禁预设（TLS 指纹/header 清洗/jitter/轮换） |
-| `TLS_FINGERPRINT` | chrome | `chrome\|firefox\|safari\|edge\|random` |
+| `TLS_FINGERPRINT` | auto | `auto \| chrome120 \| chrome126 \| safari17 \| safari18 \| firefox120 \| firefox128 \| edge126 \| random` |
 | `UPSTREAM_BASE_URL` | `https://codebuff.com` | 上游地址 |
-| `LOG_LEVEL` | info | 日志级别 |
 | `REQUEST_TIMEOUT` | 15m | 单请求超时（≤ Vercel 300s 上限） |
+| `SESSION_CALL_TIMEOUT` | 30s | 会话调用超时 |
+| `TRANSIENT_RETRIES` | 1 | 瞬时传输失败额外重试次数 |
+| `IDLE_ROTATION_TIMEOUT` | 0 | 空闲后结束 run（SAFE_MODE 下默认 30m） |
+| `SOCKS5_PROXY` / `SOCKS5_PROXIES` | 空 | 出站 SOCKS5 代理（单/按 token 列表；云上一般无需） |
 | `COST_MODE` | free | free 档 |
 
-云端无意义（无需配置）：`LOG_FILE`、`ADMIN_TOKEN`、`-doctor/-update/-setup`、token 自动发现。
+## Admin Dashboard（云端说明）
+
+上游新增内嵌管理后台，Vercel 上同样随二进制提供，但**功能受限**：
+
+- **只读状态页**（`/admin` overview / tokens / models / traces / metrics / setup）可访问，展示 token 会话状态、配额、用量、最近请求 trace 等。
+- **写操作**（config 编辑器、token add/remove、mode 切换、smoke、diag）在**未设 `ADMIN_TOKEN` 时要求 loopback 客户端**，而 Vercel 上请求来自边缘（非 loopback）→ 实际被拒；且 config 编辑器写 `.env` 在只读文件系统上也会失败。这些功能在 serverless 上本就无意义。
+- **重要**：`ADMIN_TOKEN` 现在同时保护 `/admin` dashboard 与 `/admin/reload`。Vercel 实例是**公网可达**，强烈建议设置 `ADMIN_TOKEN`（`openssl rand -hex 16`），否则任何知道 URL 的人都能查看 dashboard 状态页。
+
+云端无意义（无需配置）：`LOG_FILE`、`DEBUG_DUMP`（写 `./dump/`）、dashboard 的 `.env` 编辑/持久化、`-doctor/-update/-setup/-test-token`、CLI token 自动发现。
 
 ## 本地运行 / 测试
 
@@ -91,16 +116,18 @@ LISTEN_ADDR=:3457 AUTO_DISCOVER_TOKEN=false API_KEYS=test \
 # 另开终端：
 curl http://127.0.0.1:3457/healthz
 curl -H "Authorization: Bearer test" http://127.0.0.1:3457/v1/models
-go test ./...                            # 上游完整测试套件（11 包全过）
+go test ./...                            # 上游完整测试套件（全过）
 ```
 
-> 根目录 `main.go` 是 Vercel 检测入口（镜像上游启动逻辑，去掉 `-doctor/-update/-setup`）；完整版入口在 `cmd/freebuff-proxy/main.go`，本地自建部署可用它。
+> 根目录 `main.go` 是 Vercel 检测入口（镜像上游启动逻辑，去掉 `-doctor/-update/-setup/-test-token`）；完整版入口在 `cmd/freebuff-proxy/main.go`，本地自建部署可用它。
 
-## 与上游的差异（云环境所致，非代码改动）
+## 与上游的差异（云环境所致，非逻辑代码改动）
 
 | 特性 | 本地/自建 | Vercel 上 |
 |---|---|---|
 | 会话/run 池 | 内存常驻，跨请求复用 | 实例 scale-to-zero，空闲后重置（冷启动重建） |
+| dashboard / 日志环 | 内存常驻 | 冷启动重置；写 `.env` 只读失败 |
+| egress 探测 | 本机出口 | iad1 美东（region/tier 降级依据） |
 | 请求时长 | 无硬限制 | **300s 上限**（Hobby） |
 | 出口 | 本机 IP / 自配代理 | 美东 iad1（动态 IP） |
 | `/admin/reload` | 热重载本地 .env | 无意义（无本地配置文件） |
@@ -109,7 +136,7 @@ go test ./...                            # 上游完整测试套件（11 包全�
 ## 上游
 
 - 项目：https://github.com/trefeon/freebuff-proxy
-- 协议转换层（`internal/convert`、`internal/upstream`、`internal/stealth`、`internal/registry`）随上游更新，本仓库保持零改动镜像，可 `git pull` 上游同步。
+- 同步基线：上游 commit `39fd436`（2026-08-16）。协议转换层（`internal/convert`、`internal/upstream`、`internal/stealth`、`internal/registry`、`internal/dashboard`、`internal/egress`、`internal/logring`）随上游更新；本仓库逻辑代码与上游逐字节一致，唯一差异是根 `main.go`、`vercel.json`、本 README（Vercel 适配层）。
 
 ## License
 

@@ -1,24 +1,30 @@
 package upstream
 
 import (
+	"bufio"
 	"bytes"
 	"compress/flate"
 	"compress/gzip"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/andybalholm/brotli"
+	"github.com/klauspost/compress/zstd"
 
 	"freebuff-proxy/internal/config"
 	"freebuff-proxy/internal/stealth"
@@ -261,7 +267,7 @@ func TestErrorClassification(t *testing.T) {
 		{"waiting room 503", 503, `{"error":"waiting_room_queued"}`, ErrWaitingRoom},
 		{"waiting room body", 429, `{"error":"waiting_room_required"}`, ErrSessionInvalid},
 		{"generic", 500, `{"error":"boom"}`, &UpstreamError{Status: 500}},
-		{"402 out of credits", 402, `{"error":"out of credits"}`, &UpstreamError{Status: 402}},
+		{"402 out of credits", 402, `{"error":"out of credits"}`, ErrCredits},
 	}
 
 	for _, tc := range cases {
@@ -418,6 +424,54 @@ func TestSessionCallParsesRateLimitsByModel(t *testing.T) {
 	}
 }
 
+// TestSessionCallParsesLimitedModelOffers verifies the limited-tier per-model
+// allowances from an admission response are parsed into SessionState,
+// including flex-time userResetAt.
+func TestSessionCallParsesLimitedModelOffers(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mock.SessionHandler = func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"status":"active","instanceId":"inst-abc-123","accessTier":"limited","limitedModelOffers":[{"model":"deepseek/deepseek-v4-flash","remaining":3,"total":5,"userRemaining":3,"userResetAt":"2026-08-16T07:00:00.000Z"}]}`)
+	}
+
+	client, _ := New("tok", testConfig(mock.URL(), nil))
+	st, err := client.CreateSession(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(st.LimitedModelOffers) != 1 {
+		t.Fatalf("LimitedModelOffers len = %d, want 1: %+v", len(st.LimitedModelOffers), st.LimitedModelOffers)
+	}
+	offer := st.LimitedModelOffers[0]
+	if offer.Model != "deepseek/deepseek-v4-flash" {
+		t.Errorf("model = %q", offer.Model)
+	}
+	if offer.Remaining != 3 || offer.Total != 5 || offer.UserRemaining != 3 {
+		t.Errorf("offer = %+v, want remaining=3 total=5 userRemaining=3", offer)
+	}
+	wantReset := time.Date(2026, 8, 16, 7, 0, 0, 0, time.UTC)
+	if !offer.UserResetAt.Equal(wantReset) {
+		t.Errorf("UserResetAt = %v, want %v", offer.UserResetAt, wantReset)
+	}
+}
+
+// TestSessionCallIgnoresMissingLimitedModelOffers verifies a full-tier or
+// compact admission without limitedModelOffers parses cleanly (nil slice).
+func TestSessionCallIgnoresMissingLimitedModelOffers(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+
+	client, _ := New("tok", testConfig(mock.URL(), nil))
+	st, err := client.CreateSession(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.LimitedModelOffers != nil {
+		t.Errorf("LimitedModelOffers = %+v, want nil when absent", st.LimitedModelOffers)
+	}
+}
+
 func TestSession404Mapping(t *testing.T) {
 	// A create 404 means no session slot exists upstream → disabled.
 	mock := testutil.NewMock()
@@ -531,12 +585,335 @@ func TestProxyWiring(t *testing.T) {
 	}
 }
 
+// TestSOCKS5RotationDisablesKeepAlives verifies round-robin/random rotation
+// is not defeated by pooled idle connections: with multiple SOCKS5 proxies
+// the transport must redial per request (DisableKeepAlives) so the
+// per-request proxy choice is actually dialed, while the single-proxy path
+// keeps pooled connections.
+func TestSOCKS5RotationDisablesKeepAlives(t *testing.T) {
+	multi, err := New("tok", testConfig("", func(c *config.Config) {
+		c.SOCKS5Proxies = []string{"socks5://127.0.0.1:1001", "socks5://127.0.0.1:1002"}
+		c.ProxyRotation = "round-robin"
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !multi.http.Transport.(*http.Transport).DisableKeepAlives {
+		t.Error("multi-proxy rotation must disable keep-alives so every request dials through its assigned proxy")
+	}
+
+	single, err := New("tok", testConfig("", func(c *config.Config) { c.SOCKS5Proxy = "socks5://127.0.0.1:1080" }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if single.http.Transport.(*http.Transport).DisableKeepAlives {
+		t.Error("single SOCKS5 proxy must keep pooled keep-alive connections")
+	}
+}
+
+// TestSOCKS5IgnoresEnvProxy verifies the SOCKS5 branches drop the
+// ProxyFromEnvironment inherited from http.DefaultTransport.Clone: an
+// operator HTTP_PROXY/HTTPS_PROXY env var must never double-route SOCKS5
+// traffic through a second proxy.
+func TestSOCKS5IgnoresEnvProxy(t *testing.T) {
+	t.Setenv("HTTP_PROXY", "http://127.0.0.1:9998")
+	t.Setenv("HTTPS_PROXY", "http://127.0.0.1:9998")
+
+	multi, err := New("tok", testConfig("", func(c *config.Config) {
+		c.SOCKS5Proxies = []string{"socks5://127.0.0.1:1001", "socks5://127.0.0.1:1002"}
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tr := multi.http.Transport.(*http.Transport); tr.Proxy != nil {
+		t.Error("SOCKS5_PROXIES transport still routes via ProxyFromEnvironment")
+	}
+
+	single, err := New("tok", testConfig("", func(c *config.Config) { c.SOCKS5Proxy = "socks5://127.0.0.1:1080" }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tr := single.http.Transport.(*http.Transport); tr.Proxy != nil {
+		t.Error("SOCKS5_PROXY transport still routes via ProxyFromEnvironment")
+	}
+}
+
+// TestHTTPProxyStealthUsesConnectTunnel verifies HTTP_PROXY + TLS_FINGERPRINT
+// routes the stealth dialer through an explicit CONNECT tunnel instead of
+// transport.Proxy: Go calls DialTLSContext with the proxy's address for
+// proxied HTTPS (not the origin), so transport.Proxy would hand the stealth
+// ClientHello to the plain CONNECT proxy and break the tunnel.
+func TestHTTPProxyStealthUsesConnectTunnel(t *testing.T) {
+	stealthClient, err := New("tok", testConfig("", func(c *config.Config) {
+		c.HTTPProxy = "http://127.0.0.1:9999"
+		c.TLSFingerprint = "chrome126"
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr := stealthClient.http.Transport.(*http.Transport)
+	if tr.Proxy != nil {
+		t.Error("HTTP_PROXY + TLS_FINGERPRINT must not route via transport.Proxy (Go would TLS to the proxy, not the origin)")
+	}
+	if tr.DialTLSContext == nil {
+		t.Error("HTTP_PROXY + TLS_FINGERPRINT must wire the stealth DialTLSContext over the CONNECT tunnel")
+	}
+
+	plainClient, err := New("tok", testConfig("", func(c *config.Config) { c.HTTPProxy = "http://127.0.0.1:9999" }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	plainTr := plainClient.http.Transport.(*http.Transport)
+	if plainTr.Proxy == nil {
+		t.Error("HTTP_PROXY without TLS_FINGERPRINT should keep transport.Proxy routing")
+	}
+	if plainTr.DialTLSContext != nil {
+		t.Error("HTTP_PROXY without TLS_FINGERPRINT must not wire DialTLSContext")
+	}
+}
+
+// TestHTTPConnectDial exercises the CONNECT tunnel against a real proxy
+// listener: the CONNECT request line carries the target, Proxy-Authorization
+// is sent when the proxy URL has credentials, bytes flow both ways through
+// the tunnel, and a non-200 CONNECT response is rejected.
+func TestHTTPConnectDial(t *testing.T) {
+	t.Run("tunnel", func(t *testing.T) {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = ln.Close() }()
+
+		type proxyObs struct {
+			reqLine string
+			echo    string
+		}
+		obs := make(chan proxyObs, 1)
+		go func() {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			defer func() { _ = conn.Close() }()
+			br := bufio.NewReader(conn)
+			reqLine, err := br.ReadString('\n')
+			if err != nil {
+				return
+			}
+			for {
+				line, err := br.ReadString('\n')
+				if err != nil || line == "\r\n" {
+					break
+				}
+			}
+			_, _ = io.WriteString(conn, "HTTP/1.1 200 Connection established\r\n\r\n")
+			buf := make([]byte, 4)
+			if _, err := io.ReadFull(br, buf); err != nil {
+				return
+			}
+			_, _ = io.WriteString(conn, "pong")
+			obs <- proxyObs{reqLine: reqLine, echo: string(buf)}
+		}()
+
+		dial := httpConnectDial(&url.URL{Scheme: "http", Host: ln.Addr().String()})
+		conn, err := dial(context.Background(), "tcp", "origin.example:443")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = conn.Close() }()
+		if _, err := conn.Write([]byte("ping")); err != nil {
+			t.Fatal(err)
+		}
+		reply := make([]byte, 4)
+		if _, err := io.ReadFull(conn, reply); err != nil {
+			t.Fatal(err)
+		}
+		if string(reply) != "pong" {
+			t.Errorf("tunnel reply = %q, want pong", reply)
+		}
+		got := <-obs
+		if !strings.Contains(got.reqLine, "CONNECT origin.example:443 HTTP/1.1") {
+			t.Errorf("CONNECT request line = %q, want target origin.example:443", got.reqLine)
+		}
+		if got.echo != "ping" {
+			t.Errorf("tunnel carried %q, want ping", got.echo)
+		}
+	})
+
+	t.Run("proxy auth", func(t *testing.T) {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = ln.Close() }()
+
+		authCh := make(chan string, 1)
+		go func() {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			defer func() { _ = conn.Close() }()
+			br := bufio.NewReader(conn)
+			var auth string
+			for {
+				line, err := br.ReadString('\n')
+				if err != nil {
+					return
+				}
+				if strings.HasPrefix(strings.ToLower(line), "proxy-authorization:") {
+					auth = strings.TrimSpace(line[strings.IndexByte(line, ':')+1:])
+				}
+				if line == "\r\n" {
+					break
+				}
+			}
+			_, _ = io.WriteString(conn, "HTTP/1.1 200 Connection established\r\n\r\n")
+			authCh <- auth
+			_, _ = io.Copy(io.Discard, br)
+		}()
+
+		dial := httpConnectDial(&url.URL{Scheme: "http", User: url.UserPassword("alice", "s3cret"), Host: ln.Addr().String()})
+		conn, err := dial(context.Background(), "tcp", "origin.example:443")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = conn.Close() }()
+		want := "Basic " + base64.StdEncoding.EncodeToString([]byte("alice:s3cret"))
+		if got := <-authCh; !strings.EqualFold(got, want) {
+			t.Errorf("Proxy-Authorization = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("non-200 rejected", func(t *testing.T) {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = ln.Close() }()
+		go func() {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			defer func() { _ = conn.Close() }()
+			br := bufio.NewReader(conn)
+			for {
+				line, err := br.ReadString('\n')
+				if err != nil || line == "\r\n" {
+					break
+				}
+			}
+			_, _ = io.WriteString(conn, "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
+		}()
+
+		dial := httpConnectDial(&url.URL{Scheme: "http", Host: ln.Addr().String()})
+		conn, err := dial(context.Background(), "tcp", "origin.example:443")
+		if err == nil {
+			_ = conn.Close()
+			t.Fatal("CONNECT through a 403 proxy succeeded, want error")
+		}
+		if !strings.Contains(err.Error(), "403") {
+			t.Errorf("error = %q, want proxy 403 status", err)
+		}
+	})
+}
+
+// TestCrossHostRedirectStripsToken verifies a cross-host redirect does not
+// carry x-codebuff-api-key (or Authorization): Go strips the latter itself
+// but not the former, so the raw token used to leak to any redirect target.
+// Same-host redirects keep their credentials (CDN / bare-host -> www).
+func TestCrossHostRedirectStripsToken(t *testing.T) {
+	const token = "tok-secret-redirect"
+
+	keySeen := make(chan string, 1)
+	authSeen := make(chan string, 1)
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		keySeen <- r.Header.Get("x-codebuff-api-key")
+		authSeen <- r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer target.Close()
+
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL+"/final", http.StatusTemporaryRedirect)
+	}))
+	defer origin.Close()
+
+	client, err := New(token, testConfig(origin.URL, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := client.newRequest(context.Background(), http.MethodGet, "/start", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := client.http.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if got := <-keySeen; got != "" {
+		t.Errorf("cross-host redirect carried x-codebuff-api-key %q, want stripped", got)
+	}
+	if got := <-authSeen; got != "" {
+		t.Errorf("cross-host redirect carried Authorization %q, want stripped", got)
+	}
+
+	sameKey := make(chan string, 1)
+	same := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/start" {
+			http.Redirect(w, r, "/final", http.StatusTemporaryRedirect)
+			return
+		}
+		sameKey <- r.Header.Get("x-codebuff-api-key")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer same.Close()
+
+	sameClient, err := New(token, testConfig(same.URL, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sameReq, err := sameClient.newRequest(context.Background(), http.MethodGet, "/start", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sameResp, err := sameClient.http.Do(sameReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = sameResp.Body.Close()
+	if got := <-sameKey; got != token {
+		t.Errorf("same-host redirect carried x-codebuff-api-key %q, want %q kept", got, token)
+	}
+}
+
 func TestClientIDFormat(t *testing.T) {
 	for i := 0; i < 50; i++ {
 		id := generateClientID()
 		if !regexp.MustCompile(`^[0-9a-z]{13}$`).MatchString(id) {
 			t.Fatalf("client_id %q not 13-char base36", id)
 		}
+	}
+}
+
+// TestGenerateClientIDFallbackPads verifies the time-seeded fallback never
+// panics on a short base36 value: UnixNano in base36 is 12 digits today, and
+// the old [:13] slice on it panicked whenever crypto/rand failed. The shared
+// padBase36 helper must always yield the SDK's 13-char id.
+func TestGenerateClientIDFallbackPads(t *testing.T) {
+	for i := 0; i < 10; i++ {
+		fallback := padBase36(strconv.FormatInt(time.Now().UnixNano(), 36))
+		if !regexp.MustCompile(`^[0-9a-z]{13}$`).MatchString(fallback) {
+			t.Fatalf("time fallback client_id %q not 13-char base36", fallback)
+		}
+	}
+	if got := padBase36("abc"); got != "0000000000abc" {
+		t.Errorf("padBase36(abc) = %q, want 0000000000abc (13 chars)", got)
+	}
+	if got := padBase36("0123456789abc"); got != "0123456789abc" {
+		t.Errorf("padBase36(13-char) = %q, want unchanged", got)
 	}
 }
 
@@ -694,7 +1071,14 @@ func TestWrapDecompress(t *testing.T) {
 			_ = zw.Close()
 			return buf.Bytes()
 		}, ""},
-		{"unsupported encoding", "zstd", nil, "unsupported Content-Encoding"},
+		{"zstd", "zstd", func(b []byte) []byte {
+			var buf bytes.Buffer
+			zw, _ := zstd.NewWriter(&buf)
+			_, _ = zw.Write(b)
+			_ = zw.Close()
+			return buf.Bytes()
+		}, ""},
+		{"unsupported encoding", "lz4", nil, "unsupported Content-Encoding"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -800,6 +1184,101 @@ func TestClassifyBanUnixMsResumesAt(t *testing.T) {
 				t.Errorf("ResumesAt = %v, want %v", be.ResumesAt, tc.want)
 			}
 		})
+	}
+}
+
+// TestClassifyCredits verifies a 402 payment-required response maps to a
+// CreditsError unwrapping to ErrCredits (fresh free accounts hit this before
+// the free tier kicks in, so it must NOT fall through to a generic
+// UpstreamError).
+func TestClassifyCredits(t *testing.T) {
+	err := classifyError(402, `{"error":"insufficient credits"}`, http.Header{})
+	var credErr *CreditsError
+	if !errors.As(err, &credErr) {
+		t.Fatalf("want CreditsError, got %v", err)
+	}
+	if credErr.Status != 402 {
+		t.Errorf("status = %d, want 402", credErr.Status)
+	}
+	if !errors.Is(err, ErrCredits) {
+		t.Error("not unwrap-able to ErrCredits")
+	}
+}
+
+// TestClassifyFreeModeCLIRequired verifies the free-tier gate refusal is
+// typed, so the gateway can distinguish "envelope missing" from a hard 403.
+func TestClassifyFreeModeCLIRequired(t *testing.T) {
+	body := `{"error":{"status":"free_mode_cli_required","message":"CLI fingerprint required for free tier"}}`
+	err := classifyError(403, body, http.Header{})
+	if !errors.Is(err, ErrFreeModeCLIRequired) {
+		t.Fatalf("errors.Is(ErrFreeModeCLIRequired) = false, got %v", err)
+	}
+}
+
+// TestClassifyCountryBlocked verifies a 403 country_blocked response maps to
+// a CountryBlockedError carrying the parsed region fields.
+func TestClassifyCountryBlocked(t *testing.T) {
+	body := `{"status":"country_blocked","countryCode":"US","countryBlockReason":"Free mode is not available in your country","ipPrivacySignals":["vpn","proxy"]}`
+	err := classifyError(403, body, http.Header{})
+	var cbe *CountryBlockedError
+	if !errors.As(err, &cbe) {
+		t.Fatalf("want CountryBlockedError, got %v", err)
+	}
+	if cbe.CountryCode != "US" {
+		t.Errorf("countryCode = %q, want US", cbe.CountryCode)
+	}
+	if cbe.CountryBlockReason != "Free mode is not available in your country" {
+		t.Errorf("countryBlockReason = %q", cbe.CountryBlockReason)
+	}
+	if len(cbe.IpPrivacySignals) != 2 || cbe.IpPrivacySignals[0] != "vpn" || cbe.IpPrivacySignals[1] != "proxy" {
+		t.Errorf("ipPrivacySignals = %v", cbe.IpPrivacySignals)
+	}
+	if !errors.Is(err, ErrCountryBlocked) {
+		t.Error("not unwrap-able to ErrCountryBlocked")
+	}
+}
+
+// TestClassifyCountryBlockedToleratesAbsentFields verifies a bare
+// country_blocked body (compact poll) still classifies without panicking and
+// leaves the optional fields zero.
+func TestClassifyCountryBlockedToleratesAbsentFields(t *testing.T) {
+	err := classifyError(403, `{"status":"country_blocked"}`, http.Header{})
+	var cbe *CountryBlockedError
+	if !errors.As(err, &cbe) {
+		t.Fatalf("want CountryBlockedError, got %v", err)
+	}
+	if cbe.CountryCode != "" || cbe.CountryBlockReason != "" || len(cbe.IpPrivacySignals) != 0 {
+		t.Errorf("expected zero optional fields, got %+v", cbe)
+	}
+	if !errors.Is(err, ErrCountryBlocked) {
+		t.Error("not unwrap-able to ErrCountryBlocked")
+	}
+}
+
+// TestClassifyDeploymentOutsideHoursRetryable verifies a
+// deployment_outside_hours body (when no other classifier claims it) maps to
+// an UpstreamError marked Retryable, not a hard failure.
+func TestClassifyDeploymentOutsideHoursRetryable(t *testing.T) {
+	err := classifyError(500, `{"status":"deployment_outside_hours","message":"Free mode is only available during operating hours"}`, http.Header{})
+	var upErr *UpstreamError
+	if !errors.As(err, &upErr) {
+		t.Fatalf("want UpstreamError, got %v", err)
+	}
+	if !upErr.Retryable {
+		t.Error("Retryable = false, want true")
+	}
+	if upErr.Status != 500 {
+		t.Errorf("status = %d, want 500", upErr.Status)
+	}
+
+	// Ordinary 500s stay non-retryable.
+	errPlain := classifyError(500, `{"error":"boom"}`, http.Header{})
+	var plain *UpstreamError
+	if !errors.As(errPlain, &plain) {
+		t.Fatalf("want UpstreamError, got %v", errPlain)
+	}
+	if plain.Retryable {
+		t.Error("plain UpstreamError must not be Retryable")
 	}
 }
 

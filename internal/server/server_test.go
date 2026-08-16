@@ -69,7 +69,7 @@ func newTestServerCfg(t *testing.T, apiKeys []string, mut func(*config.Config), 
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := server.New(cfg, p, reg, nil)
+	srv := server.New(cfg, p, reg, nil, nil, "")
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
 	return ts, p
@@ -557,10 +557,13 @@ func TestModelsEndpoint(t *testing.T) {
 	var out struct {
 		Object string `json:"object"`
 		Data   []struct {
-			ID      string `json:"id"`
-			Object  string `json:"object"`
-			Created int64  `json:"created"`
-			OwnedBy string `json:"owned_by"`
+			ID                string `json:"id"`
+			Object            string `json:"object"`
+			Created           int64  `json:"created"`
+			OwnedBy           string `json:"owned_by"`
+			Available         bool   `json:"available"`
+			Status            string `json:"status"`
+			CurrentAccessTier string `json:"current_access_tier"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(data, &out); err != nil {
@@ -578,6 +581,14 @@ func TestModelsEndpoint(t *testing.T) {
 		}
 		if m.Created != out.Data[0].Created {
 			t.Errorf("model %d created = %d, want %d (pinned to server start)", i, m.Created, out.Data[0].Created)
+		}
+		// Advisory annotation: never hide a working model, so available is
+		// true and status "unknown" when no session has reported anything.
+		if !m.Available {
+			t.Errorf("model %s available = false, want true (advisory default)", m.ID)
+		}
+		if m.Status == "" {
+			t.Errorf("model %s status empty, want a status string", m.ID)
 		}
 	}
 	if out.Data[0].Created <= 0 || out.Data[0].Created > time.Now().Unix() {
@@ -697,6 +708,230 @@ func TestHealthzQuota(t *testing.T) {
 	}
 	if len(out.Tokens[0].Entitlement) != 0 {
 		t.Errorf("top-level entitlement = %+v, want omitted (empty)", out.Tokens[0].Entitlement)
+	}
+}
+
+// TestModelsAnnotationWithQuota verifies /v1/models reflects a session that
+// admitted a model: status becomes "available" once quotaByModel mentions it,
+// and current_access_tier carries the admission's tier.
+func TestModelsAnnotationWithQuota(t *testing.T) {
+	mock := quotaMock(t)
+	mock.AccessTier = "limited"
+	mock.CountryCode = "US"
+	ts, _ := newTestServer(t, nil, mock)
+
+	resp, data := doJSON(t, http.MethodPost, ts.URL+"/v1/chat/completions", chatBody(modelA), nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("chat status = %d, want 200: %s", resp.StatusCode, data)
+	}
+
+	resp, data = doJSON(t, http.MethodGet, ts.URL+"/v1/models", nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("models status = %d, want 200: %s", resp.StatusCode, data)
+	}
+	var out struct {
+		Data []struct {
+			ID                string `json:"id"`
+			Available         bool   `json:"available"`
+			Status            string `json:"status"`
+			CurrentAccessTier string `json:"current_access_tier"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(data, &out); err != nil {
+		t.Fatalf("models is not JSON: %v: %s", err, data)
+	}
+	var found *struct {
+		ID                string `json:"id"`
+		Available         bool   `json:"available"`
+		Status            string `json:"status"`
+		CurrentAccessTier string `json:"current_access_tier"`
+	}
+	for i := range out.Data {
+		if out.Data[i].ID == modelA {
+			found = &out.Data[i]
+			break
+		}
+	}
+	if found == nil {
+		t.Fatalf("model %q not in /v1/models", modelA)
+	}
+	if !found.Available {
+		t.Errorf("available = false, want true")
+	}
+	if found.Status != "available" {
+		t.Errorf("status = %q, want available (session admitted the model)", found.Status)
+	}
+	if found.CurrentAccessTier != "limited" {
+		t.Errorf("current_access_tier = %q, want limited (from session admission)", found.CurrentAccessTier)
+	}
+}
+
+// TestModelsRegionLimited verifies the tier-aware annotation: with a token in
+// the 'limited' tier (region/privacy demotion), a model outside the limited
+// allowlist with no admission signal is marked available=false +
+// status=region_limited, while an allowlisted model (deepseek-v4-flash) stays
+// available. An admitted model keeps its available status (admission is
+// ground truth).
+func TestModelsRegionLimited(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mock.AccessTier = "limited"
+	mock.CountryCode = "US"
+	ts, _ := newTestServer(t, nil, mock)
+
+	// Admit a session so the token's snapshot carries tier=limited. The
+	// admitted model (modelA) becomes available by admission.
+	resp, data := doJSON(t, http.MethodPost, ts.URL+"/v1/chat/completions", chatBody(modelA), nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("chat status = %d, want 200: %s", resp.StatusCode, data)
+	}
+
+	resp, data = doJSON(t, http.MethodGet, ts.URL+"/v1/models", nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("models status = %d, want 200: %s", resp.StatusCode, data)
+	}
+	var out struct {
+		Data []struct {
+			ID        string `json:"id"`
+			Available bool   `json:"available"`
+			Status    string `json:"status"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(data, &out); err != nil {
+		t.Fatalf("models is not JSON: %v: %s", err, data)
+	}
+	byID := map[string]struct {
+		Available bool
+		Status    string
+	}{}
+	for _, m := range out.Data {
+		byID[m.ID] = struct {
+			Available bool
+			Status    string
+		}{m.Available, m.Status}
+	}
+	// deepseek-v4-flash is on the limited allowlist -> available.
+	if m, ok := byID["deepseek/deepseek-v4-flash"]; !ok || !m.Available {
+		t.Errorf("deepseek-v4-flash = %+v, want available:true on limited tier", m)
+	}
+	// anthropic/claude-fable-5 is NOT on the limited allowlist and was never
+	// admitted -> available:false + region_limited.
+	if m, ok := byID["anthropic/claude-fable-5"]; !ok {
+		t.Errorf("fable-5 missing from /v1/models")
+	} else if m.Available {
+		t.Errorf("fable-5 available = true, want false on limited tier")
+	} else if m.Status != "region_limited" {
+		t.Errorf("fable-5 status = %q, want region_limited", m.Status)
+	}
+}
+
+// TestModelsHideUnavailable verifies MODELS_HIDE_UNAVAILABLE=true prunes
+// region-limited models from the list so picker clients cannot select them.
+func TestModelsHideUnavailable(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mock.AccessTier = "limited"
+	mock.CountryCode = "US"
+	ts, _ := newTestServerCfg(t, nil, func(c *config.Config) {
+		c.ModelsHideUnavailable = true
+	}, mock)
+
+	// Admit a session so the token snapshot carries tier=limited.
+	resp, data := doJSON(t, http.MethodPost, ts.URL+"/v1/chat/completions", chatBody(modelA), nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("chat status = %d, want 200: %s", resp.StatusCode, data)
+	}
+
+	resp, data = doJSON(t, http.MethodGet, ts.URL+"/v1/models", nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("models status = %d, want 200: %s", resp.StatusCode, data)
+	}
+	var out struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(data, &out); err != nil {
+		t.Fatalf("models is not JSON: %v: %s", err, data)
+	}
+	for _, m := range out.Data {
+		if m.ID == "anthropic/claude-fable-5" {
+			t.Errorf("fable-5 present in /v1/models with MODELS_HIDE_UNAVAILABLE=true")
+		}
+	}
+	found := false
+	for _, m := range out.Data {
+		if m.ID == "deepseek/deepseek-v4-flash" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("deepseek-v4-flash pruned, want kept (limited allowlist)")
+	}
+}
+
+// TestSmokeDefaultsToFallbackModel verifies the smoke test with no explicit
+// model probes the guaranteed fallback (deepseek-v4-flash), not the
+// alphabetical-first catalog model (anthropic/claude-fable-5, a gated offer).
+func TestSmokeDefaultsToFallbackModel(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mock.ChatBody = testutil.SSEEvent(chunk("chatcmpl-sm", 1, `"choices":[{"index":0,"delta":{"content":"ping"},"finish_reason":"stop"}]`))
+	ts, _ := newTestServer(t, nil, mock)
+
+	// Smoke with no model field: server picks the fallback.
+	resp, data := doJSON(t, http.MethodPost, ts.URL+"/admin/smoke", []byte(`{"prompt":"ping"}`), nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("smoke status = %d, want 200: %s", resp.StatusCode, data)
+	}
+	if len(mock.RecordedChatHeaders) == 0 {
+		t.Fatal("no upstream chat recorded")
+	}
+	if got := mock.RecordedChatHeaders[0].Get("x-freebuff-model"); got != "deepseek/deepseek-v4-flash" {
+		t.Errorf("smoke probe model = %q, want deepseek/deepseek-v4-flash", got)
+	}
+}
+
+// TestHealthzModeTierCountry verifies healthz surfaces the effective routing
+// mode plus the per-token tier/country from the session admission.
+func TestHealthzModeTierCountry(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mock.AccessTier = "limited"
+	mock.CountryCode = "US"
+	ts, _ := newTestServer(t, nil, mock)
+
+	resp, data := doJSON(t, http.MethodPost, ts.URL+"/v1/chat/completions", chatBody(modelA), nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("chat status = %d, want 200: %s", resp.StatusCode, data)
+	}
+
+	resp, data = doJSON(t, http.MethodGet, ts.URL+"/healthz", nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("healthz status = %d, want 200: %s", resp.StatusCode, data)
+	}
+	var out struct {
+		Mode   string `json:"mode"`
+		Tokens []struct {
+			Tier    string `json:"tier"`
+			Country string `json:"country"`
+		} `json:"tokens"`
+	}
+	if err := json.Unmarshal(data, &out); err != nil {
+		t.Fatalf("healthz is not JSON: %v: %s", err, data)
+	}
+	if out.Mode != "pooled" {
+		t.Errorf("mode = %q, want pooled", out.Mode)
+	}
+	if len(out.Tokens) != 1 {
+		t.Fatalf("tokens = %d, want 1", len(out.Tokens))
+	}
+	if out.Tokens[0].Tier != "limited" {
+		t.Errorf("tier = %q, want limited", out.Tokens[0].Tier)
+	}
+	if out.Tokens[0].Country != "US" {
+		t.Errorf("country = %q, want US", out.Tokens[0].Country)
 	}
 }
 
@@ -961,7 +1196,7 @@ func newBridgeTestServer(t *testing.T, mock *testutil.MockUpstream) (*httptest.S
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := server.New(cfg, p, reg, nil)
+	srv := server.New(cfg, p, reg, nil, nil, "")
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
 	return ts, p
@@ -1117,6 +1352,215 @@ func TestBridgeModeChat401Cooldown(t *testing.T) {
 	}
 }
 
+// TestHybridModeChatRouting verifies hybrid mode routes per request: a
+// client-supplied token is relayed upstream like bridge, and a token-less
+// request falls back to the pooled AUTH_TOKENS.
+func TestHybridModeChatRouting(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mock.ChatBody = testutil.SSEEvent(chunk("chatcmpl-h1", 1, `"choices":[{"index":0,"delta":{"content":"hybrid"},"finish_reason":null}]`))
+	ts, p := newTestServerCfg(t, nil, func(c *config.Config) {
+		c.HybridMode = true
+		c.UpstreamBaseURL = mock.URL() // bridge leases build clients from the pool cfg
+	}, mock)
+	_ = p
+	chatURL := ts.URL + "/v1/chat/completions"
+
+	// Client token present → bridge relay: the upstream sees the client token.
+	resp, data := doJSON(t, http.MethodPost, chatURL, chatBody(modelA), map[string]string{"Authorization": "Bearer client-hybrid-1"})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("token request status = %d, want 200: %s", resp.StatusCode, data)
+	}
+	if !strings.Contains(string(data), "hybrid") {
+		t.Errorf("stream missing content: %s", data)
+	}
+
+	// Token-less → pooled: the upstream sees the configured pool token.
+	resp, data = doJSON(t, http.MethodPost, chatURL, chatBody(modelA), nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("token-less request status = %d, want 200: %s", resp.StatusCode, data)
+	}
+
+	if len(mock.RecordedChatHeaders) != 2 {
+		t.Fatalf("upstream chat calls = %d, want 2", len(mock.RecordedChatHeaders))
+	}
+	if got := mock.RecordedChatHeaders[0].Get("Authorization"); got != "Bearer client-hybrid-1" {
+		t.Errorf("token request upstream Authorization = %q, want %q", got, "Bearer client-hybrid-1")
+	}
+	if got := mock.RecordedChatHeaders[1].Get("Authorization"); got != "Bearer tok-0" {
+		t.Errorf("token-less request upstream Authorization = %q, want %q (pooled)", got, "Bearer tok-0")
+	}
+
+	// healthz reports the hybrid mode.
+	resp, data = doJSON(t, http.MethodGet, ts.URL+"/healthz", nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("healthz status = %d, want 200: %s", resp.StatusCode, data)
+	}
+	var out struct {
+		Mode string `json:"mode"`
+	}
+	if err := json.Unmarshal(data, &out); err != nil {
+		t.Fatalf("healthz is not JSON: %v: %s", err, data)
+	}
+	if out.Mode != "hybrid" {
+		t.Errorf("mode = %q, want hybrid", out.Mode)
+	}
+}
+
+// TestHybridModeNoTokensRequiresPooledFallback verifies hybrid without any
+// AUTH_TOKENS: a client token still relays (bridge path), while a token-less
+// request fails with the pooled no-tokens error instead of the bridge 401 —
+// the mode-switch warning ("token-less requests will 502 until a token is
+// added") is what the operator sees.
+func TestHybridModeNoTokensRequiresPooledFallback(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mock.ChatBody = testutil.SSEEvent(chunk("chatcmpl-h2", 2, `"choices":[{"index":0,"delta":{"content":"relayed"},"finish_reason":null}]`))
+	// Mirrors newBridgeTestServer (no AUTH_TOKENS) plus HYBRID_MODE.
+	cfg := &config.Config{
+		RotationInterval:   time.Hour,
+		RequestTimeout:     15 * time.Minute,
+		SessionCallTimeout: 5 * time.Second,
+		RegistryRefresh:    6 * time.Hour,
+		UpstreamBaseURL:    mock.URL(),
+		HybridMode:         true,
+	}
+	reg := registry.New(cfg, nil)
+	reg.LoadFallback()
+	p, err := pool.New(cfg, nil, nil, reg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := server.New(cfg, p, reg, nil, nil, "")
+	ts := httptest.NewServer(srv.Handler())
+	t.Cleanup(ts.Close)
+
+	// Client token relays fine.
+	resp, data := doJSON(t, http.MethodPost, ts.URL+"/v1/chat/completions", chatBody(modelA), map[string]string{"Authorization": "Bearer client-hybrid-2"})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("token request status = %d, want 200: %s", resp.StatusCode, data)
+	}
+	// Token-less request fails as pooled-no-tokens (not the bridge 401).
+	resp, data = doJSON(t, http.MethodPost, ts.URL+"/v1/chat/completions", chatBody(modelA), nil)
+	if resp.StatusCode == http.StatusUnauthorized {
+		t.Fatalf("token-less hybrid status = 401, want a pooled no-tokens failure (not bridge 401): %s", data)
+	}
+	if strings.Contains(string(data), "missing_bearer_token") {
+		t.Errorf("token-less hybrid body = %s, must not claim bridge mode", data)
+	}
+}
+
+// TestHybridModeXAPIKeyStaysPooled verifies hybrid routing never relays an
+// x-api-key upstream: x-api-key is the API_KEYS scheme for pooled clients,
+// and a Bearer token is the only bridge discriminator. A pooled client using
+// x-api-key must hit the pool (and fail API_KEYS auth when the key is not
+// configured) instead of having its key sent to the upstream service.
+func TestHybridModeXAPIKeyStaysPooled(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mock.ChatBody = testutil.SSEEvent(chunk("chatcmpl-h3", 3, `"choices":[{"index":0,"delta":{"content":"pooled"},"finish_reason":null}]`))
+	// API_KEYS configured: pooled requests must authenticate with them.
+	ts, _ := newTestServerCfg(t, []string{"sk-pooled"}, func(c *config.Config) {
+		c.HybridMode = true
+		c.UpstreamBaseURL = mock.URL()
+	}, mock)
+	chatURL := ts.URL + "/v1/chat/completions"
+
+	// x-api-key with the configured pool key -> pooled path, 200.
+	resp, data := doJSON(t, http.MethodPost, chatURL, chatBody(modelA), map[string]string{"x-api-key": "sk-pooled"})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("x-api-key pooled status = %d, want 200: %s", resp.StatusCode, data)
+	}
+	// x-api-key without a valid pool key -> 401 (API_KEYS gate), and the
+	// key must never reach the upstream as a bridge relay.
+	resp, data = doJSON(t, http.MethodPost, chatURL, chatBody(modelA), map[string]string{"x-api-key": "sk-any"})
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("x-api-key invalid status = %d, want 401: %s", resp.StatusCode, data)
+	}
+	// Bearer still relays as bridge.
+	resp, data = doJSON(t, http.MethodPost, chatURL, chatBody(modelA), map[string]string{"Authorization": "Bearer client-hybrid-3"})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("bearer status = %d, want 200: %s", resp.StatusCode, data)
+	}
+	if len(mock.RecordedChatHeaders) != 2 {
+		t.Fatalf("upstream chat calls = %d, want 2 (pooled + bearer bridge)", len(mock.RecordedChatHeaders))
+	}
+	if got := mock.RecordedChatHeaders[0].Get("Authorization"); got != "Bearer tok-0" {
+		t.Errorf("x-api-key pooled upstream Authorization = %q, want %q", got, "Bearer tok-0")
+	}
+	for i, h := range mock.RecordedChatHeaders {
+		if v := h.Get("x-api-key"); v == "sk-pooled" || v == "sk-any" {
+			t.Errorf("upstream call %d carried an operator x-api-key %q upstream", i, v)
+		}
+	}
+}
+
+// TestUpstreamRetryableMapsTo503 verifies a Retryable UpstreamError
+// (deployment_outside_hours) surfaces as 503 upstream_retryable so clients
+// back off and retry later, not a hard 502.
+func TestUpstreamRetryableMapsTo503(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mock.ChatStatus = http.StatusServiceUnavailable
+	mock.ChatErrorBody = `{"error":"deployment_outside_hours"}`
+	ts, _ := newTestServer(t, nil, mock)
+	resp, data := doJSON(t, http.MethodPost, ts.URL+"/v1/chat/completions", chatBody(modelA), nil)
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503: %s", resp.StatusCode, data)
+	}
+	if !strings.Contains(string(data), "upstream_retryable") {
+		t.Errorf("body = %s, want upstream_retryable code", data)
+	}
+}
+
+// TestUpstreamRetryableNotBlindRetried verifies chatAttempt does NOT retry a
+// Retryable UpstreamError (deployment_outside_hours): the flag means "worth
+// retrying later", not "transient", so a blind retry must not burn a second
+// lease against the same wall. The mock must see exactly one chat call.
+func TestUpstreamRetryableNotBlindRetried(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	var chatCalls atomic.Int32
+	mock.ChatHandler = func(w http.ResponseWriter, r *http.Request) {
+		chatCalls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = io.WriteString(w, `{"error":{"message":"deployment_outside_hours","type":"upstream_error","code":"deployment_outside_hours"}}`)
+	}
+	ts, _ := newTestServer(t, nil, mock)
+	resp, data := doJSON(t, http.MethodPost, ts.URL+"/v1/chat/completions", chatBody(modelA), nil)
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503: %s", resp.StatusCode, data)
+	}
+	if !strings.Contains(string(data), "upstream_retryable") {
+		t.Errorf("body = %s, want upstream_retryable code", data)
+	}
+	if got := chatCalls.Load(); got != 1 {
+		t.Errorf("upstream chat calls = %d, want 1 (Retryable errors must not be blind-retried)", got)
+	}
+}
+
+// TestBridgeModeHealthzReportsMode pins the healthz "mode" field in pure
+// bridge mode.
+func TestBridgeModeHealthzReportsMode(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	ts, _ := newBridgeTestServer(t, mock)
+	resp, data := doJSON(t, http.MethodGet, ts.URL+"/healthz", nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("healthz status = %d, want 200: %s", resp.StatusCode, data)
+	}
+	var out struct {
+		Mode string `json:"mode"`
+	}
+	if err := json.Unmarshal(data, &out); err != nil {
+		t.Fatalf("healthz is not JSON: %v: %s", err, data)
+	}
+	if out.Mode != "bridge" {
+		t.Errorf("mode = %q, want bridge", out.Mode)
+	}
+}
+
 func TestChatModelAliasesAndReasoningEffort(t *testing.T) {
 	mock := testutil.NewMock()
 	defer mock.Close()
@@ -1136,7 +1580,7 @@ func TestChatModelAliasesAndReasoningEffort(t *testing.T) {
 		ModelAliases: map[string]string{
 			"gpt-4o": modelA,
 		},
-	}, p, reg, nil)
+	}, p, reg, nil, nil, "")
 	tsAlias := httptest.NewServer(srv.Handler())
 	t.Cleanup(tsAlias.Close)
 
@@ -1218,7 +1662,7 @@ func TestMetricsTransientRetryCounters(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := server.New(cfg, p, reg, nil)
+	srv := server.New(cfg, p, reg, nil, nil, "")
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
 
@@ -1239,5 +1683,24 @@ func TestMetricsTransientRetryCounters(t *testing.T) {
 	// and the fingerprint value line must not be emitted (only when > 0).
 	if strings.Contains(body, "freebuff_proxy_fingerprint_rotations_total{token=\"1\"}") {
 		t.Errorf("metrics emitted a fingerprint rotation value with no rotation: %s", body)
+	}
+}
+
+// RequestsServed counts successful upstream chats in bridge mode too (the
+// metrics page reads it, so it must not stay 0 when no AUTH_TOKENS exist).
+func TestBridgeRequestsServedCounter(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mock.ChatBody = testutil.SSEEvent(chunk("chatcmpl-b2", 1, `"choices":[{"index":0,"delta":{"content":"x"},"finish_reason":null}]`))
+	ts, p := newBridgeTestServer(t, mock)
+	chatURL := ts.URL + "/v1/chat/completions"
+	for range 3 {
+		resp, data := doJSON(t, http.MethodPost, chatURL, chatBody(modelA), map[string]string{"Authorization": "Bearer client-tok"})
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d: %s", resp.StatusCode, data)
+		}
+	}
+	if got := p.PoolSnapshot().RequestsServed; got != 3 {
+		t.Fatalf("RequestsServed = %d, want 3 (bridge chats must count)", got)
 	}
 }

@@ -19,6 +19,7 @@ import (
 	"runtime"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"freebuff-proxy/internal/config"
@@ -43,6 +44,16 @@ const fetchTimeout = 30 * time.Second
 // maxFetchBytes caps a single registry source read (2 MiB). A source larger
 // than this fails the fetch, which keeps the previous registry state.
 const maxFetchBytes = 2 << 20
+
+// LimitedTierModels is the model set available to 'limited' access-tier
+// accounts (egress region demotion, privacy-signal demotion). Mirrors the
+// upstream LIMITED_FREEBUFF_MODEL_IDS constant
+// (freebuff/common/src/constants/freebuff-models.ts): deepseek-v4-flash +
+// mimo-v2.5. Used to annotate /v1/models availability per token tier.
+var LimitedTierModels = map[string]bool{
+	"deepseek/deepseek-v4-flash": true,
+	"mimo/mimo-v2.5":             true,
+}
 
 // fallbackAgents is the hardcoded model→agent fallback used when the sources
 // are unreachable. Ported verbatim from registry.js (lines 14-41), entry
@@ -85,8 +96,8 @@ var ErrModelNotFound = errors.New("model not found in registry")
 // Registry is a concurrency-safe model→agent mapping with periodic refresh.
 type Registry struct {
 	mu     sync.RWMutex
-	cfg    *config.Config // reserved for later slices (custom source URLs)
-	client *http.Client   // fetch client; redirects followed, fetchTimeout applied
+	cfg    atomic.Pointer[config.Config] // swapped atomically on reload (SetConfig)
+	client *http.Client                  // fetch client; redirects followed, fetchTimeout applied
 
 	sources      []string // override of the default 5 source URLs (tests)
 	modelToAgent map[string]string
@@ -96,13 +107,25 @@ type Registry struct {
 
 // New returns a Registry that fetches from the default Codebuff sources.
 // client is used for all fetches; when nil, a client with the 30s fetch
-// timeout is used. cfg is currently informational (later slices may read
-// custom source URLs / debug dump from it).
+// timeout is used. cfg is stored as the initial config the registry reads
+// (currently only MODEL_ALIASES resolution); SetConfig replaces it at
+// runtime after a dashboard save or /admin/reload.
 func New(cfg *config.Config, client *http.Client) *Registry {
 	if client == nil {
 		client = &http.Client{Timeout: fetchTimeout}
 	}
-	return &Registry{cfg: cfg, client: client}
+	r := &Registry{client: client}
+	if cfg != nil {
+		r.cfg.Store(cfg)
+	}
+	return r
+}
+
+// SetConfig atomically replaces the config the registry reads, so alias
+// resolution (ResolveModel) reflects a dashboard .env save or /admin/reload
+// without a restart. A nil cfg clears the stored config.
+func (r *Registry) SetConfig(cfg *config.Config) {
+	r.cfg.Store(cfg)
 }
 
 // SetSources overrides the source URLs fetched by Refresh (mainly for tests,
@@ -181,8 +204,12 @@ func (r *Registry) LoadFallback() {
 // ResolveModel resolves an alias (e.g. "gpt-4o") to its real model ID if mapped
 // in cfg.ModelAliases, or returns model unchanged.
 func (r *Registry) ResolveModel(model string) string {
-	if r != nil && r.cfg != nil && len(r.cfg.ModelAliases) > 0 {
-		if realModel, ok := r.cfg.ModelAliases[model]; ok && realModel != "" {
+	if r == nil {
+		return model
+	}
+	cfg := r.cfg.Load()
+	if cfg != nil && len(cfg.ModelAliases) > 0 {
+		if realModel, ok := cfg.ModelAliases[model]; ok && realModel != "" {
 			return realModel
 		}
 	}

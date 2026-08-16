@@ -15,23 +15,35 @@ package server
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"math"
 	"net"
 	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"freebuff-proxy/internal/config"
 	"freebuff-proxy/internal/convert"
+	"freebuff-proxy/internal/dashboard"
+	"freebuff-proxy/internal/logring"
 	"freebuff-proxy/internal/pool"
 	"freebuff-proxy/internal/registry"
 	"freebuff-proxy/internal/runs"
@@ -55,17 +67,34 @@ type Server struct {
 	reg     *registry.Registry
 	logger  *slog.Logger
 	started time.Time
+
+	// dash is the embedded admin UI (htmx + vendored assets).
+	dash *dashboard.Dashboard
+	// adminAuth guards the dashboard: a stateless HMAC-signed session cookie
+	// issued against ADMIN_TOKEN, plus a per-IP login rate limiter.
+	adminAuth *adminAuth
+	// adminSaveMu serializes .env saves (config editor) so a rejected save
+	// cannot clobber a newer accepted one.
+	adminSaveMu sync.Mutex
+	// configPath is the -config JSON path ("" when none); reloads re-apply it
+	// so JSON overrides survive dashboard saves and /admin/reload.
+	configPath string
 }
 
 // New builds the server over the configured pool and registry. A nil logger
 // falls back to slog.Default(). The started timestamp pins /v1/models
-// "created" and /healthz uptime.
-func New(cfg *config.Config, p *pool.Pool, reg *registry.Registry, logger *slog.Logger) *Server {
+// "created" and /healthz uptime. logs is the optional dashboard log viewer
+// ring (nil disables the /admin/logs page data). configPath is the -config
+// JSON path the process was started with ("" = none), used by reloads so a
+// dashboard save or /admin/reload re-applies the JSON overrides.
+func New(cfg *config.Config, p *pool.Pool, reg *registry.Registry, logger *slog.Logger, logs *logring.Handler, configPath string) *Server {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	s := &Server{pool: p, reg: reg, logger: logger, started: time.Now()}
+	s := &Server{pool: p, reg: reg, logger: logger, started: time.Now(), configPath: configPath}
 	s.cfg.Store(cfg)
+	s.dash = dashboard.New(func() *config.Config { return s.cfg.Load() }, p, reg, logger, logs)
+	s.adminAuth = newAdminAuth()
 	return s
 }
 
@@ -77,7 +106,34 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/models", s.requireAuth(s.handleModels))
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
 	mux.HandleFunc("GET /metrics", s.handleMetrics)
-	mux.HandleFunc("POST /admin/reload", s.requireAdminToken(s.requireAuth(s.handleReload)))
+	mux.HandleFunc("POST /admin/reload", s.requireAdminToken(s.requireAuth(s.adminCSRF(http.HandlerFunc(s.handleReload)))))
+	// Admin dashboard: cookie-authenticated browser UI. Assets are static
+	// and public — the login page (served without a cookie) references them,
+	// so they must NOT sit behind dashboardAuth. Overview/tokens/metrics are
+	// read-only status and stay open when ADMIN_TOKEN is unset (legacy).
+	// Config (read + write) and logs expose secrets and are gated further:
+	// with ADMIN_TOKEN unset they require a loopback client.
+	mux.HandleFunc("GET /admin/login", s.handleAdminLogin)
+	mux.HandleFunc("POST /admin/login", s.handleAdminLogin)
+	mux.Handle("GET /admin", s.dashboardAuth(s.dash.Page("overview")))
+	mux.Handle("GET /admin/tokens", s.dashboardAuth(s.dash.Page("tokens")))
+	mux.Handle("GET /admin/models", s.dashboardAuth(s.dash.Page("models")))
+	mux.Handle("GET /admin/traces", s.dashboardAuth(s.dash.Page("traces")))
+	mux.Handle("GET /admin/setup", s.dashboardAuth(s.dash.Page("setup")))
+	mux.Handle("GET /admin/config", s.dashboardAuth(s.adminSensitive(s.dash.Page("config"))))
+	mux.Handle("GET /admin/logs", s.dashboardAuth(s.adminSensitive(s.dash.Page("logs"))))
+	mux.Handle("GET /admin/metrics", s.dashboardAuth(s.dash.Page("metrics")))
+	mux.Handle("POST /admin/config", s.dashboardAuth(s.adminSensitive(s.adminCSRF(http.HandlerFunc(s.handleConfigSave)))))
+	mux.Handle("POST /admin/tokens/{id}/unlock", s.dashboardAuth(s.adminSensitive(s.adminCSRF(http.HandlerFunc(s.handleTokenUnlock)))))
+	mux.Handle("POST /admin/tokens/{id}/finish", s.dashboardAuth(s.adminSensitive(s.adminCSRF(http.HandlerFunc(s.handleTokenFinish)))))
+	mux.Handle("POST /admin/tokens/{id}/test", s.dashboardAuth(s.adminSensitive(s.adminCSRF(http.HandlerFunc(s.handleTokenTest)))))
+	mux.Handle("POST /admin/tokens/test-all", s.dashboardAuth(s.adminSensitive(s.adminCSRF(http.HandlerFunc(s.handleTokenTestAll)))))
+	mux.Handle("POST /admin/tokens/add", s.dashboardAuth(s.adminSensitive(s.adminCSRF(http.HandlerFunc(s.handleTokenAdd)))))
+	mux.Handle("POST /admin/tokens/remove", s.dashboardAuth(s.adminSensitive(s.adminCSRF(http.HandlerFunc(s.handleTokenRemove)))))
+	mux.Handle("POST /admin/mode", s.dashboardAuth(s.adminSensitive(s.adminCSRF(http.HandlerFunc(s.handleModeSwitch)))))
+	mux.Handle("POST /admin/diag", s.dashboardAuth(s.adminSensitive(s.adminCSRF(http.HandlerFunc(s.handleDiag)))))
+	mux.Handle("POST /admin/smoke", s.dashboardAuth(s.adminSensitive(s.adminCSRF(http.HandlerFunc(s.handleSmoke)))))
+	mux.Handle("GET /admin/assets/", http.StripPrefix("/admin/assets/", noDirListing(http.FileServerFS(mustSubFS(dashboard.AssetsFS(), "assets")))))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
@@ -129,6 +185,29 @@ func (w *statusWriter) Push(target string, opts *http.PushOptions) error {
 	return http.ErrNotSupported
 }
 
+// mustSubFS returns the named subtree of an embed.FS. The directory is
+// embedded at compile time, so a missing subtree is an invariant violation,
+// not a runtime condition.
+func mustSubFS(fsys fs.FS, dir string) fs.FS {
+	sub, err := fs.Sub(fsys, dir)
+	if err != nil {
+		panic("dashboard: embedded subtree missing: " + err.Error())
+	}
+	return sub
+}
+
+// noDirListing rejects directory requests so FileServerFS never renders an
+// index listing of the embedded assets.
+func noDirListing(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/") {
+			http.NotFound(w, r)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 // remoteHost returns the client host without the port.
 func remoteHost(r *http.Request) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
@@ -144,11 +223,18 @@ func remoteHost(r *http.Request) string {
 // are configured the handler passes through untouched; /healthz is always
 // exempt (the caller wires it without requireAuth). Bridge mode (no
 // AUTH_TOKENS) also passes through: the Authorization header IS the upstream
-// token there, and API_KEYS is meaningless.
+// token there, and API_KEYS is meaningless. Hybrid mode passes a Bearer
+// token through (bridge relay: the client's own FreeBuff credential), but
+// token-less requests fall back to the pool and must still pass the
+// API_KEYS gate — an x-api-key is the API_KEYS scheme, never a bridge token.
 func (s *Server) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		cfg := s.cfg.Load()
 		if len(cfg.APIKeys) == 0 || cfg.BridgeMode() {
+			next(w, r)
+			return
+		}
+		if cfg.HybridMode && bearerToken(r) != "" {
 			next(w, r)
 			return
 		}
@@ -208,6 +294,984 @@ func (s *Server) requireAdminToken(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+// --- dashboard auth ---
+
+// adminCookieName is the HttpOnly session cookie set after a successful
+// ADMIN_TOKEN login. The value is stateless: unix expiry + HMAC-SHA256 over
+// the expiry, keyed by a per-process random secret. No server-side session
+// store; restart invalidates all sessions, which is the safe default for an
+// admin UI.
+const (
+	adminCookieName = "fb_admin"
+	adminCookieTTL  = 24 * time.Hour
+)
+
+// adminAuth issues and validates dashboard session cookies and rate-limits
+// login attempts per remote IP.
+type adminAuth struct {
+	key   [32]byte
+	mu    sync.Mutex
+	fails map[string]failEntry
+}
+
+// failEntry tracks consecutive failed logins from one IP.
+type failEntry struct {
+	count int
+	until time.Time
+}
+
+func newAdminAuth() *adminAuth {
+	a := &adminAuth{fails: make(map[string]failEntry)}
+	_, _ = rand.Read(a.key[:])
+	return a
+}
+
+// cookieValue builds "expiry.hmac" for the given expiry.
+func (a *adminAuth) cookieValue(expiry time.Time) string {
+	mac := hmac.New(sha256.New, a.key[:])
+	_, _ = mac.Write([]byte(strconv.FormatInt(expiry.Unix(), 10)))
+	return strconv.FormatInt(expiry.Unix(), 10) + "." + hex.EncodeToString(mac.Sum(nil))
+}
+
+// valid reports whether the cookie value carries a not-yet-expired HMAC
+// signature. Constant-time comparison via hmac.Equal.
+func (a *adminAuth) valid(value string) bool {
+	dot := strings.IndexByte(value, '.')
+	if dot < 0 {
+		return false
+	}
+	exp, err := strconv.ParseInt(value[:dot], 10, 64)
+	if err != nil || time.Now().Unix() >= exp {
+		return false
+	}
+	mac := hmac.New(sha256.New, a.key[:])
+	_, _ = mac.Write([]byte(value[:dot]))
+	got, err := hex.DecodeString(value[dot+1:])
+	if err != nil || !hmac.Equal(got, mac.Sum(nil)) {
+		return false
+	}
+	return true
+}
+
+// maxLoginFails caps consecutive failed logins from one IP before lockout;
+// loginFailsCap bounds the fails map so distinct IP scans cannot grow it
+// without bound (expired entries are dropped on access).
+const (
+	maxLoginFails = 5
+	loginLockout  = time.Minute
+	loginFailsCap = 1024
+)
+
+func (a *adminAuth) setCookie(w http.ResponseWriter, secure bool) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     adminCookieName,
+		Value:    a.cookieValue(time.Now().Add(adminCookieTTL)),
+		Path:     "/admin",
+		HttpOnly: true,
+		SameSite: http.SameSiteStrictMode,
+		Secure:   secure,
+		MaxAge:   int(adminCookieTTL.Seconds()),
+	})
+}
+
+// allow reports whether ip may attempt a login right now. Entries track the
+// running failure count until a lockout is set (until non-zero); an expired
+// lockout is dropped so the map does not grow without bound.
+func (a *adminAuth) allow(ip string) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	e, ok := a.fails[ip]
+	if !ok {
+		return true
+	}
+	if !e.until.IsZero() {
+		if time.Now().Before(e.until) {
+			return false
+		}
+		delete(a.fails, ip)
+	}
+	return true
+}
+
+// recordFail counts a failed login, locking ip out after maxLoginFails. The
+// map is capped: when a new IP arrives at the cap, expired entries are swept
+// first, then the oldest remaining lockout is dropped (a brute-force scan
+// rotating fresh IPs cannot grow the map without bound).
+func (a *adminAuth) recordFail(ip string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	e := a.fails[ip]
+	e.count++
+	if e.count >= maxLoginFails {
+		e.until = time.Now().Add(loginLockout)
+		e.count = 0
+	}
+	if _, exists := a.fails[ip]; !exists && len(a.fails) >= loginFailsCap {
+		now := time.Now()
+		for k, v := range a.fails {
+			if now.After(v.until) {
+				delete(a.fails, k)
+			}
+		}
+		if len(a.fails) >= loginFailsCap {
+			// No expired entries to reclaim — drop one lockout (map
+			// iteration order is fine; the bound is what matters).
+			for k := range a.fails {
+				delete(a.fails, k)
+				break
+			}
+		}
+	}
+	a.fails[ip] = e
+}
+
+func (a *adminAuth) clearFails(ip string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	delete(a.fails, ip)
+}
+
+// dashboardAuth guards the browser UI. With ADMIN_TOKEN unset the dashboard
+// is open (legacy behavior, matching /admin/reload; main.go warns at startup).
+// Otherwise the request must carry a valid fb_admin cookie; missing/invalid
+// sessions are redirected to the login page. htmx polls get 401 + HX-Redirect
+// so the login page replaces the swapped region instead of a bare fragment.
+func (s *Server) dashboardAuth(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cfg := s.cfg.Load()
+		if cfg.AdminToken == "" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if c, err := r.Cookie(adminCookieName); err == nil && s.adminAuth.valid(c.Value) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if r.Header.Get("HX-Request") == "true" {
+			w.Header().Set("HX-Redirect", "/admin/login")
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		http.Redirect(w, r, "/admin/login", http.StatusFound)
+	})
+}
+
+// adminSensitive gates the secret-bearing admin routes (config read/write,
+// logs) in the default-open mode: when ADMIN_TOKEN is unset, only loopback
+// clients may access them, so a remotely reachable proxy cannot leak or let
+// anyone rewrite the .env. With ADMIN_TOKEN set the cookie gate already ran
+// (this middleware is wrapped inside dashboardAuth).
+func (s *Server) adminSensitive(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cfg := s.cfg.Load()
+		if cfg.AdminToken == "" && !isLoopback(r) {
+			s.dash.RenderRestricted(w, r, "This page is only available to loopback clients while ADMIN_TOKEN is unset.")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// isLoopback reports whether the request came from a loopback address.
+func isLoopback(r *http.Request) bool {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return false
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+// adminCSRF rejects cross-origin mutating admin requests. Browsers send
+// Origin (and/or Sec-Fetch-Site) on every POST; a malicious site's form
+// would carry an Origin that does not match the proxy's own host. Requests
+// with NEITHER header (curl, API clients, legacy tests) pass through, so the
+// admin API stays scriptable while a victim's browser cannot drive the
+// dashboard cross-site. Origin is compared case-insensitively per RFC 6454
+// host matching; Sec-Fetch-Site must be same-origin or none (direct
+// navigation). Wired inside dashboardAuth → adminSensitive so the cookie
+// and loopback gates still run first.
+func (s *Server) adminCSRF(next http.Handler) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			if origin := r.Header.Get("Origin"); origin != "" {
+				u, err := url.Parse(origin)
+				if err != nil || !strings.EqualFold(u.Host, r.Host) {
+					w.Header().Set("Content-Type", "text/html; charset=utf-8")
+					w.WriteHeader(http.StatusForbidden)
+					s.dash.RenderConfigResult(w, r, false, "Cross-origin request rejected.")
+					return
+				}
+			}
+			if sfs := strings.ToLower(strings.TrimSpace(r.Header.Get("Sec-Fetch-Site"))); sfs != "" {
+				if sfs != "same-origin" && sfs != "none" {
+					w.Header().Set("Content-Type", "text/html; charset=utf-8")
+					w.WriteHeader(http.StatusForbidden)
+					s.dash.RenderConfigResult(w, r, false, "Cross-origin request rejected.")
+					return
+				}
+			}
+		}
+		next.ServeHTTP(w, r)
+	}
+}
+
+// handleAdminLogin renders the login page and processes the token form:
+// constant-time ADMIN_TOKEN comparison, per-IP rate limiting, and a signed
+// session cookie on success. With ADMIN_TOKEN unset it redirects straight to
+// the dashboard.
+func (s *Server) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
+	cfg := s.cfg.Load()
+	if cfg.AdminToken == "" {
+		http.Redirect(w, r, "/admin", http.StatusFound)
+		return
+	}
+	ip := remoteHost(r)
+	if r.Method == http.MethodPost {
+		if !s.adminAuth.allow(ip) {
+			s.dash.RenderLogin(w, r, "Too many failed attempts — try again in a minute.")
+			return
+		}
+		token := r.FormValue("token")
+		if subtle.ConstantTimeCompare([]byte(token), []byte(cfg.AdminToken)) == 1 {
+			s.adminAuth.clearFails(ip)
+			// Secure only when the login arrived over an actual TLS
+			// connection (direct HTTPS or a TLS-terminating reverse proxy
+			// setting X-Forwarded-Proto). A Secure cookie over plain HTTP is
+			// rejected by browsers, silently breaking remote login.
+			s.adminAuth.setCookie(w, r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https"))
+			http.Redirect(w, r, "/admin", http.StatusFound)
+			return
+		}
+		s.adminAuth.recordFail(ip)
+		s.dash.RenderLogin(w, r, "Invalid admin token.")
+		return
+	}
+	s.dash.RenderLogin(w, r, "")
+}
+
+// maxEnvSize caps the .env editor payload (64KB is generous for a config file).
+const maxEnvSize = 64 << 10
+
+// tokenActionID parses the {id} path value into a 0-based token index.
+func tokenActionID(r *http.Request) (int, error) {
+	id, err := strconv.Atoi(r.PathValue("id"))
+	if err != nil || id < 0 {
+		return 0, errors.New("invalid token id")
+	}
+	return id, nil
+}
+
+// handleTokenUnlock clears a token's cooldown/rate-limit/ban lock. Gated as
+// sensitive: unlocking a banned token lets upstream traffic resume, so it is
+// loopback-only in open mode.
+func (s *Server) handleTokenUnlock(w http.ResponseWriter, r *http.Request) {
+	id, err := tokenActionID(r)
+	if err == nil {
+		err = s.pool.UnlockToken(id)
+	}
+	if err != nil {
+		s.dash.RenderConfigResult(w, r, false, "Unlock failed: "+err.Error())
+		return
+	}
+	s.logger.Info("dashboard token unlocked", "token", id)
+	s.dash.RenderConfigResult(w, r, true, "Token "+strconv.Itoa(id)+" unlocked — no cooldown or ban window remains.")
+}
+
+// handleTokenFinish finishes all active runs of a token.
+func (s *Server) handleTokenFinish(w http.ResponseWriter, r *http.Request) {
+	id, err := tokenActionID(r)
+	if err == nil {
+		err = s.pool.FinishTokenRuns(r.Context(), id)
+	}
+	if err != nil {
+		s.dash.RenderConfigResult(w, r, false, "Finish failed: "+err.Error())
+		return
+	}
+	s.logger.Info("dashboard token runs finished", "token", id)
+	s.dash.RenderConfigResult(w, r, true, "Token "+strconv.Itoa(id)+" runs finished.")
+}
+
+// probeModel returns the safest model to probe a token with: the fallback
+// default (deepseek-v4-flash — the model every account gets, incl. limited
+// tier) when it is in the catalog, else the first catalog model. Alphabetical
+// models[0] would otherwise pick anthropic/claude-fable-5, a capacity-gated
+// offer model that makes token tests/smoke fail on most accounts.
+func probeModel(reg *registry.Registry) string {
+	models := reg.Models()
+	if len(models) == 0 {
+		return ""
+	}
+	for _, id := range models {
+		if id == session.DefaultFallbackModel {
+			return id
+		}
+	}
+	return models[0]
+}
+
+// handleTokenTest probes a token with a real upstream session handshake
+// (create + end) against the fallback model.
+func (s *Server) handleTokenTest(w http.ResponseWriter, r *http.Request) {
+	id, err := tokenActionID(r)
+	var model string
+	if err == nil {
+		model = probeModel(s.reg)
+		if model == "" {
+			err = errors.New("registry has no models to probe")
+		}
+	}
+	var instanceID string
+	if err == nil {
+		ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+		defer cancel()
+		instanceID, err = s.pool.TestToken(ctx, id, model)
+	}
+	if err != nil {
+		s.logger.Warn("dashboard token test failed", "token", id, "err", err)
+		s.dash.RenderConfigResult(w, r, false, "Token "+strconv.Itoa(id)+" test failed: "+err.Error())
+		return
+	}
+	s.logger.Info("dashboard token test ok", "token", id, "model", model, "instance", instanceID)
+	s.dash.RenderConfigResult(w, r, true, "Token "+strconv.Itoa(id)+" OK — session handshake succeeded ("+model+").")
+}
+
+// handleTokenTestAll probes every pooled token (dashboard "Test all"). Each
+// token gets a real session handshake with its own timeout; per-token results
+// are rendered as a fragment.
+func (s *Server) handleTokenTestAll(w http.ResponseWriter, r *http.Request) {
+	probeModel := probeModel(s.reg)
+	count := 0
+	for _, snap := range s.pool.PoolSnapshot().Tokens {
+		i := snap.Token
+		if probeModel == "" {
+			break
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
+		instanceID, err := s.pool.TestToken(ctx, i, probeModel)
+		cancel()
+		ok := err == nil
+		msg := "ok"
+		if !ok {
+			msg = err.Error()
+		}
+		s.dash.RenderTestResult(w, r, i, ok, msg, instanceID)
+		count++
+	}
+	if count == 0 {
+		s.dash.RenderConfigResult(w, r, false, "No tokens to test (bridge mode has no fixed AUTH_TOKENS).")
+	}
+}
+
+// smokeRequest is the dashboard smoke-test payload (a real chat through the
+// exact client path clients use).
+type smokeRequest struct {
+	Model  string `json:"model"`
+	Prompt string `json:"prompt"`
+	Token  string `json:"token"` // bridge mode: client token to relay upstream
+}
+
+// maxSmokeBytes bounds the upstream body read for the smoke preview.
+const maxSmokeBytes = 32 << 10
+
+// handleSmoke sends one real chat request through the pool (Acquire + Chat,
+// the same path clients use) and reports status, latency, and a content
+// preview. Bridge mode requires a client token in the payload.
+func (s *Server) handleSmoke(w http.ResponseWriter, r *http.Request) {
+	var req smokeRequest
+	// The dashboard form posts urlencoded model=&prompt=&token=; read those
+	// first and only fall back to JSON for programmatic clients (mirrors
+	// handleTokenAdd).
+	var err error
+	req.Model = strings.TrimSpace(r.FormValue("model"))
+	req.Prompt = strings.TrimSpace(r.FormValue("prompt"))
+	req.Token = strings.TrimSpace(r.FormValue("token"))
+	if req.Model == "" && req.Prompt == "" && req.Token == "" {
+		var body []byte
+		body, err = io.ReadAll(http.MaxBytesReader(w, r.Body, 64<<10))
+		if err != nil {
+			s.dash.RenderConfigResult(w, r, false, "Failed to read request: "+err.Error())
+			return
+		}
+		if err = json.Unmarshal(body, &req); err != nil {
+			s.dash.RenderConfigResult(w, r, false, "Invalid request JSON: "+err.Error())
+			return
+		}
+	}
+	req.Model = strings.TrimSpace(req.Model)
+	req.Prompt = strings.TrimSpace(req.Prompt)
+	req.Token = strings.TrimSpace(req.Token)
+	if req.Model == "" {
+		req.Model = probeModel(s.reg)
+		if req.Model == "" {
+			s.dash.RenderConfigResult(w, r, false, "No models in the registry to test.")
+			return
+		}
+	}
+	if req.Prompt == "" {
+		req.Prompt = "ping"
+	}
+	if len(req.Prompt) > 200 {
+		s.dash.RenderConfigResult(w, r, false, "Prompt too long (max 200 chars).")
+		return
+	}
+
+	start := time.Now()
+	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+	defer cancel()
+
+	cfg := s.cfg.Load()
+	chatBody := []byte(`{"model":` + strconv.Quote(req.Model) + `,"messages":[{"role":"user","content":` + strconv.Quote(req.Prompt) + `}],"stream":false}`)
+	chatOpts := upstream.ChatOptions{Model: req.Model}
+
+	var lease *pool.Lease
+	var up io.ReadCloser
+	if cfg.BridgeMode() {
+		if req.Token == "" {
+			s.dash.RenderConfigResult(w, r, false, "Bridge mode: include a client token in the smoke request.")
+			return
+		}
+		lease, err = s.pool.AcquireBridge(ctx, req.Token, req.Model)
+	} else {
+		lease, err = s.pool.Acquire(ctx, req.Model)
+	}
+	if err == nil {
+		up, err = s.pool.Chat(ctx, lease, chatOpts, chatBody)
+	}
+	if err != nil {
+		if lease != nil {
+			s.pool.LeaseRelease(lease)
+		}
+		s.logger.Warn("dashboard smoke test failed", "model", req.Model, "err", err)
+		s.dash.RenderConfigResult(w, r, false, "Smoke test failed: "+err.Error())
+		return
+	}
+	defer s.pool.LeaseRelease(lease)
+	defer func() { _ = up.Close() }()
+
+	// Read a bounded prefix of the SSE stream for the preview.
+	preview, readErr := readBounded(up, maxSmokeBytes)
+	ms := time.Since(start).Milliseconds()
+	if readErr != nil {
+		s.dash.RenderConfigResult(w, r, false, "Smoke test: upstream accepted but stream read failed: "+readErr.Error())
+		return
+	}
+	s.dash.RenderSmokeResult(w, r, req.Model, tokenLabel(lease), ms, preview)
+}
+
+// readBounded reads up to n bytes from r, tolerating an EOF mid-prefix.
+func readBounded(r io.Reader, n int) ([]byte, error) {
+	buf := make([]byte, n)
+	got, err := io.ReadFull(r, buf)
+	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+		return nil, err
+	}
+	return buf[:got], nil
+}
+
+// envUpdate is one KEY=VALUE replacement for updateEnvKeys.
+type envUpdate struct {
+	Key   string
+	Value string
+}
+
+// updateEnvKeys rewrites the given KEY=VALUE lines in .env (appending each
+// missing key), preserving every other line. The existing EOL style is
+// preserved — CRLF files stay CRLF — so a Windows-edited .env is never
+// rewritten with mixed line endings. Updates apply in order; later updates
+// to an already-replaced key win (callers keep keys distinct).
+func updateEnvKeys(updates []envUpdate) ([]byte, error) {
+	content, err := os.ReadFile(".env")
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+	crlf := bytes.Contains(content, []byte("\r"))
+	lines := make([]string, 0, len(content)/8)
+	for _, l := range strings.Split(string(content), "\n") {
+		lines = append(lines, strings.TrimSuffix(l, "\r"))
+	}
+	// A file ending with a newline has a trailing "" split element that is
+	// an artifact of that newline, not a real blank line; drop it so
+	// appended keys do not land after a spurious blank line.
+	trailingNL := len(content) > 0 && content[len(content)-1] == '\n'
+	if trailingNL {
+		if n := len(lines); n > 0 && lines[n-1] == "" {
+			lines = lines[:n-1]
+		}
+	}
+	for _, u := range updates {
+		line := u.Key + "=" + u.Value
+		replaced := false
+		for i, l := range lines {
+			if strings.HasPrefix(strings.TrimSpace(l), u.Key+"=") {
+				lines[i] = line
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			if n := len(lines); n == 1 && lines[0] == "" {
+				// Empty (or missing) file: the new line is the whole file.
+				lines[0] = line
+			} else {
+				lines = append(lines, line)
+			}
+		}
+	}
+	eol := "\n"
+	if crlf {
+		eol = "\r\n"
+	}
+	out := []byte(strings.Join(lines, eol))
+	if trailingNL {
+		out = append(out, eol...)
+	}
+	if err := writeFileAtomic(".env", out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// updateAuthTokensEnv rewrites the AUTH_TOKENS= line in .env (appending it
+// when absent), preserving every other line. Returns the new content. The
+// existing EOL style is preserved — CRLF files stay CRLF — so a
+// Windows-edited .env is never rewritten with mixed line endings.
+func updateAuthTokensEnv(tokens []string) ([]byte, error) {
+	return updateEnvKeys([]envUpdate{{Key: "AUTH_TOKENS", Value: strings.Join(tokens, ",")}})
+}
+
+// syncTokensAfterMutation updates .env + reloads config after a pool token
+// mutation, so the change survives a restart and cfg reflects the new list.
+func (s *Server) syncTokensAfterMutation(tokens []string) error {
+	if _, err := updateAuthTokensEnv(tokens); err != nil {
+		return fmt.Errorf("persist AUTH_TOKENS: %w", err)
+	}
+	newCfg, err := config.Load(s.configPath)
+	if err != nil {
+		return fmt.Errorf("reload config: %w", err)
+	}
+	s.cfg.Store(&newCfg)
+	s.reg.SetConfig(&newCfg)
+	s.pool.SetConfig(&newCfg)
+	return nil
+}
+
+// handleTokenAdd adds a token to the live pool and persists it (dashboard
+// "Add token"). Rolls the pool back if persistence fails.
+func (s *Server) handleTokenAdd(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Token string `json:"token"`
+	}
+	req.Token = strings.TrimSpace(r.FormValue("token"))
+	if req.Token == "" {
+		// JSON fallback for programmatic clients.
+		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 8<<10))
+		if err != nil {
+			s.dash.RenderConfigResult(w, r, false, "Failed to read request: "+err.Error())
+			return
+		}
+		if err := json.Unmarshal(body, &req); err != nil {
+			s.dash.RenderConfigResult(w, r, false, "Invalid request: "+err.Error())
+			return
+		}
+	}
+	req.Token = strings.TrimSpace(req.Token)
+	if req.Token == "" || strings.HasPrefix(strings.ToLower(req.Token), "bearer ") {
+		s.dash.RenderConfigResult(w, r, false, "Invalid token (must not start with 'Bearer ').")
+		return
+	}
+
+	// adminSaveMu serializes the pool mutation + persist + reload with the
+	// other .env writers (config editor, token remove, mode switch) so a
+	// concurrent save cannot interleave and lose a token from .env.
+	s.adminSaveMu.Lock()
+	defer s.adminSaveMu.Unlock()
+
+	idx, err := s.pool.AddToken(req.Token)
+	if err != nil {
+		s.dash.RenderConfigResult(w, r, false, err.Error())
+		return
+	}
+	cfg := s.cfg.Load()
+	tokens := append(append([]string{}, cfg.AuthTokens...), req.Token)
+	if err := s.syncTokensAfterMutation(tokens); err != nil {
+		_ = s.pool.RemoveLastToken()
+		s.logger.Warn("dashboard token add rolled back", "err", err)
+		s.dash.RenderConfigResult(w, r, false, err.Error())
+		return
+	}
+	s.logger.Info("dashboard token added", "index", idx)
+	s.dash.RenderConfigResult(w, r, true, "Token added at index "+strconv.Itoa(idx)+" and persisted to .env.")
+}
+
+// handleTokenRemove removes the last pooled token (dashboard "Remove last").
+func (s *Server) handleTokenRemove(w http.ResponseWriter, r *http.Request) {
+	// adminSaveMu serializes the pool mutation + persist + reload with the
+	// other .env writers, exactly like handleTokenAdd.
+	s.adminSaveMu.Lock()
+	defer s.adminSaveMu.Unlock()
+
+	cfg := s.cfg.Load()
+	// A config-editor AUTH_TOKENS edit or /admin/reload can diverge
+	// cfg.AuthTokens from the live pool; removing "the last token" from a
+	// stale list would persist the wrong .env and leave pool/.env/cfg
+	// permanently inconsistent.
+	if len(cfg.AuthTokens) != s.pool.TokenCount() {
+		s.dash.RenderConfigResult(w, r, false, "AUTH_TOKENS in .env differs from the live pool — reconcile in the Config editor or restart.")
+		return
+	}
+	removed := ""
+	if len(cfg.AuthTokens) > 0 {
+		removed = cfg.AuthTokens[len(cfg.AuthTokens)-1]
+	}
+	if err := s.pool.RemoveLastToken(); err != nil {
+		s.dash.RenderConfigResult(w, r, false, err.Error())
+		return
+	}
+	tokens := cfg.AuthTokens
+	if len(tokens) > 0 {
+		tokens = tokens[:len(tokens)-1]
+	}
+	if err := s.syncTokensAfterMutation(tokens); err != nil {
+		// Roll the pool back so a failed persist does not leave the token
+		// removed from the pool but still listed in .env/cfg (mirrors
+		// handleTokenAdd's rollback).
+		if removed != "" {
+			if _, addErr := s.pool.AddToken(removed); addErr != nil {
+				s.logger.Warn("dashboard token remove rollback re-add failed", "err", addErr)
+			}
+		}
+		s.logger.Warn("dashboard token remove rolled back", "err", err)
+		s.dash.RenderConfigResult(w, r, false, err.Error())
+		return
+	}
+	s.logger.Info("dashboard token removed")
+	s.dash.RenderConfigResult(w, r, true, "Last token removed and persisted to .env.")
+}
+
+// handleModeSwitch flips between bridge, pooled, and hybrid mode at runtime
+// (dashboard mode control). Pooled→bridge removes all tokens; bridge→pooled
+// requires at least one token to add (use the Add-token form first). Hybrid
+// keeps the pooled tokens and additionally relays client-supplied tokens;
+// switching to it persists HYBRID_MODE=true in .env.
+//
+// Order matters: the .env is persisted and the config reloaded BEFORE the
+// live pool is drained, and the reload result is verified to actually be in
+// the requested mode. Otherwise a failed persist (or a higher-precedence
+// AUTH_TOKENS/HYBRID_MODE source such as a -config JSON file or real
+// environment variable) would empty the pool while cfg still claims pooled —
+// leaving the proxy broken and the dashboard pill showing the old mode.
+func (s *Server) handleModeSwitch(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Mode string `json:"mode"`
+	}
+	req.Mode = r.FormValue("mode")
+	if req.Mode == "" {
+		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 4<<10))
+		if err != nil {
+			s.dash.RenderConfigResult(w, r, false, "Failed to read request: "+err.Error())
+			return
+		}
+		if err := json.Unmarshal(body, &req); err != nil {
+			s.dash.RenderConfigResult(w, r, false, "Invalid request: "+err.Error())
+			return
+		}
+	}
+	cfg := s.cfg.Load()
+	switch strings.ToLower(strings.TrimSpace(req.Mode)) {
+	case "bridge":
+		if cfg.BridgeMode() && !cfg.HybridMode {
+			s.dash.RenderConfigResult(w, r, false, "Already in bridge mode.")
+			return
+		}
+		// adminSaveMu serializes the persist → verify → rollback sequence
+		// with the other .env writers (config editor, token add/remove) so a
+		// concurrent save cannot interleave between the write and the reload.
+		// The live-pool drain stays outside the lock, after the reload is
+		// verified (persist → verify → drain).
+		s.adminSaveMu.Lock()
+		defer s.adminSaveMu.Unlock()
+		// Persist AUTH_TOKENS= (explicit empty) + HYBRID_MODE=false and
+		// reload, verifying the effective config actually lands in bridge
+		// mode before touching the live pool. Roll the .env back on failure.
+		old, oldErr := os.ReadFile(".env")
+		if _, err := updateEnvKeys([]envUpdate{{Key: "AUTH_TOKENS", Value: ""}, {Key: "HYBRID_MODE", Value: "false"}}); err != nil {
+			s.dash.RenderConfigResult(w, r, false, "Failed to persist .env: "+err.Error())
+			return
+		}
+		newCfg, err := config.Load(s.configPath)
+		if err != nil {
+			restoreEnvFile(old, oldErr)
+			s.dash.RenderConfigResult(w, r, false, "Reload rejected: "+err.Error())
+			return
+		}
+		if !newCfg.BridgeMode() {
+			// A higher-precedence source (e.g. AUTH_TOKENS in a -config JSON
+			// file or the real environment) still supplies tokens — .env alone
+			// cannot clear it, so the switch cannot succeed.
+			restoreEnvFile(old, oldErr)
+			s.dash.RenderConfigResult(w, r, false, "Could not switch to bridge mode: AUTH_TOKENS is still set by a -config JSON file or the environment, which overrides .env. Clear it there, or run without -config, then retry.")
+			return
+		}
+		s.cfg.Store(&newCfg)
+		s.reg.SetConfig(&newCfg)
+		s.pool.SetConfig(&newCfg)
+		s.pool.RemoveAllTokens(r.Context())
+		s.logger.Info("dashboard switched to bridge mode")
+		s.dash.RenderConfigResult(w, r, true, "Switched to bridge mode — AUTH_TOKENS cleared; clients now send their own token.")
+	case "pooled":
+		if !cfg.BridgeMode() && !cfg.HybridMode {
+			s.dash.RenderConfigResult(w, r, false, "Already in pooled mode.")
+			return
+		}
+		if cfg.BridgeMode() {
+			s.dash.RenderConfigResult(w, r, false, "Pooled mode needs tokens — add one via the Add-token form first.")
+			return
+		}
+		// Hybrid → pooled: keep the tokens, just clear HYBRID_MODE.
+		s.adminSaveMu.Lock()
+		defer s.adminSaveMu.Unlock()
+		old, oldErr := os.ReadFile(".env")
+		if _, err := updateEnvKeys([]envUpdate{{Key: "HYBRID_MODE", Value: "false"}}); err != nil {
+			s.dash.RenderConfigResult(w, r, false, "Failed to persist .env: "+err.Error())
+			return
+		}
+		newCfg, err := config.Load(s.configPath)
+		if err != nil {
+			restoreEnvFile(old, oldErr)
+			s.dash.RenderConfigResult(w, r, false, "Reload rejected: "+err.Error())
+			return
+		}
+		if newCfg.HybridMode {
+			restoreEnvFile(old, oldErr)
+			s.dash.RenderConfigResult(w, r, false, "Could not switch to pooled mode: HYBRID_MODE is still true via a -config JSON file or the environment, which overrides .env. Clear it there, then retry.")
+			return
+		}
+		s.cfg.Store(&newCfg)
+		s.reg.SetConfig(&newCfg)
+		s.pool.SetConfig(&newCfg)
+		s.logger.Info("dashboard switched to pooled mode", "auth_tokens", len(newCfg.AuthTokens))
+		s.dash.RenderConfigResult(w, r, true, "Switched to pooled mode — HYBRID_MODE cleared; all requests now use the pool.")
+	case "hybrid":
+		if cfg.HybridMode {
+			s.dash.RenderConfigResult(w, r, false, "Already in hybrid mode.")
+			return
+		}
+		// Hybrid → pooled: keep the tokens, just clear HYBRID_MODE.
+		s.adminSaveMu.Lock()
+		defer s.adminSaveMu.Unlock()
+		old, oldErr := os.ReadFile(".env")
+		if _, err := updateEnvKeys([]envUpdate{{Key: "HYBRID_MODE", Value: "true"}}); err != nil {
+			s.dash.RenderConfigResult(w, r, false, "Failed to persist .env: "+err.Error())
+			return
+		}
+		newCfg, err := config.Load(s.configPath)
+		if err != nil {
+			restoreEnvFile(old, oldErr)
+			s.dash.RenderConfigResult(w, r, false, "Reload rejected: "+err.Error())
+			return
+		}
+		if !newCfg.HybridMode {
+			restoreEnvFile(old, oldErr)
+			s.dash.RenderConfigResult(w, r, false, "Could not switch to hybrid mode: HYBRID_MODE is still false via a -config JSON file or the environment, which overrides .env. Set it there, then retry.")
+			return
+		}
+		s.cfg.Store(&newCfg)
+		s.reg.SetConfig(&newCfg)
+		s.pool.SetConfig(&newCfg)
+		msg := "Switched to hybrid mode — clients with a token relay it; token-less requests use the pool."
+		if len(newCfg.AuthTokens) == 0 {
+			msg += " Warning: no AUTH_TOKENS — token-less requests will fail (502) until a token is added."
+			s.logger.Warn("hybrid mode enabled without AUTH_TOKENS: token-less requests will 502 until a token is added")
+		} else {
+			s.logger.Info("dashboard switched to hybrid mode", "auth_tokens", len(newCfg.AuthTokens))
+		}
+		s.dash.RenderConfigResult(w, r, true, msg)
+	default:
+		s.dash.RenderConfigResult(w, r, false, "Mode must be 'bridge', 'pooled', or 'hybrid'.")
+	}
+}
+
+// restoreEnvFile writes old content back to .env, or removes the file when it
+// did not exist before. Best-effort rollback for failed mode switches.
+func restoreEnvFile(old []byte, oldErr error) {
+	if oldErr != nil {
+		_ = os.Remove(".env")
+		return
+	}
+	_ = writeFileAtomic(".env", old)
+}
+
+// dialTarget returns the host:port to dial for an upstream base host,
+// defaulting to 443 only when the host carries no explicit port — an
+// UpstreamBaseURL like "https://host:8443" must not become "host:8443:443".
+func dialTarget(host string) string {
+	if _, _, err := net.SplitHostPort(host); err == nil {
+		return host
+	}
+	return net.JoinHostPort(host, "443")
+}
+
+// handleDiag runs the dashboard diagnostics: config state, upstream
+// reachability (DNS + TLS), registry health, and per-token validity probes —
+// the same checks -doctor performs, rendered as a fragment.
+func (s *Server) handleDiag(w http.ResponseWriter, r *http.Request) {
+	checks := []dashboard.DiagCheck{}
+
+	cfg := s.cfg.Load()
+	switch cfg.EffectiveMode() {
+	case "bridge":
+		checks = append(checks, dashboard.DiagCheck{OK: true, Message: "Configuration: bridge mode (clients relay their own token)"})
+	case "hybrid":
+		checks = append(checks, dashboard.DiagCheck{OK: true, Message: fmt.Sprintf("Configuration: hybrid mode, %d pooled token(s) (client tokens relayed; token-less requests use the pool)", len(cfg.AuthTokens))})
+	default:
+		checks = append(checks, dashboard.DiagCheck{OK: true, Message: fmt.Sprintf("Configuration: pooled mode, %d token(s)", len(cfg.AuthTokens))})
+	}
+
+	// Upstream reachability: DNS + TLS to the configured base host.
+	targetHost := "www.codebuff.com"
+	if u, err := url.Parse(cfg.UpstreamBaseURL); err == nil && u.Host != "" {
+		targetHost = u.Host
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	if _, err := net.DefaultResolver.LookupHost(ctx, targetHost); err != nil {
+		checks = append(checks, dashboard.DiagCheck{Message: "DNS lookup failed for " + targetHost + ": " + err.Error()})
+	} else {
+		checks = append(checks, dashboard.DiagCheck{OK: true, Message: "DNS resolves " + targetHost})
+	}
+	hostForDial := dialTarget(targetHost)
+	if conn, err := net.DialTimeout("tcp", hostForDial, 5*time.Second); err != nil {
+		checks = append(checks, dashboard.DiagCheck{Message: "TCP connect to " + hostForDial + " failed: " + err.Error()})
+	} else {
+		_ = conn.Close()
+		checks = append(checks, dashboard.DiagCheck{OK: true, Message: "TCP reachable " + hostForDial})
+	}
+
+	checks = append(checks, dashboard.DiagCheck{OK: true, Message: fmt.Sprintf("Model registry: %d models", s.reg.ModelCount())})
+
+	// Per-token validity probes (pooled and hybrid-with-tokens modes).
+	if !cfg.BridgeMode() {
+		probe := probeModel(s.reg)
+		if probe == "" {
+			checks = append(checks, dashboard.DiagCheck{Warn: true, Message: "Cannot probe tokens: registry has no models"})
+		} else {
+			for _, snap := range s.pool.PoolSnapshot().Tokens {
+				idx := snap.Token
+				probeCtx, probeCancel := context.WithTimeout(r.Context(), 8*time.Second)
+				_, err := s.pool.TestToken(probeCtx, idx, probe)
+				probeCancel()
+				if err != nil {
+					checks = append(checks, dashboard.DiagCheck{Message: fmt.Sprintf("Token #%d validity probe failed: %v", idx+1, err)})
+				} else {
+					checks = append(checks, dashboard.DiagCheck{OK: true, Message: fmt.Sprintf("Token #%d validity probe succeeded", idx+1)})
+				}
+			}
+		}
+	} else {
+		checks = append(checks, dashboard.DiagCheck{Warn: true, Message: "No pooled tokens to probe (the smoke test uses a client token)."})
+	}
+
+	s.dash.RenderDiag(w, r, checks)
+}
+
+// handleConfigSave persists the submitted .env text and hot-reloads the
+// config. The flow: write the file atomically (temp + rename) → full
+// config.Load("") — the same pipeline used at startup, so every semantic
+// validation (durations, URLs, fingerprints, Validate) runs — and swap the
+// atomic pointer. Any failure restores the previous .env content. adminSaveMu
+// serializes concurrent saves so a rejected save can never clobber a newer
+// accepted one.
+func (s *Server) handleConfigSave(w http.ResponseWriter, r *http.Request) {
+	const envPath = ".env"
+	r.Body = http.MaxBytesReader(w, r.Body, maxEnvSize)
+
+	// The dashboard textarea posts application/x-www-form-urlencoded
+	// (name="content"); a raw urlencoded body written verbatim as .env would
+	// become "content=KEY=VALUE..." and destroy the file. Programmatic
+	// clients (text/plain) post the raw .env text and keep the raw path.
+	var content []byte
+	if strings.HasPrefix(r.Header.Get("Content-Type"), "application/x-www-form-urlencoded") {
+		if err := r.ParseForm(); err != nil {
+			s.dash.RenderConfigResult(w, r, false, "Failed to read request form.")
+			return
+		}
+		content = []byte(r.FormValue("content"))
+	} else {
+		var err error
+		content, err = io.ReadAll(r.Body)
+		if err != nil {
+			s.dash.RenderConfigResult(w, r, false, "Failed to read request body.")
+			return
+		}
+	}
+
+	s.adminSaveMu.Lock()
+	defer s.adminSaveMu.Unlock()
+
+	old, oldErr := os.ReadFile(envPath)
+	if err := writeFileAtomic(envPath, content); err != nil {
+		s.dash.RenderConfigResult(w, r, false, "Failed to write .env: "+err.Error())
+		return
+	}
+	newCfg, err := config.Load(s.configPath)
+	if err != nil {
+		if oldErr == nil {
+			_ = writeFileAtomic(envPath, old)
+		} else {
+			_ = os.Remove(envPath)
+		}
+		s.logger.Warn("dashboard config save rejected", "err", err)
+		s.dash.RenderConfigResult(w, r, false, "Configuration rejected: "+err.Error())
+		return
+	}
+	s.cfg.Store(&newCfg)
+	s.reg.SetConfig(&newCfg)
+	s.pool.SetConfig(&newCfg)
+	s.logger.Info("dashboard config saved and reloaded",
+		"auth_tokens", len(newCfg.AuthTokens), "safe_mode", newCfg.SafeMode)
+	s.dash.RenderConfigResult(w, r, true, "Saved and reloaded — effective configuration updated.")
+}
+
+// writeFileAtomic writes data to path via a temp file + rename: readers never
+// observe a truncated file, and a crash mid-write leaves the previous content
+// intact. os.Rename replaces an existing target atomically on every supported
+// platform (Windows uses MoveFileEx with MOVEFILE_REPLACE_EXISTING); only
+// filesystems without atomic replace support need the remove-then-rename
+// fallback (a tiny non-atomic window, acceptable for an admin action).
+func writeFileAtomic(path string, data []byte) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpName)
+		return err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		if _, statErr := os.Stat(path); statErr == nil {
+			// The target exists but rename-over-existing failed: fall back
+			// to removing it first, then renaming.
+			_ = os.Remove(path)
+			if err := os.Rename(tmpName, path); err == nil {
+				return nil
+			} else {
+				_ = os.Remove(tmpName)
+				return err
+			}
+		}
+		_ = os.Remove(tmpName)
+		return err
+	}
+	return nil
+}
+
 // clientToken returns the request's bearer token (Authorization: Bearer or
 // x-api-key), trimmed. Empty when the request carries none. In bridge mode
 // this token IS the client's FreeBuff token relayed upstream.
@@ -219,6 +1283,18 @@ func clientToken(r *http.Request) string {
 		provided = h
 	}
 	return strings.TrimSpace(provided)
+}
+
+// bearerToken returns only the Authorization: Bearer token. In hybrid mode
+// this is the discriminator between bridge traffic (client relays its own
+// FreeBuff token) and pooled traffic (no bearer; x-api-key is the API_KEYS
+// scheme and must never be relayed upstream as a FreeBuff credential).
+func bearerToken(r *http.Request) string {
+	h := r.Header.Get("Authorization")
+	if !strings.HasPrefix(h, "Bearer ") {
+		return ""
+	}
+	return strings.TrimSpace(strings.TrimPrefix(h, "Bearer "))
 }
 
 // --- chat ---
@@ -285,13 +1361,29 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		reqAttrs = append(reqAttrs, "reasoning_effort", reasoningEffort)
 	}
 	s.logger.Info("chat request", reqAttrs...)
-	// Bridge mode (no AUTH_TOKENS): the client's Authorization header IS the
-	// upstream token. No token → 401 before touching the pool.
+	// Bridge routing: pure bridge (no AUTH_TOKENS, not hybrid) always relays
+	// the client's Authorization header as the upstream token; hybrid mode
+	// relays when a token is present and falls back to the pool otherwise.
+	// No token in pure bridge → 401 before touching the pool.
 	var up io.ReadCloser
 	var lease *pool.Lease
 	cfg := s.cfg.Load()
-	if cfg.BridgeMode() {
-		tok := clientToken(r)
+	// In hybrid, only an Authorization: Bearer token selects the bridge
+	// path — an x-api-key is the API_KEYS scheme for pooled clients and
+	// must never be relayed upstream as a FreeBuff credential.
+	tok := bearerToken(r)
+	bridge := false
+	switch {
+	case cfg.BridgeMode() && !cfg.HybridMode:
+		// Pure bridge: the client token is the only upstream credential.
+		bridge = true
+		tok = clientToken(r)
+	case cfg.HybridMode:
+		// Hybrid: a Bearer token is relayed like bridge; token-less
+		// requests fall back to the pool.
+		bridge = tok != ""
+	}
+	if bridge {
 		if tok == "" {
 			s.writeJSONError(w, http.StatusUnauthorized,
 				"bridge mode: send your FreeBuff token as Authorization: Bearer <token> (no AUTH_TOKENS configured on the proxy)",
@@ -308,6 +1400,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			func(l *pool.Lease) { s.pool.CooldownBridge(l, runs.DefaultCooldown) },
 			s.pool.CooldownBridgeBan,
 			s.pool.CooldownBridgeRateLimit,
+			s.pool.CooldownBridgeCountryBlocked,
 		)
 	} else {
 		up, lease, err = s.chatAttempt(ctx, model, normalized,
@@ -318,9 +1411,13 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			func(l *pool.Lease) { s.pool.CooldownToken(l.Token, runs.DefaultCooldown) },
 			func(l *pool.Lease, be *upstream.BanError) { s.pool.CooldownTokenBan(l.Token, be) },
 			func(l *pool.Lease, rle *upstream.RateLimitError) { s.pool.CooldownTokenRateLimit(l.Token, rle) },
+			func(l *pool.Lease, cbe *upstream.CountryBlockedError) {
+				s.pool.CooldownTokenCountryBlocked(l.Token, cbe)
+			},
 		)
 	}
 	if err != nil {
+		s.traceChat(lease, model, time.Since(start).Milliseconds(), "error", chatErrClass(err))
 		s.writeError(w, r, err)
 		return
 	}
@@ -344,10 +1441,41 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		stats := &relayStats{}
 		s.relayStream(ctx, w, up, stats)
 		s.logger.Info("chat done", chatDoneAttrs(model, lease.AgentID, true, time.Since(start).Milliseconds(), stats.chunks, stats.bytes, reasoningEffort)...)
+		s.traceChat(lease, model, time.Since(start).Milliseconds(), "ok", "")
 	} else {
 		stats := &relayStats{}
 		s.relayJSON(ctx, w, up, stats)
 		s.logger.Info("chat done", chatDoneAttrs(model, lease.AgentID, false, time.Since(start).Milliseconds(), 0, stats.bytes, reasoningEffort)...)
+		s.traceChat(lease, model, time.Since(start).Milliseconds(), "ok", "")
+	}
+}
+
+// traceChat records a structured "chat trace" entry for the dashboard
+// traces page (the page filters the shared log ring by msg == "chat trace").
+func (s *Server) traceChat(lease *pool.Lease, model string, ms int64, status, errClass string) {
+	attrs := []any{"model", model, "status", status, "ms", ms}
+	if lease != nil {
+		attrs = append(attrs, "token", tokenLabel(lease), "agent", lease.AgentID)
+	}
+	if errClass != "" {
+		attrs = append(attrs, "error", errClass)
+	}
+	s.logger.Info("chat trace", attrs...)
+}
+
+// chatErrClass buckets an upstream error into the trace error column.
+func chatErrClass(err error) string {
+	switch err.(type) {
+	case *upstream.RateLimitError:
+		return "rate_limited"
+	case *upstream.BanError:
+		return "banned"
+	case *upstream.WaitingRoomError, *session.WaitingRoomError:
+		return "waiting_room"
+	case *upstream.UpstreamError:
+		return "upstream"
+	default:
+		return "error"
 	}
 }
 
@@ -390,6 +1518,7 @@ func (s *Server) chatAttempt(
 	cooldownAuth func(*pool.Lease),
 	cooldownBan func(*pool.Lease, *upstream.BanError),
 	cooldownRate func(*pool.Lease, *upstream.RateLimitError),
+	cooldownCountry func(*pool.Lease, *upstream.CountryBlockedError),
 ) (io.ReadCloser, *pool.Lease, error) {
 	lease, err := acquire(ctx, model)
 	if err != nil {
@@ -451,8 +1580,26 @@ func (s *Server) chatAttempt(
 			}
 			release()
 			return nil, nil, err
+		case errors.Is(err, upstream.ErrCountryBlocked):
+			// A chat-path country block cools the token like the admission
+			// path does: without it the cached session stays "active" and
+			// every request re-hits upstream run-start inside the window.
+			var cbe *upstream.CountryBlockedError
+			if errors.As(err, &cbe) {
+				cooldownCountry(lease, cbe)
+			}
+			release()
+			return nil, nil, err
 		default:
 			release()
+			// Retryable UpstreamErrors (e.g. deployment_outside_hours) are
+			// temporarily unavailable, not transient: a blind retry burns a
+			// fresh lease against the same wall. Surface them for writeError
+			// (503 upstream_retryable) instead.
+			var ue *upstream.UpstreamError
+			if errors.As(err, &ue) && ue.Retryable {
+				return nil, nil, err
+			}
 			if attempts > 1 {
 				return nil, nil, err
 			}
@@ -568,26 +1715,91 @@ func (s *Server) relayJSON(ctx context.Context, w http.ResponseWriter, r io.Read
 
 // handleModels serves the OpenAI model-list shape with the registry's
 // current models; created is pinned to server start so every entry matches.
+// Each row carries an advisory availability annotation derived from the pool
+// token snapshots (available/status/current_access_tier) so clients can
+// surface quota or lock signals without probing.
 func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	created := s.started.Unix()
+	snaps := s.pool.Snapshot()
 	models := s.reg.Models()
+	hideUnavailable := s.cfg.Load().ModelsHideUnavailable
 	data := make([]map[string]any, 0, len(models))
 	for _, id := range models {
+		available, status, tier := modelAvailability(id, snaps)
+		if hideUnavailable && !available {
+			// MODELS_HIDE_UNAVAILABLE=true: prune region/tier/quota-locked
+			// models so picker clients never auto-select one. Off by default
+			// because a stale signal could hide a working model.
+			continue
+		}
 		data = append(data, map[string]any{
-			"id":       id,
-			"object":   "model",
-			"created":  created,
-			"owned_by": "freebuff",
+			"id":                  id,
+			"object":              "model",
+			"created":             created,
+			"owned_by":            "freebuff",
+			"available":           available,
+			"status":              status,
+			"current_access_tier": tier,
 		})
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"object": "list", "data": data})
 }
 
-// handleHealthz reports uptime, model count, the per-token snapshot, and
-// the cached bridge entries (bridge mode).
+// modelAvailability derives the advisory per-model annotation from the pool
+// token snapshots. The snapshot does not carry the model of a live session,
+// so the signal set is: quotaByModel presence (the session admitted this
+// model), quota exhaustion (recent >= limit), session-level locks, and the
+// access tier. A token demoted to the 'limited' tier (region/privacy
+// demotion) can only use LimitedTierModels — every other model is marked
+// unavailable with status "region_limited" (kept in the list, never hidden,
+// so a stale tier can't strand a working model). available defaults to true
+// when no signal exists, so a working model is never hidden.
+func modelAvailability(id string, snaps []pool.TokenSnapshot) (available bool, status, tier string) {
+	available = true
+	status = "unknown"
+	quotaHit := false
+	quotaExhausted := false
+	locked := false
+	for _, snap := range snaps {
+		if tier == "" {
+			tier = snap.TierAccess
+		}
+		switch snap.SessionStatus {
+		case "model_locked", "disabled":
+			locked = true
+		}
+		if q, ok := snap.QuotaByModel[id]; ok {
+			quotaHit = true
+			if q.Limit > 0 && q.RecentCount >= q.Limit {
+				quotaExhausted = true
+			}
+		}
+	}
+	switch {
+	case quotaExhausted:
+		status = "quota_exhausted"
+	case locked:
+		status = "locked"
+	case quotaHit:
+		status = "available"
+	}
+	if status == "unknown" && tier == "limited" && !registry.LimitedTierModels[id] {
+		// Region/privacy demotion: the model is not on the limited tier's
+		// allowlist and the session never admitted it. Keep it listed but
+		// honest — clients that auto-pick on the available flag skip it,
+		// and a stale tier can never hide a model the session admitted
+		// (admission is ground truth, handled above).
+		return false, "region_limited", tier
+	}
+	return available, status, tier
+}
+
+// handleHealthz reports uptime, model count, the per-token snapshot, the
+// cached bridge entries (bridge mode), and the effective routing mode.
 func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	snaps := s.pool.Snapshot()
+	cfg := s.cfg.Load()
 	w.Header().Set("Content-Type", "application/json")
 	tokens := make([]map[string]any, 0, len(snaps))
 	for _, snap := range snaps {
@@ -604,6 +1816,8 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 			"DailyLimit":           snap.DailyLimit,
 			"UsagePct":             snap.UsagePct,
 			"RiskLevel":            snap.RiskLevel,
+			"tier":                 snap.TierAccess,
+			"country":              snap.CountryCode,
 		}
 		if len(snap.QuotaByModel) > 0 {
 			quota := make(map[string]any, len(snap.QuotaByModel))
@@ -630,6 +1844,7 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"status":         "ok",
+		"mode":           cfg.EffectiveMode(),
 		"uptime_seconds": time.Since(s.started).Seconds(),
 		"models":         s.reg.ModelCount(),
 		"tokens":         tokens,
@@ -757,12 +1972,14 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 // handleReload handles POST /admin/reload for hot configuration reloads (#26).
 func (s *Server) handleReload(w http.ResponseWriter, r *http.Request) {
 	s.logger.Info("admin reload requested")
-	newCfg, err := config.Load("")
+	newCfg, err := config.Load(s.configPath)
 	if err != nil {
 		s.writeJSONError(w, http.StatusInternalServerError, "failed to reload config: "+err.Error(), "internal_error", "reload_failed", 0)
 		return
 	}
 	s.cfg.Store(&newCfg)
+	s.reg.SetConfig(&newCfg)
+	s.pool.SetConfig(&newCfg)
 	s.logger.Info("config reloaded successfully", "auth_tokens", len(newCfg.AuthTokens), "safe_mode", newCfg.SafeMode)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{
@@ -813,6 +2030,10 @@ func defaultHintForCode(code, message string) string {
 		return "Account suspended upstream. Token is dead; create a fresh account with an established GitHub login."
 	case code == "country_blocked" || strings.Contains(lowerMsg, "country blocked") || strings.Contains(lowerMsg, "country_blocked"):
 		return "Your egress IP is in an unsupported region. Route traffic through an allowed country (e.g. US/EU/ID/SG) or configure SOCKS5_PROXY in .env."
+	case code == "out_of_credits" || strings.Contains(lowerMsg, "out of credits"):
+		return "Upstream free-tier credits exhausted. Check COST_MODE=free in .env — a typo routes requests as PAID and fresh free accounts get 402."
+	case code == "upstream_timeout":
+		return "The upstream request exceeded its deadline. Retry, or raise REQUEST_TIMEOUT/SESSION_CALL_TIMEOUT in .env."
 	case code == "upstream_auth_rejected" || code == "invalid_api_key" || strings.Contains(lowerMsg, "invalid api key"):
 		return "Token invalid or expired. Get a fresh token by running freebuff or scripts/get-freebuff-token.sh"
 	case code == "rate_limited":
@@ -849,6 +2070,8 @@ func (s *Server) writeError(w http.ResponseWriter, r *http.Request, err error) {
 	var ue *upstream.UpstreamError
 	var rle *upstream.RateLimitError
 	var be *upstream.BanError
+	var cbe *upstream.CountryBlockedError
+	var ce *upstream.CreditsError
 	switch {
 	case errors.As(err, &be):
 		status, code = http.StatusForbidden, "account_banned"
@@ -872,15 +2095,22 @@ func (s *Server) writeError(w http.ResponseWriter, r *http.Request, err error) {
 		status, code = http.StatusServiceUnavailable, "waiting_room_queued"
 		message, retryAfter = uwr.Error(), uwr.RetryAfter
 	case errors.As(err, &ue):
-		status = ue.Status
-		if status != http.StatusPaymentRequired && status != http.StatusConflict && status != http.StatusTooManyRequests {
-			status = http.StatusBadGateway
+		if ue.Retryable {
+			// deployment_outside_hours etc.: temporarily unavailable, worth
+			// a later retry — 503 lets clients/9router back off instead of
+			// treating it as a hard failure.
+			status, code = http.StatusServiceUnavailable, "upstream_retryable"
+		} else {
+			status = ue.Status
+			if status != http.StatusPaymentRequired && status != http.StatusConflict && status != http.StatusTooManyRequests {
+				status = http.StatusBadGateway
+			}
 		}
 		message = ue.Body
 		if message == "" {
 			message = "upstream error"
 		}
-		code, retryAfter = "", ue.RetryAfter
+		retryAfter = ue.RetryAfter
 	case errors.Is(err, registry.ErrModelNotFound):
 		status, code = http.StatusBadRequest, "model_not_found"
 		message = err.Error() + "; available: " + strings.Join(s.reg.Models(), ", ")
@@ -890,6 +2120,23 @@ func (s *Server) writeError(w http.ResponseWriter, r *http.Request, err error) {
 	case errors.Is(err, upstream.ErrWaitingRoom):
 		status, code = http.StatusServiceUnavailable, "waiting_room_queued"
 		message = err.Error()
+	case errors.As(err, &cbe):
+		status, code = http.StatusForbidden, "country_blocked"
+		message = cbe.Error()
+	case errors.Is(err, upstream.ErrFreeModeCLIRequired):
+		status, code = http.StatusForbidden, "free_mode_cli_required"
+		message = err.Error()
+	case errors.As(err, &ce):
+		// 402 "Out of credits": surfacing the upstream body verbatim keeps
+		// the quota detail (limit/recent/reset) for the client.
+		status, code = http.StatusPaymentRequired, "out_of_credits"
+		message = ce.Body
+		if message == "" {
+			message = "out of credits"
+		}
+	case errors.Is(err, context.DeadlineExceeded):
+		status, code = http.StatusGatewayTimeout, "upstream_timeout"
+		message = "upstream request timed out: " + err.Error()
 	}
 
 	s.logger.Warn("request failed", "status", status, "code", code, "err", err)

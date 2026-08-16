@@ -7,6 +7,7 @@
 package config
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -21,33 +22,35 @@ import (
 
 // Config is the fully-resolved, validated runtime configuration.
 type Config struct {
-	ListenAddr          string
-	UpstreamBaseURL     string
-	AuthTokens          []string
-	RotationInterval    time.Duration
-	RequestTimeout      time.Duration
-	SessionCallTimeout  time.Duration
-	APIKeys             []string
-	AdminToken          string // bearer token required for POST /admin/reload ("" = unauthenticated in default deployments)
-	HTTPProxy           string
-	SOCKS5Proxy         string
-	SOCKS5Proxies       []string // comma-separated list of SOCKS5 proxies (#23)
-	ProxyRotation       string   // "per-token" (default), "round-robin", "random" (#23)
-	CostMode            string   // "" (omit) or "free"; A/B pending, PRD §8
-	TLSFingerprint      string   // "" (plain Go transport) | chrome120 | chrome126 | safari17 | safari18 | firefox120 | firefox128 | edge126 | random | auto
-	RegistryRefresh     time.Duration
-	DebugDump           bool
-	LogFile             string
-	LogLevel            string            // "" (use -v/default) or debug|info|warn|error
-	MaxMessagesPerDay   int               // 0 = unlimited: per-token cap on successful chats per 24h
-	IdleRotationTimeout time.Duration     // 0 = disabled: pause rotation/refresh after this idle period
-	SafeMode            bool              // true = apply recommended anti-ban safe defaults
-	RequestJitter       time.Duration     // random delay range [0, RequestJitter) before upstream chat calls
-	CLIVersion          string            // upstream CLI version string (default: 0.10.7)
-	ModelAliases        map[string]string // map model alias -> real model ID (#25)
-	TransientRetries    int               // max additional attempts after a transient transport failure (0 = disabled; default 1)
-	DiscoveredSource    string            // auto-discovered credentials file path (if any)
-	DiscoveredEmail     string            // auto-discovered account email (if any)
+	ListenAddr            string
+	UpstreamBaseURL       string
+	AuthTokens            []string
+	RotationInterval      time.Duration
+	RequestTimeout        time.Duration
+	SessionCallTimeout    time.Duration
+	APIKeys               []string
+	AdminToken            string // bearer token required for POST /admin/reload ("" = unauthenticated in default deployments)
+	HTTPProxy             string
+	SOCKS5Proxy           string
+	SOCKS5Proxies         []string // comma-separated list of SOCKS5 proxies (#23)
+	ProxyRotation         string   // "per-token" (default), "round-robin", "random" (#23)
+	CostMode              string   // "" (omit) or "free"; A/B pending, PRD §8
+	TLSFingerprint        string   // "" (plain Go transport) | chrome120 | chrome126 | safari17 | safari18 | firefox120 | firefox128 | edge126 | random | auto
+	RegistryRefresh       time.Duration
+	DebugDump             bool
+	LogFile               string
+	LogLevel              string            // "" (use -v/default) or debug|info|warn|error
+	MaxMessagesPerDay     int               // 0 = unlimited: per-token cap on successful chats per 24h
+	IdleRotationTimeout   time.Duration     // 0 = disabled: pause rotation/refresh after this idle period
+	SafeMode              bool              // true = apply recommended anti-ban safe defaults
+	HybridMode            bool              // true = relay client tokens like bridge AND serve token-less requests from the pool
+	ModelsHideUnavailable bool              // true = /v1/models prunes models marked unavailable (region/tier/quota)
+	RequestJitter         time.Duration     // random delay range [0, RequestJitter) before upstream chat calls
+	CLIVersion            string            // upstream CLI version string (default: 0.10.7)
+	ModelAliases          map[string]string // map model alias -> real model ID (#25)
+	TransientRetries      int               // max additional attempts after a transient transport failure (0 = disabled; default 1)
+	DiscoveredSource      string            // auto-discovered credentials file path (if any)
+	DiscoveredEmail       string            // auto-discovered account email (if any)
 }
 
 // BridgeMode reports whether the proxy runs without any AUTH_TOKENS: every
@@ -55,34 +58,57 @@ type Config struct {
 // or x-api-key), and the proxy relays with that token upstream.
 func (c Config) BridgeMode() bool { return len(c.AuthTokens) == 0 }
 
+// EffectiveMode reports the routing mode label for dashboards and healthz:
+// "hybrid" when HYBRID_MODE is set, "bridge" when no AUTH_TOKENS are
+// configured, else "pooled". Hybrid wins over bridge so a hybrid config with
+// zero tokens still reports hybrid (token-less requests 502 until a token is
+// added, while client-token requests relay like bridge).
+func (c Config) EffectiveMode() string {
+	if c.HybridMode {
+		return "hybrid"
+	}
+	if c.BridgeMode() {
+		return "bridge"
+	}
+	return "pooled"
+}
+
 // rawConfig mirrors the JSON file / env keys as strings so that parsing and
 // validation happen once, after all overrides are applied.
 type rawConfig struct {
-	ListenAddr          string   `json:"LISTEN_ADDR"`
-	UpstreamBaseURL     string   `json:"UPSTREAM_BASE_URL"`
-	AuthTokens          []string `json:"AUTH_TOKENS"`
-	RotationInterval    string   `json:"ROTATION_INTERVAL"`
-	RequestTimeout      string   `json:"REQUEST_TIMEOUT"`
-	SessionCallTimeout  string   `json:"SESSION_CALL_TIMEOUT"`
-	APIKeys             []string `json:"API_KEYS"`
-	AdminToken          string   `json:"ADMIN_TOKEN"`
-	HTTPProxy           string   `json:"HTTP_PROXY"`
-	SOCKS5Proxy         string   `json:"SOCKS5_PROXY"`
-	SOCKS5Proxies       []string `json:"SOCKS5_PROXIES"`
-	ProxyRotation       string   `json:"PROXY_ROTATION"`
-	CostMode            string   `json:"COST_MODE"`
-	TLSFingerprint      string   `json:"TLS_FINGERPRINT"`
-	RegistryRefresh     string   `json:"REGISTRY_REFRESH"`
-	DebugDump           bool     `json:"DEBUG_DUMP"`
-	LogFile             string   `json:"LOG_FILE"`
-	LogLevel            string   `json:"LOG_LEVEL"`
-	MaxMessagesPerDay   *int     `json:"MAX_MESSAGES_PER_DAY"`
-	IdleRotationTimeout string   `json:"IDLE_ROTATION_TIMEOUT"`
-	SafeMode            bool     `json:"SAFE_MODE"`
-	RequestJitter       string   `json:"REQUEST_JITTER"`
-	CLIVersion          string   `json:"CLI_VERSION"`
-	ModelAliases        string   `json:"MODEL_ALIASES"`
-	TransientRetries    *int     `json:"TRANSIENT_RETRIES"`
+	ListenAddr      string   `json:"LISTEN_ADDR"`
+	UpstreamBaseURL string   `json:"UPSTREAM_BASE_URL"`
+	AuthTokens      []string `json:"AUTH_TOKENS"`
+	// AuthTokensSet records that AUTH_TOKENS was explicitly provided (even
+	// as an empty value) by the JSON file, .env, or the environment. An
+	// explicitly-empty AUTH_TOKENS means the operator chose bridge mode, so
+	// CLI auto-discovery must not refill it (runtime mode switch persists
+	// "AUTH_TOKENS=" to .env and relies on this).
+	AuthTokensSet         bool     `json:"-"`
+	RotationInterval      string   `json:"ROTATION_INTERVAL"`
+	RequestTimeout        string   `json:"REQUEST_TIMEOUT"`
+	SessionCallTimeout    string   `json:"SESSION_CALL_TIMEOUT"`
+	APIKeys               []string `json:"API_KEYS"`
+	AdminToken            string   `json:"ADMIN_TOKEN"`
+	HTTPProxy             string   `json:"HTTP_PROXY"`
+	SOCKS5Proxy           string   `json:"SOCKS5_PROXY"`
+	SOCKS5Proxies         []string `json:"SOCKS5_PROXIES"`
+	ProxyRotation         string   `json:"PROXY_ROTATION"`
+	CostMode              string   `json:"COST_MODE"`
+	TLSFingerprint        string   `json:"TLS_FINGERPRINT"`
+	RegistryRefresh       string   `json:"REGISTRY_REFRESH"`
+	DebugDump             bool     `json:"DEBUG_DUMP"`
+	LogFile               string   `json:"LOG_FILE"`
+	LogLevel              string   `json:"LOG_LEVEL"`
+	MaxMessagesPerDay     *int     `json:"MAX_MESSAGES_PER_DAY"`
+	IdleRotationTimeout   string   `json:"IDLE_ROTATION_TIMEOUT"`
+	SafeMode              bool     `json:"SAFE_MODE"`
+	HybridMode            bool     `json:"HYBRID_MODE"`
+	ModelsHideUnavailable bool     `json:"MODELS_HIDE_UNAVAILABLE"`
+	RequestJitter         string   `json:"REQUEST_JITTER"`
+	CLIVersion            string   `json:"CLI_VERSION"`
+	ModelAliases          string   `json:"MODEL_ALIASES"`
+	TransientRetries      *int     `json:"TRANSIENT_RETRIES"`
 }
 
 func defaultRawConfig() rawConfig {
@@ -95,9 +121,10 @@ func defaultRawConfig() rawConfig {
 		RegistryRefresh:     "6h",
 		CostMode:            "free", // free-tier mode; omission routes requests as PAID and fresh free accounts get 402 "Out of credits" (upstream check: cost_mode !== 'free' → billing)
 		MaxMessagesPerDay:   nil,
-		IdleRotationTimeout: "",   // "" = disabled (unset → SAFE_MODE preset may fill)
-		SafeMode:            true, // anti-ban presets on by default; set SAFE_MODE=false to disable
-		RequestJitter:       "",   // "" = disabled (unset → SAFE_MODE preset may fill)
+		IdleRotationTimeout: "",    // "" = disabled (unset → SAFE_MODE preset may fill)
+		SafeMode:            true,  // anti-ban presets on by default; set SAFE_MODE=false to disable
+		HybridMode:          false, // relay client tokens AND serve the pool (off by default)
+		RequestJitter:       "",    // "" = disabled (unset → SAFE_MODE preset may fill)
 		CLIVersion:          "0.10.7",
 		TransientRetries:    nil, // nil = 1 (one retry after a transient transport failure; 0 disables)
 	}
@@ -120,7 +147,17 @@ func Load(configPath string) (Config, error) {
 
 	overrideString(&raw.ListenAddr, "LISTEN_ADDR")
 	overrideString(&raw.UpstreamBaseURL, "UPSTREAM_BASE_URL")
-	overrideCSV(&raw.AuthTokens, "AUTH_TOKENS")
+	// AUTH_TOKENS is presence-sensitive: an empty value in the real
+	// environment is an explicit bridge-mode choice (systemd/Docker unit
+	// files set AUTH_TOKENS= to force bridge mode). Unlike other keys, an
+	// empty value must not be skipped — it records presence so CLI
+	// auto-discovery cannot refill the pool, mirroring applyDotenv's
+	// AUTH_TOKENS handling for .env. When the variable is absent, the
+	// JSON/.env value (if any) stands unchanged.
+	if v, ok := os.LookupEnv("AUTH_TOKENS"); ok {
+		raw.AuthTokens = splitList(v)
+		raw.AuthTokensSet = true
+	}
 	overrideString(&raw.RotationInterval, "ROTATION_INTERVAL")
 	overrideString(&raw.RequestTimeout, "REQUEST_TIMEOUT")
 	overrideString(&raw.SessionCallTimeout, "SESSION_CALL_TIMEOUT")
@@ -139,6 +176,8 @@ func Load(configPath string) (Config, error) {
 	overrideInt(&raw.MaxMessagesPerDay, "MAX_MESSAGES_PER_DAY")
 	overrideString(&raw.IdleRotationTimeout, "IDLE_ROTATION_TIMEOUT")
 	overrideBool(&raw.SafeMode, "SAFE_MODE")
+	overrideBool(&raw.HybridMode, "HYBRID_MODE")
+	overrideBool(&raw.ModelsHideUnavailable, "MODELS_HIDE_UNAVAILABLE")
 	overrideString(&raw.RequestJitter, "REQUEST_JITTER")
 	overrideString(&raw.CLIVersion, "CLI_VERSION")
 	overrideString(&raw.ModelAliases, "MODEL_ALIASES")
@@ -209,31 +248,33 @@ func Load(configPath string) (Config, error) {
 	}
 
 	cfg := Config{
-		ListenAddr:          strings.TrimSpace(raw.ListenAddr),
-		UpstreamBaseURL:     upstreamBaseURL,
-		AuthTokens:          dedupeStrings(raw.AuthTokens),
-		RotationInterval:    rotationInterval,
-		RequestTimeout:      requestTimeout,
-		SessionCallTimeout:  sessionCallTimeout,
-		APIKeys:             dedupeStrings(raw.APIKeys),
-		AdminToken:          strings.TrimSpace(raw.AdminToken),
-		HTTPProxy:           strings.TrimSpace(raw.HTTPProxy),
-		SOCKS5Proxy:         strings.TrimSpace(raw.SOCKS5Proxy),
-		SOCKS5Proxies:       dedupeStrings(raw.SOCKS5Proxies),
-		ProxyRotation:       strings.TrimSpace(raw.ProxyRotation),
-		CostMode:            strings.TrimSpace(raw.CostMode),
-		TLSFingerprint:      strings.TrimSpace(raw.TLSFingerprint),
-		RegistryRefresh:     registryRefresh,
-		DebugDump:           raw.DebugDump,
-		LogFile:             strings.TrimSpace(raw.LogFile),
-		LogLevel:            strings.TrimSpace(raw.LogLevel),
-		MaxMessagesPerDay:   maxMessagesPerDay,
-		IdleRotationTimeout: idleRotationTimeout,
-		SafeMode:            raw.SafeMode,
-		RequestJitter:       requestJitter,
-		CLIVersion:          strings.TrimSpace(raw.CLIVersion),
-		ModelAliases:        parseMap(raw.ModelAliases),
-		TransientRetries:    transientRetries,
+		ListenAddr:            strings.TrimSpace(raw.ListenAddr),
+		UpstreamBaseURL:       upstreamBaseURL,
+		AuthTokens:            dedupeStrings(raw.AuthTokens),
+		RotationInterval:      rotationInterval,
+		RequestTimeout:        requestTimeout,
+		SessionCallTimeout:    sessionCallTimeout,
+		APIKeys:               dedupeStrings(raw.APIKeys),
+		AdminToken:            strings.TrimSpace(raw.AdminToken),
+		HTTPProxy:             strings.TrimSpace(raw.HTTPProxy),
+		SOCKS5Proxy:           strings.TrimSpace(raw.SOCKS5Proxy),
+		SOCKS5Proxies:         dedupeStrings(raw.SOCKS5Proxies),
+		ProxyRotation:         strings.TrimSpace(raw.ProxyRotation),
+		CostMode:              strings.TrimSpace(raw.CostMode),
+		TLSFingerprint:        strings.TrimSpace(raw.TLSFingerprint),
+		RegistryRefresh:       registryRefresh,
+		DebugDump:             raw.DebugDump,
+		LogFile:               strings.TrimSpace(raw.LogFile),
+		LogLevel:              strings.TrimSpace(raw.LogLevel),
+		MaxMessagesPerDay:     maxMessagesPerDay,
+		IdleRotationTimeout:   idleRotationTimeout,
+		SafeMode:              raw.SafeMode,
+		HybridMode:            raw.HybridMode,
+		ModelsHideUnavailable: raw.ModelsHideUnavailable,
+		RequestJitter:         requestJitter,
+		CLIVersion:            strings.TrimSpace(raw.CLIVersion),
+		ModelAliases:          parseMap(raw.ModelAliases),
+		TransientRetries:      transientRetries,
 	}
 
 	// Auto-discover CLI token if no AUTH_TOKENS were explicitly configured
@@ -242,7 +283,7 @@ func Load(configPath string) (Config, error) {
 	if v := strings.ToLower(strings.TrimSpace(os.Getenv("AUTO_DISCOVER_TOKEN"))); v == "false" || v == "0" || v == "off" || v == "no" {
 		autoDiscover = false
 	}
-	if autoDiscover && len(cfg.AuthTokens) == 0 {
+	if autoDiscover && len(cfg.AuthTokens) == 0 && !raw.AuthTokensSet {
 		if token, email, srcPath, ok := discoverCLIToken(); ok {
 			cfg.AuthTokens = []string{token}
 			cfg.DiscoveredSource = srcPath
@@ -296,6 +337,9 @@ func discoverCLIToken() (string, string, string, bool) {
 		if err != nil {
 			continue
 		}
+		// Strip a leading UTF-8 BOM (Windows credential writers can add one)
+		// or json.Unmarshal fails and auto-discovery silently skips the file.
+		data = bytes.TrimPrefix(data, []byte{0xEF, 0xBB, 0xBF})
 		var parsed map[string]any
 		if err := json.Unmarshal(data, &parsed); err != nil {
 			continue
@@ -343,7 +387,18 @@ func (c Config) Validate() error {
 		return errors.New("REQUEST_JITTER cannot be negative")
 	case c.TransientRetries < 0:
 		return errors.New("TRANSIENT_RETRIES cannot be negative")
+	case c.CostMode != "" && c.CostMode != "free":
+		return errors.New(`COST_MODE must be "free" or unset -- any other value (e.g. a typo) routes requests as PAID and fresh free accounts get 402 "Out of credits"`)
+	case c.ProxyRotation != "" && c.ProxyRotation != "per-token" && c.ProxyRotation != "round-robin" && c.ProxyRotation != "random":
+		return fmt.Errorf("PROXY_ROTATION %q must be one of: per-token, round-robin, random", c.ProxyRotation)
+	case c.MaxMessagesPerDay < 0:
+		return errors.New("MAX_MESSAGES_PER_DAY cannot be negative")
 	}
+
+	// HYBRID_MODE deliberately has no constraint: hybrid with zero
+	// AUTH_TOKENS is legal — the dashboard warns that token-less requests
+	// will 502 until a token is added, while client-token requests relay
+	// like bridge mode.
 
 	for i, tok := range c.AuthTokens {
 		if strings.HasPrefix(strings.ToLower(tok), "bearer ") {
@@ -425,6 +480,9 @@ func loadRaw(configPath string) (rawConfig, error) {
 		if err := json.Unmarshal(data, &cfg); err != nil {
 			return rawConfig{}, fmt.Errorf("parse config file: %w", err)
 		}
+		// A non-nil AuthTokens after unmarshal means the JSON key was present
+		// ([] is an explicit empty list; absent leaves it nil).
+		cfg.AuthTokensSet = cfg.AuthTokens != nil
 	}
 
 	return cfg, nil
@@ -440,9 +498,17 @@ func applyDotenv(raw *rawConfig) error {
 		return err
 	}
 	get := func(name string) string { return vals[name] }
+	// An empty AUTH_TOKENS= line in .env is an explicit bridge-mode choice
+	// (the dashboard mode switch persists exactly this): record presence so
+	// auto-discovery cannot refill it, AND clear whatever the JSON config
+	// provided (the empty value must beat the JSON list). Unlike other keys,
+	// AUTH_TOKENS must NOT skip empty overrides.
+	if v, ok := vals["AUTH_TOKENS"]; ok {
+		raw.AuthTokens = splitList(v)
+		raw.AuthTokensSet = true
+	}
 	overrideStringFrom(&raw.ListenAddr, get, "LISTEN_ADDR")
 	overrideStringFrom(&raw.UpstreamBaseURL, get, "UPSTREAM_BASE_URL")
-	overrideCSVFrom(&raw.AuthTokens, get, "AUTH_TOKENS")
 	overrideStringFrom(&raw.RotationInterval, get, "ROTATION_INTERVAL")
 	overrideStringFrom(&raw.RequestTimeout, get, "REQUEST_TIMEOUT")
 	overrideStringFrom(&raw.SessionCallTimeout, get, "SESSION_CALL_TIMEOUT")
@@ -463,6 +529,8 @@ func applyDotenv(raw *rawConfig) error {
 	// AUTO_DISCOVER_TOKEN is intentionally env-only (it controls the .env
 	// read itself, so honoring it from .env would be circular).
 	overrideBoolFrom(&raw.SafeMode, get, "SAFE_MODE")
+	overrideBoolFrom(&raw.HybridMode, get, "HYBRID_MODE")
+	overrideBoolFrom(&raw.ModelsHideUnavailable, get, "MODELS_HIDE_UNAVAILABLE")
 	overrideStringFrom(&raw.RequestJitter, get, "REQUEST_JITTER")
 	overrideStringFrom(&raw.CLIVersion, get, "CLI_VERSION")
 	overrideStringFrom(&raw.ModelAliases, get, "MODEL_ALIASES")
@@ -485,7 +553,18 @@ func readDotenv(path string) (map[string]string, error) {
 		}
 		return nil, fmt.Errorf("read %s: %w", path, err)
 	}
+	return parseDotenv(data), nil
+}
+
+// parseDotenv splits .env content into KEY=VALUE pairs using the same lenient
+// rules as readDotenv: blank lines and # comments skipped, single/double
+// quotes stripped, unquoted trailing # comments trimmed.
+func parseDotenv(data []byte) map[string]string {
 	out := make(map[string]string)
+	// Strip a leading UTF-8 BOM: PowerShell WriteAllText with a BOM-less
+	// encoding must not be the only safe writer — a BOM on the first line
+	// would corrupt the first key into "\ufeffKEY".
+	data = bytes.TrimPrefix(data, []byte{0xEF, 0xBB, 0xBF})
 	for _, line := range strings.Split(string(data), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" || strings.HasPrefix(line, "#") {
@@ -514,7 +593,7 @@ func readDotenv(path string) (map[string]string, error) {
 		}
 		out[key] = value
 	}
-	return out, nil
+	return out
 }
 
 func overrideString(target *string, envName string) {

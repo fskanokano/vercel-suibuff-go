@@ -1,0 +1,8 @@
+# LF everywhere: repo + checkout, all platforms (Windows autocrlf noise gone)
+* text=auto eol=lf
+
+# Shell scripts must stay LF in the repo (Windows autocrlf would break them)
+*.sh text eol=lf
+
+# PowerShell scripts: LF-safe with pwsh/VS Code; explicit for self-documentation
+*.ps1 text eol=lf

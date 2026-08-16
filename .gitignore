@@ -15,10 +15,13 @@ dist/
 out/
 bin/
 tmp/
+.playwright-mcp/
+.ruff_cache/
 
 # ── build outputs (Go binaries) ──
 /freebuff-proxy
 /freebuff-proxy.exe
+/freebuff-proxy-dash.exe
 /server
 *.test
 *.out
@@ -49,3 +52,8 @@ HANDOFF.md
 # ── dev docs (local only, not repo content); guides/ is public ──
 docs/*
 !docs/guides/
+
+# local agent tool state (skills.sh installs, session artifacts)
+.agents/
+.claude/
+skills-lock.json
