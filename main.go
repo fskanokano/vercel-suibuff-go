@@ -111,7 +111,14 @@ func main() {
 	go refreshLoop(ctx, logger, reg, cfg.RegistryRefresh)
 
 	// One upstream client and session manager per token, bound into the pool
-	// together with a per-token run manager.
+	// together with a per-token run manager. When SESSION_PERSIST is enabled
+	// one shared store backs every session manager, so a restart resumes
+	// unexpired sessions (on Vercel the ephemeral FS resets this on cold start).
+	var store *session.Store
+	if cfg.SessionPersist {
+		store = session.NewStore(cfg.SessionStateFile)
+		logger.Info("session state persistence enabled", "file", cfg.SessionStateFile)
+	}
 	clients := make([]*upstream.Client, 0, len(cfg.AuthTokens))
 	sessions := make([]*session.Manager, 0, len(cfg.AuthTokens))
 	for i, token := range cfg.AuthTokens {
@@ -121,7 +128,7 @@ func main() {
 			os.Exit(1)
 		}
 		clients = append(clients, client)
-		sessions = append(sessions, session.NewManager(client))
+		sessions = append(sessions, session.NewManagerWithStore(client, store))
 	}
 	if cfg.DiscoveredSource != "" {
 		logger.Info("auto-discovered FreeBuff token from CLI login", "email", cfg.DiscoveredEmail, "file", cfg.DiscoveredSource)
@@ -131,6 +138,7 @@ func main() {
 		logger.Error("failed to build pool", "err", err)
 		os.Exit(1)
 	}
+	p.SetSessionStore(store)
 
 	// Prewarm + the maintain loop run until ctx is canceled (shutdown).
 	p.Start(ctx)

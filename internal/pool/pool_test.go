@@ -1,11 +1,14 @@
 package pool
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -568,14 +571,19 @@ func TestAcquireRateLimitCooldowns(t *testing.T) {
 }
 
 func TestAcquireRateLimitBestWindow(t *testing.T) {
-	// Both tokens rate-limited with different windows: the pool surfaces the
-	// longest one (the token that unblocks last bounds the wait).
+	// Both tokens rate-limited with DIFFERENT windows (per-mock
+	// retryAfterMs): the pool surfaces the longest one — the token that
+	// unblocks last bounds the wait. The previous version served the same
+	// fixed body to both tokens, so the assertion never exercised the
+	// bestRateLimit comparison.
 	mock0 := testutil.NewMock()
 	defer mock0.Close()
 	mock0.RateLimit = true
+	mock0.RateLimitRetryAfterMs = 60000 // 1m window
 	mock1 := testutil.NewMock()
 	defer mock1.Close()
 	mock1.RateLimit = true
+	mock1.RateLimitRetryAfterMs = 300000 // 5m window
 	p := newTestPool(t, mock0, mock1)
 
 	_, err := p.Acquire(context.Background(), modelA)
@@ -583,8 +591,8 @@ func TestAcquireRateLimitBestWindow(t *testing.T) {
 	if !errors.As(err, &rle) {
 		t.Fatalf("want *upstream.RateLimitError, got %v", err)
 	}
-	if rle.RetryAfter != 48549499*time.Millisecond {
-		t.Errorf("RetryAfter = %s, want 48549499ms (best window)", rle.RetryAfter)
+	if rle.RetryAfter != 5*time.Minute {
+		t.Errorf("RetryAfter = %s, want 5m (longest window wins)", rle.RetryAfter)
 	}
 	if err.Error() == "" || !strings.Contains(err.Error(), "upstream rate limited") {
 		t.Errorf("error = %q, want rate-limit message", err)
@@ -952,6 +960,74 @@ func TestSetConfigReloadsDailyLimit(t *testing.T) {
 	}
 }
 
+// TestSetConfigWarnsOnPersistenceChange pins the reload warning: session
+// persistence is fixed at startup (the store is built from the boot config
+// and injected via SetSessionStore), so a reloaded config that changes
+// SESSION_PERSIST / SESSION_STATE_FILE must warn that it only takes effect
+// on the next restart instead of silently doing nothing.
+func TestSetConfigWarnsOnPersistenceChange(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+
+	var buf bytes.Buffer
+	testLogger := slog.New(slog.NewTextHandler(&buf, nil))
+
+	p := newTestPoolCfg(t, func(c *config.Config) {
+		c.SessionPersist = true
+		c.SessionStateFile = ".freebuff-session-state.json"
+	}, mock)
+	p.logger = testLogger // internal test: capture the pool's logger
+	p.SetSessionStore(session.NewStore(filepath.Join(t.TempDir(), "state.json")))
+
+	// Same persistence config on reload → no warning.
+	buf.Reset()
+	same := *p.cfg.Load()
+	p.SetConfig(&same)
+	if got := buf.String(); got != "" {
+		t.Fatalf("SetConfig with unchanged persistence logged: %q, want none", got)
+	}
+
+	// Persistence disabled → warn.
+	buf.Reset()
+	disabled := *p.cfg.Load()
+	disabled.SessionPersist = false
+	p.SetConfig(&disabled)
+	if got := buf.String(); !strings.Contains(got, "SESSION_PERSIST") {
+		t.Fatalf("SetConfig disabling persistence logged %q, want SESSION_PERSIST warning", got)
+	}
+
+	// Same persistence, different state file → warn.
+	buf.Reset()
+	moved := *p.cfg.Load()
+	moved.SessionPersist = true
+	moved.SessionStateFile = "elsewhere.json"
+	p.SetConfig(&moved)
+	if got := buf.String(); !strings.Contains(got, "SESSION_PERSIST") || !strings.Contains(got, "elsewhere.json") {
+		t.Fatalf("SetConfig moving the state file logged %q, want SESSION_PERSIST warning with new path", got)
+	}
+}
+
+// TestSetConfigWarnsWhenPersistenceTurnedOn covers the pre-injection state
+// (SetSessionStore never called, store nil): a reload that turns
+// SESSION_PERSIST on cannot build the store at runtime, so it must warn.
+func TestSetConfigWarnsWhenPersistenceTurnedOn(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+
+	var buf bytes.Buffer
+	p := newTestPool(t, mock)
+	p.logger = slog.New(slog.NewTextHandler(&buf, nil))
+	// SetSessionStore never called: recorded persistence is off.
+
+	enabled := *p.cfg.Load()
+	enabled.SessionPersist = true
+	enabled.SessionStateFile = ".freebuff-session-state.json"
+	p.SetConfig(&enabled)
+	if got := buf.String(); !strings.Contains(got, "SESSION_PERSIST") {
+		t.Fatalf("SetConfig enabling persistence logged %q, want SESSION_PERSIST warning", got)
+	}
+}
+
 func TestIdleRotationFinishesRuns(t *testing.T) {
 	mock := testutil.NewMock()
 	defer mock.Close()
@@ -975,8 +1051,12 @@ func TestIdleRotationFinishesRuns(t *testing.T) {
 		t.Fatalf("finished runs = %v before idle, want none", got)
 	}
 
-	// Past the idle threshold: one pass FINISHes all runs...
-	time.Sleep(30 * time.Millisecond)
+	// Past the idle threshold: one pass FINISHes all runs. The threshold is
+	// crossed by mutating lastActive (deterministic; a fixed sleep would
+	// race the 10ms threshold on slow CI).
+	p.lastActiveMu.Lock()
+	p.lastActive = time.Now().Add(-time.Second)
+	p.lastActiveMu.Unlock()
 	p.maintainTick(context.Background())
 	finished := mock.FinishedRunsSnapshot()
 	if len(finished) != 1 || finished[0].Status != "completed" {
@@ -1029,7 +1109,11 @@ func TestIdleRotationSkipsInflight(t *testing.T) {
 	}
 
 	// Past the idle threshold: an idle pass must NOT FINISH the held run.
-	time.Sleep(30 * time.Millisecond)
+	// The threshold is crossed by mutating lastActive (deterministic; a
+	// fixed sleep would race the 10ms threshold on slow CI).
+	p.lastActiveMu.Lock()
+	p.lastActive = time.Now().Add(-time.Second)
+	p.lastActiveMu.Unlock()
 	p.maintainTick(context.Background())
 	if got := mock.FinishedRunsSnapshot(); len(got) != 0 {
 		t.Fatalf("finished runs = %v, want none (in-flight lease held)", got)
@@ -1132,8 +1216,8 @@ func TestPoolCooldownRateLimitAndBan(t *testing.T) {
 	p.CooldownTokenBan(0, be)
 
 	snap := p.Snapshot()[0]
-	if snap.RiskLevel != "critical" && snap.RiskLevel != "high" {
-		t.Errorf("RiskLevel = %q, want high or critical", snap.RiskLevel)
+	if snap.RiskLevel != "critical" {
+		t.Errorf("RiskLevel = %q, want critical (active ban outranks the cooldown label)", snap.RiskLevel)
 	}
 }
 
@@ -1760,7 +1844,11 @@ func TestIdleFinishAllRunsHonorsMaintainCtx(t *testing.T) {
 	}
 	p.LeaseRelease(lease)
 
-	time.Sleep(20 * time.Millisecond) // past the idle threshold
+	// Cross the idle threshold by mutating lastActive (deterministic; a
+	// fixed sleep would race the 1ms threshold on slow CI).
+	p.lastActiveMu.Lock()
+	p.lastActive = time.Now().Add(-time.Second)
+	p.lastActiveMu.Unlock()
 
 	// Hold every FINISH upstream: only ctx cancellation can end it.
 	mock.FinishDelay = time.Hour
@@ -1810,7 +1898,7 @@ func TestBridgeMaintainEvictHonorsCtx(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
-		p.bridgeMaintain(ctx)
+		p.bridgeMaintain(ctx, false)
 		close(done)
 	}()
 

@@ -32,6 +32,7 @@ codebuff.com 上游
 - **Hybrid 模式**：`HYBRID_MODE=true` 时 pooled + bridge 共存。
 - **quota 透明**：`/healthz` 新增 per-token `quota` map（上次 admission 携带时）；`/v1/models` 携带 `available`/`status`/`current_access_tier`。
 - **region/tier 模型可用性**：`MODELS_HIDE_UNAVAILABLE=true` 时 `/v1/models` 裁剪不可用模型。
+- **Session 持久化**：`SESSION_PERSIST=true` 时把未过期会话写盘（`SESSION_STATE_FILE`，0600，按 token 的 SHA-256 哈希为键、原始 token 不落盘），重启后恢复而避免烧新的每日会话额度。⚠️ Vercel 只读/易失文件系统上**无法真正持久化**（冷启动即重置），此项在 Vercel 上仅作占位。
 
 ## 快速部署
 
@@ -131,12 +132,13 @@ go test ./...                            # 上游完整测试套件（全过）
 | 请求时长 | 无硬限制 | **300s 上限**（Hobby） |
 | 出口 | 本机 IP / 自配代理 | 美东 iad1（动态 IP） |
 | `/admin/reload` | 热重载本地 .env | 无意义（无本地配置文件） |
+| 会话持久化 (`SESSION_PERSIST`) | 重启恢复未过期会话 | 只读/易失 FS，冷启动即重置（仅占位） |
 | TLS 隐身 (uTLS) | ✅ | ✅ 完整保留 |
 
 ## 上游
 
 - 项目：https://github.com/trefeon/freebuff-proxy
-- 同步基线：上游 commit `39fd436`（2026-08-16）。协议转换层（`internal/convert`、`internal/upstream`、`internal/stealth`、`internal/registry`、`internal/dashboard`、`internal/egress`、`internal/logring`）随上游更新；本仓库逻辑代码与上游逐字节一致，唯一差异是根 `main.go`、`vercel.json`、本 README（Vercel 适配层）。
+- 同步基线：上游 commit `3cf82c5`（2026-08-16）。协议转换层（`internal/convert`、`internal/upstream`、`internal/stealth`、`internal/registry`、`internal/dashboard`、`internal/egress`、`internal/logring`、`internal/session`）随上游更新；本仓库逻辑代码与上游逐字节一致，唯一差异是根 `main.go`、`vercel.json`、本 README（Vercel 适配层）。
 
 ## License
 

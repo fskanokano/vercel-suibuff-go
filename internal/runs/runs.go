@@ -286,8 +286,8 @@ func (m *RunManager) Shutdown(ctx context.Context) {
 			errs = append(errs, fmt.Sprintf("finish run %s: %v", run.RunID, err))
 		}
 	}
-	if err := m.session.EndSession(ctx); err != nil {
-		errs = append(errs, fmt.Sprintf("end session: %v", err))
+	if err := m.session.Shutdown(ctx); err != nil {
+		errs = append(errs, fmt.Sprintf("shutdown session: %v", err))
 	}
 	if len(errs) > 0 {
 		slog.Warn("runs: shutdown with errors", "errors", strings.Join(errs, "; "))
@@ -340,6 +340,11 @@ func (m *RunManager) Cooldown(d time.Duration) {
 	m.rateLimit = nil
 	m.ban = nil
 	m.countryBlock = nil
+	// The ban/country windows die with their remembered errors: leaving the
+	// deadlines set would surface a stale future BannedUntil (healthz risk
+	// gating via Snapshot) with no ban attached. Mirror ClearCooldowns.
+	m.banUntil = time.Time{}
+	m.countryUntil = time.Time{}
 	m.mu.Unlock()
 }
 
