@@ -1,18 +1,22 @@
 package registry
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"freebuff-proxy/internal/config"
 )
@@ -27,27 +31,29 @@ func fileSource(t *testing.T, path string) string {
 	return "file:///" + filepath.ToSlash(abs)
 }
 
-// expectedFallback is the model→agent map the JS fallback table (lines
-// 14-41) must produce: first-seen assignment in entry order, so the five
-// base2-free models belong to base2-free (not their dedicated one-model
-// agents), and the gemini helper models belong to file-picker / file-picker-max
-// (which precede file-lister / researcher-* / basher).
+// expectedFallback is the model→agent map the pruned, parity-checked fallback
+// table must produce: the pinned upstream snapshot (testdata/upstream) parsed
+// with the real parser, with FREEBUFF_ROOT_AGENT_ID_BY_MODEL winning over
+// first-seen assignment (exactly like a live refresh). The five base models
+// route to their per-model roots (not the generic base2-free), the gemini
+// helper models belong to file-picker / file-picker-max, and every upstream-
+// retired id is absent.
 var expectedFallback = map[string]string{
-	"deepseek/deepseek-v4-pro":         "base2-free",
-	"deepseek/deepseek-v4-flash":       "base2-free",
-	"minimax/minimax-m3":               "base2-free",
-	"openai/gpt-5.6-luna":              "base2-free",
-	"mimo/mimo-v2.5":                   "base2-free",
-	"z-ai/glm-5.2":                     "base2-free-glm",
-	"poolside/laguna-s-2.1":            "base2-free-laguna-s-2-1",
-	"openrouter/poolside/laguna-s-2.1": "base2-free-laguna-s-2-1-openrouter",
-	"inclusionai/ling-3.0-flash:free":  "base2-free-ling-3-flash",
-	"crof/greg-2-ultra":                "base2-free-greg-2-ultra",
-	"crof/greg-2-super":                "base2-free-greg-2-super",
-	"anthropic/claude-fable-5":         "base2-free-fable",
-	"google/gemini-2.5-flash-lite":     "file-picker",
-	"google/gemini-3.1-flash-lite":     "file-picker-max",
-	"google/gemini-3.5-flash-lite":     "file-picker-max",
+	"minimax/minimax-m3":              "base2-free-minimax-m3",
+	"openai/gpt-5.6-luna":             "base2-free-luna",
+	"deepseek/deepseek-v4-pro":        "base2-free-deepseek",
+	"deepseek/deepseek-v4-flash":      "base2-free-deepseek-flash",
+	"mimo/mimo-v2.5":                  "base2-free-mimo",
+	"z-ai/glm-5.2":                    "base2-free-glm",
+	"crof/kimi-k3-eco":                "base2-free-kimi-k3-eco",
+	"deepseek/deepseek-v4-pro-max":    "base2-free-deepseek-pro-max",
+	"deepseek/deepseek-v4-flash-max":  "base2-free-deepseek-flash-max",
+	"openai/gpt-5.6-luna-max":         "base2-free-luna-max",
+	"meta/muse-spark-1.2-contributor": "base2-free-muse-spark",
+	"anthropic/claude-fable-5":        "base2-free-fable",
+	"google/gemini-2.5-flash-lite":    "file-picker",
+	"google/gemini-3.1-flash-lite":    "file-picker-max",
+	"google/gemini-3.5-flash-lite":    "file-picker-max",
 }
 
 func TestFallbackMap(t *testing.T) {
@@ -95,6 +101,113 @@ func TestFallbackMap(t *testing.T) {
 
 	if _, err := r.AgentForModel("does/not-exist"); !errors.Is(err, ErrModelNotFound) {
 		t.Errorf("unknown model err = %v, want ErrModelNotFound", err)
+	}
+}
+
+// TestFallbackParityWithPinnedUpstream guards issue #121 at the root: the
+// offline fallback must mirror the CURRENT upstream FREE_MODE_AGENT_MODELS.
+// testdata/upstream/ is a pinned snapshot of the five Codebuff source files
+// (copied from reference/freebuff/common/src/constants, the RE-verified
+// installed CLI binary). This test parses that snapshot with the real parser
+// — the same code a live Refresh runs — and requires LoadFallback to produce
+// the identical model set, model→agent routing, and agent set. When upstream
+// adds or retires a model: refresh the pinned snapshot (copy the five files
+// from the vendored reference or CodebuffAI/codebuff main) AND update
+// fallbackAgents/fallbackRootByModel in the same change — this test fails on
+// drift, so a stale fallback can no longer ship silently.
+func TestFallbackParityWithPinnedUpstream(t *testing.T) {
+	dir := filepath.Join("testdata", "upstream")
+	files := []string{"free-agents.ts", "freebuff-model-ids.ts", "freebuff-models.ts", "gemini.ts", "model-config.ts"}
+	urls := make([]string, len(files))
+	for i, f := range files {
+		urls[i] = fileSource(t, filepath.Join(dir, f))
+	}
+
+	live := New(nil, nil)
+	live.SetSources(urls)
+	if err := live.Refresh(context.Background()); err != nil {
+		t.Fatalf("refresh pinned snapshot: %v", err)
+	}
+
+	fallback := New(nil, nil)
+	fallback.LoadFallback()
+
+	if got, want := fallback.ModelCount(), live.ModelCount(); got != want {
+		t.Fatalf("fallback ModelCount = %d, live = %d (fallback drifted from pinned upstream)", got, want)
+	}
+	for _, model := range live.Models() {
+		liveAgent, err := live.AgentForModel(model)
+		if err != nil {
+			t.Fatalf("live AgentForModel(%q): %v", model, err)
+		}
+		fallbackAgent, err := fallback.AgentForModel(model)
+		if err != nil {
+			t.Errorf("fallback AgentForModel(%q): %v (live routes it to %s)", model, err, liveAgent)
+			continue
+		}
+		if fallbackAgent != liveAgent {
+			t.Errorf("fallback routes %q -> %s, live routes -> %s", model, fallbackAgent, liveAgent)
+		}
+	}
+	// Model counts already match; this additionally catches the fallback
+	// advertising a model the pinned upstream does not (dead ids).
+	for _, model := range fallback.Models() {
+		if _, err := live.AgentForModel(model); err != nil {
+			t.Errorf("fallback advertises %q, absent from pinned upstream", model)
+		}
+	}
+	// Agent sets must match too (AgentIDs feeds prewarm and the dashboard).
+	liveAgents := make(map[string]bool, len(live.AgentIDs()))
+	for _, a := range live.AgentIDs() {
+		liveAgents[a] = true
+	}
+	fallbackAgents := make(map[string]bool, len(fallback.AgentIDs()))
+	for _, a := range fallback.AgentIDs() {
+		if !liveAgents[a] {
+			t.Errorf("fallback agent %q absent from pinned upstream", a)
+		}
+		fallbackAgents[a] = true
+	}
+	for _, a := range live.AgentIDs() {
+		if !fallbackAgents[a] {
+			t.Errorf("fallback missing live agent %q", a)
+		}
+	}
+}
+
+// TestFallbackPrunesRetiredModels guards issue #121: the offline fallback
+// must not advertise model ids upstream retired from FREE_MODE_AGENT_MODELS
+// (removed 2026-08-04/08-07). Advertising them surfaces dead ids via
+// /v1/models and trips upstream 403 free_mode_invalid_agent_model.
+func TestFallbackPrunesRetiredModels(t *testing.T) {
+	r := New(nil, nil)
+	r.LoadFallback()
+
+	tests := []struct {
+		model string
+		agent string
+	}{
+		{model: "poolside/laguna-s-2.1", agent: "base2-free-laguna-s-2-1"},
+		{model: "openrouter/poolside/laguna-s-2.1", agent: "base2-free-laguna-s-2-1-openrouter"},
+		{model: "inclusionai/ling-3.0-flash:free", agent: "base2-free-ling-3-flash"},
+		{model: "crof/greg-2-ultra", agent: "base2-free-greg-2-ultra"},
+		{model: "crof/greg-2-super", agent: "base2-free-greg-2-super"},
+	}
+
+	models := r.Models()
+	agentIDs := r.AgentIDs()
+	for _, tc := range tests {
+		t.Run(tc.model, func(t *testing.T) {
+			if _, err := r.AgentForModel(tc.model); !errors.Is(err, ErrModelNotFound) {
+				t.Errorf("AgentForModel(%q) err = %v, want ErrModelNotFound", tc.model, err)
+			}
+			if contains(models, tc.model) {
+				t.Errorf("Models() still advertises retired model %q", tc.model)
+			}
+			if contains(agentIDs, tc.agent) {
+				t.Errorf("AgentIDs() still lists retired agent %q", tc.agent)
+			}
+		})
 	}
 }
 
@@ -355,8 +468,10 @@ func TestModelAliases(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AgentForModel(gpt-4o) error: %v", err)
 	}
-	if agent != "base2-free" {
-		t.Errorf("AgentForModel(gpt-4o) = %q, want base2-free", agent)
+	// deepseek-v4-flash routes to its per-model root via the fallback root
+	// map, exactly like a live refresh.
+	if agent != "base2-free-deepseek-flash" {
+		t.Errorf("AgentForModel(gpt-4o) = %q, want base2-free-deepseek-flash", agent)
 	}
 }
 
@@ -562,4 +677,160 @@ func contains(values []string, needle string) bool {
 		}
 	}
 	return false
+}
+
+// ---------------------------------------------------------------------------
+// Issue #93 — jsDelivr mirrors + fallback ordering.
+// ---------------------------------------------------------------------------
+
+// TestMirrorForURLConstruction pins the jsDelivr mirror URL construction:
+// every default raw source has a matching mirror, and non-raw URLs (SetSources
+// overrides) are never mirrored.
+func TestMirrorForURLConstruction(t *testing.T) {
+	for _, f := range sourceFiles {
+		raw := RawBase + f
+		want := JsDelivrBase + f
+		if got := mirrorFor(raw); got != want {
+			t.Errorf("mirrorFor(%q) = %q, want %q", raw, got, want)
+		}
+	}
+	if got := mirrorFor(JsDelivrBase + "free-agents.ts"); got != "" {
+		t.Errorf("mirrorFor(jsDelivr URL) = %q, want \"\" (no double mirror)", got)
+	}
+	if got := mirrorFor("file:///x.ts"); got != "" {
+		t.Errorf("mirrorFor(override) = %q, want \"\"", got)
+	}
+}
+
+// TestSourceCandidatesMirrorOrdering pins the per-file URL lists Refresh
+// tries: default sources are [raw, jsDelivr] pairs (mirror after primary),
+// while SetSources overrides are single-URL entries used as-is.
+func TestSourceCandidatesMirrorOrdering(t *testing.T) {
+	r := New(nil, nil)
+	cands := r.sourceCandidates()
+	if len(cands) != len(sourceFiles) {
+		t.Fatalf("candidates = %d, want %d source files", len(cands), len(sourceFiles))
+	}
+	for i, f := range sourceFiles {
+		want := []string{RawBase + f, JsDelivrBase + f}
+		if !reflect.DeepEqual(cands[i], want) {
+			t.Errorf("candidates[%d] = %v, want %v", i, cands[i], want)
+		}
+	}
+
+	r.SetSources([]string{"file:///custom", "http://example/x.ts"})
+	cands = r.sourceCandidates()
+	want := [][]string{{"file:///custom"}, {"http://example/x.ts"}}
+	if !reflect.DeepEqual(cands, want) {
+		t.Errorf("override candidates = %v, want %v", cands, want)
+	}
+}
+
+// TestFetchSourceFallbackOrdering verifies fetchSource tries candidate URLs
+// in order and stops at the first success: a failing primary falls through to
+// the mirror (the attempted list records both), while a successful primary
+// never triggers the fallback.
+func TestFetchSourceFallbackOrdering(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/raw":
+			http.Error(w, "boom", http.StatusInternalServerError)
+		case "/mirror":
+			_, _ = io.WriteString(w, "export const MIRROR_CONTENT = 'm/mirror'")
+		case "/ok":
+			_, _ = io.WriteString(w, "export const OK_CONTENT = 'm/ok'")
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	ctx := context.Background()
+	client := &http.Client{Timeout: 5 * time.Second}
+
+	// Primary fails, mirror succeeds: mirror content wins, both URLs recorded.
+	text, attempted, err := fetchSource(ctx, client, []string{srv.URL + "/raw", srv.URL + "/mirror"})
+	if err != nil {
+		t.Fatalf("fetchSource(raw→mirror): %v", err)
+	}
+	if !strings.Contains(text, "MIRROR_CONTENT") {
+		t.Errorf("text = %q, want mirror content", text)
+	}
+	wantAttempted := []string{srv.URL + "/raw", srv.URL + "/mirror"}
+	if !reflect.DeepEqual(attempted, wantAttempted) {
+		t.Errorf("attempted = %v, want %v", attempted, wantAttempted)
+	}
+
+	// All candidates fail: error returned, every URL recorded.
+	_, attempted, err = fetchSource(ctx, client, []string{srv.URL + "/raw", srv.URL + "/missing"})
+	if err == nil {
+		t.Fatal("fetchSource with all-failing candidates succeeded, want error")
+	}
+	if len(attempted) != 2 {
+		t.Errorf("attempted on total failure = %v, want both URLs", attempted)
+	}
+
+	// Primary succeeds: the mirror is never attempted.
+	text, attempted, err = fetchSource(ctx, client, []string{srv.URL + "/ok", srv.URL + "/mirror"})
+	if err != nil {
+		t.Fatalf("fetchSource(ok→mirror): %v", err)
+	}
+	if !strings.Contains(text, "OK_CONTENT") {
+		t.Errorf("text = %q, want primary content", text)
+	}
+	if !reflect.DeepEqual(attempted, []string{srv.URL + "/ok"}) {
+		t.Errorf("attempted = %v, want only the primary URL (no fallback)", attempted)
+	}
+}
+
+// TestLastAttemptedSources verifies the -doctor helper: every URL tried in
+// the most recent Refresh is recorded, including after failures.
+func TestLastAttemptedSources(t *testing.T) {
+	r := New(nil, nil)
+	if got := r.LastAttemptedSources(); got != nil {
+		t.Fatalf("fresh registry LastAttemptedSources = %v, want nil", got)
+	}
+
+	missing := fileSource(t, filepath.Join("testdata", "does-not-exist.ts"))
+	r.SetSources([]string{missing})
+	if err := r.Refresh(context.Background()); err == nil {
+		t.Fatal("Refresh against missing source succeeded, want error")
+	}
+	if got := r.LastAttemptedSources(); !reflect.DeepEqual(got, []string{missing}) {
+		t.Errorf("LastAttemptedSources after failed refresh = %v, want [%s]", got, missing)
+	}
+
+	// A successful refresh records the sources it actually tried.
+	fixture := fileSource(t, filepath.Join("testdata", "registry-fixture.ts"))
+	r.SetSources([]string{fixture})
+	if err := r.Refresh(context.Background()); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	if got := r.LastAttemptedSources(); !reflect.DeepEqual(got, []string{fixture}) {
+		t.Errorf("LastAttemptedSources after successful refresh = %v, want [%s]", got, fixture)
+	}
+}
+
+// TestRefreshLogsSuccess verifies T18: a successful refresh logs an INFO
+// with agents/models counts and the duration (the success path was silent;
+// only main.go's failure path logged).
+func TestRefreshLogsSuccess(t *testing.T) {
+	var sink bytes.Buffer
+	r := New(nil, nil)
+	r.SetLogger(slog.New(slog.NewTextHandler(&sink, &slog.HandlerOptions{Level: slog.LevelInfo})))
+	r.SetSources([]string{fileSource(t, filepath.Join("testdata", "registry-fixture.ts"))})
+	if err := r.Refresh(context.Background()); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	logs := sink.String()
+	if !strings.Contains(logs, "registry refreshed") {
+		t.Fatalf("refresh success log missing msg: %s", logs)
+	}
+	for _, want := range []string{"agents=", "models=", "ms="} {
+		if !strings.Contains(logs, want) {
+			t.Errorf("refresh success log missing %q: %s", want, logs)
+		}
+	}
+	if !strings.Contains(logs, "models="+strconv.Itoa(r.ModelCount())) {
+		t.Errorf("refresh log models = %s, want %d", logs, r.ModelCount())
+	}
 }

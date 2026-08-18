@@ -7,12 +7,11 @@ import (
 	"compress/gzip"
 	"compress/zlib"
 	"context"
-	"encoding/base64"
-	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -132,11 +131,13 @@ func TestChatCompletionsEnvelope(t *testing.T) {
 		t.Fatalf("want 1 chat request, got %d / %d", len(headers), len(bodies))
 	}
 	h := headers[0]
-	if got := h.Get("x-freebuff-model"); got != "deepseek/deepseek-v4-flash" {
-		t.Errorf("x-freebuff-model = %q", got)
+	// #106: the chat POST carries NO x-freebuff-model / x-freebuff-instance-id
+	// headers — the model and instance id ride only in the body metadata.
+	if got := h.Get("x-freebuff-model"); got != "" {
+		t.Errorf("x-freebuff-model = %q on the chat POST, want absent (#106)", got)
 	}
-	if got := h.Get("x-freebuff-instance-id"); got != "inst-1" {
-		t.Errorf("x-freebuff-instance-id = %q", got)
+	if got := h.Get("x-freebuff-instance-id"); got != "" {
+		t.Errorf("x-freebuff-instance-id = %q on the chat POST, want absent (#106)", got)
 	}
 	if got := h.Get("Authorization"); got != "Bearer tok-a" {
 		t.Errorf("Authorization = %q", got)
@@ -161,9 +162,11 @@ func TestChatCompletionsEnvelope(t *testing.T) {
 	if md["freebuff_instance_id"] != "inst-1" {
 		t.Errorf("freebuff_instance_id = %v", md["freebuff_instance_id"])
 	}
+	// #103: client_id is a FRESH random draw per chat call — never the
+	// sess:-prefixed shape the server fingerprints as a proxy.
 	clientID, _ := md["client_id"].(string)
-	if !regexp.MustCompile(`^[0-9a-z]{13}$`).MatchString(clientID) {
-		t.Errorf("client_id %q not 13-char base36", clientID)
+	if !regexp.MustCompile(`^[a-z0-9]{13}$`).MatchString(clientID) || strings.HasPrefix(clientID, "sess:") {
+		t.Errorf("client_id = %q, want a fresh 13-char base36 draw per chat call (#103)", clientID)
 	}
 	provider, ok := sent["provider"].(map[string]any)
 	if !ok || provider["data_collection"] != "deny" {
@@ -265,12 +268,13 @@ func TestErrorClassification(t *testing.T) {
 	}{
 		{"run invalid", 400, `{"error":"runId not found"}`, ErrRunInvalid},
 		{"run not running", 400, `{"error":"runId not running"}`, ErrRunInvalid},
-		{"session superseded", 400, `{"error":"session_superseded"}`, ErrSessionInvalid},
+		{"session superseded", 400, `{"error":"session_superseded"}`, ErrSessionSuperseded},
 		{"session expired", 400, `{"error":"session_expired"}`, ErrSessionInvalid},
 		{"update required", 400, `{"error":"freebuff_update_required"}`, ErrSessionInvalid},
 		{"auth", 401, `{"error":"unauthorized"}`, ErrAuthRejected},
 		{"waiting room 503", 503, `{"error":"waiting_room_queued"}`, ErrWaitingRoom},
-		{"waiting room body", 429, `{"error":"waiting_room_required"}`, ErrSessionInvalid},
+		{"waiting room required (428)", 428, `{"error":"waiting_room_required"}`, ErrWaitingRoomRequired},
+		{"waiting room required body (any status)", 429, `{"error":"waiting_room_required"}`, ErrWaitingRoomRequired},
 		{"generic", 500, `{"error":"boom"}`, &UpstreamError{Status: 500}},
 		{"402 out of credits", 402, `{"error":"out of credits"}`, ErrCredits},
 	}
@@ -375,9 +379,143 @@ func TestSessionControlCalls(t *testing.T) {
 	}
 
 	// end + tolerated 404
-	if err := client.EndSession(context.Background(), "inst-abc-123"); err != nil {
+	if err := client.EndSession(context.Background()); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// TestProbeAccount verifies the zero-cost token probe: a GET
+// /api/v1/freebuff/session with NO instance header that claims no session
+// slot, returns the live per-model quota, and classifies
+// auth/ban/region/transport failures through the standard matrix.
+func TestProbeAccount(t *testing.T) {
+	t.Run("200 with quota", func(t *testing.T) {
+		mock := testutil.NewMock()
+		defer mock.Close()
+
+		client, err := New("tok", testConfig(mock.URL(), nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		st, err := client.ProbeAccount(context.Background())
+		if err != nil {
+			t.Fatalf("ProbeAccount: %v", err)
+		}
+		if st.Status != "active" || st.InstanceID != "inst-abc-123" {
+			t.Fatalf("probe state = %+v", st)
+		}
+		q, ok := st.RateLimitsByModel["deepseek/deepseek-v4-flash"]
+		if !ok {
+			t.Fatalf("RateLimitsByModel missing flash quota: %+v", st.RateLimitsByModel)
+		}
+		if q.Limit != 6 || q.RecentCount != 2 {
+			t.Errorf("quota limit/recentCount = %v/%v, want 6/2", q.Limit, q.RecentCount)
+		}
+		if q.Period != "pacific_day" {
+			t.Errorf("period = %q, want pacific_day", q.Period)
+		}
+		if q.ResetAt.IsZero() {
+			t.Error("resetAt not parsed")
+		}
+		// A probe must not claim a session slot (no POST).
+		if got := mock.SessionCreatesSnapshot(); got != 0 {
+			t.Errorf("session creates = %d, want 0 (probe is zero-cost)", got)
+		}
+		if got := mock.SessionProbesSnapshot(); got != 1 {
+			t.Errorf("session probes = %d, want 1", got)
+		}
+	})
+
+	t.Run("404 maps to ErrNoActiveSession", func(t *testing.T) {
+		mock := testutil.NewMock()
+		defer mock.Close()
+		mock.SessionHandler = func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(404)
+			_, _ = io.WriteString(w, `{"error":"session not found"}`)
+		}
+
+		client, _ := New("tok", testConfig(mock.URL(), nil))
+		_, err := client.ProbeAccount(context.Background())
+		if !errors.Is(err, ErrNoActiveSession) {
+			t.Fatalf("err = %v, want ErrNoActiveSession", err)
+		}
+	})
+
+	t.Run("200 ended maps to ErrNoActiveSession", func(t *testing.T) {
+		mock := testutil.NewMock()
+		defer mock.Close()
+		mock.SessionHandler = func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(200)
+			_, _ = io.WriteString(w, `{"status":"ended"}`)
+		}
+
+		client, _ := New("tok", testConfig(mock.URL(), nil))
+		_, err := client.ProbeAccount(context.Background())
+		if !errors.Is(err, ErrNoActiveSession) {
+			t.Fatalf("err = %v, want ErrNoActiveSession", err)
+		}
+	})
+
+	t.Run("401 auth rejected", func(t *testing.T) {
+		mock := testutil.NewMock()
+		defer mock.Close()
+		mock.AuthReject = true
+
+		client, _ := New("tok", testConfig(mock.URL(), nil))
+		_, err := client.ProbeAccount(context.Background())
+		if !errors.Is(err, ErrAuthRejected) {
+			t.Fatalf("err = %v, want ErrAuthRejected", err)
+		}
+	})
+
+	t.Run("403 banned", func(t *testing.T) {
+		mock := testutil.NewMock()
+		defer mock.Close()
+		mock.Ban = true
+
+		client, _ := New("tok", testConfig(mock.URL(), nil))
+		_, err := client.ProbeAccount(context.Background())
+		if !errors.Is(err, ErrBanned) {
+			t.Fatalf("err = %v, want ErrBanned", err)
+		}
+	})
+
+	t.Run("403 country blocked", func(t *testing.T) {
+		mock := testutil.NewMock()
+		defer mock.Close()
+		mock.SessionHandler = func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(403)
+			_, _ = io.WriteString(w, `{"status":"country_blocked","countryCode":"CN","countryBlockReason":"region_restricted","ipPrivacySignals":["vpn"]}`)
+		}
+
+		client, _ := New("tok", testConfig(mock.URL(), nil))
+		_, err := client.ProbeAccount(context.Background())
+		if !errors.Is(err, ErrCountryBlocked) {
+			t.Fatalf("err = %v, want ErrCountryBlocked", err)
+		}
+		var cbe *CountryBlockedError
+		if !errors.As(err, &cbe) {
+			t.Fatalf("err = %T, want *CountryBlockedError", err)
+		}
+		if cbe.CountryCode != "CN" {
+			t.Errorf("countryCode = %q, want CN", cbe.CountryCode)
+		}
+	})
+
+	t.Run("transport error", func(t *testing.T) {
+		mock := testutil.NewMock()
+		url := mock.URL()
+		mock.Close()
+
+		client, _ := New("tok", testConfig(url, nil))
+		_, err := client.ProbeAccount(context.Background())
+		if err == nil {
+			t.Fatal("ProbeAccount returned nil error for closed server")
+		}
+	})
 }
 
 // TestSessionCallParsesRateLimitsByModel verifies the live per-model quota
@@ -542,15 +680,49 @@ func TestStartAndFinishRun(t *testing.T) {
 		t.Errorf("START not recorded: %v", mock.StartedRuns)
 	}
 
-	if err := client.FinishRun(context.Background(), runID, 4); err != nil {
+	msg1 := "msg-1"
+	steps := []RunStep{
+		{ID: "step-1", StepNumber: 1, MessageID: &msg1, Status: "completed", StartTime: "2026-08-18T00:00:00.000Z"},
+		{ID: "step-2", StepNumber: 2, Status: "completed", StartTime: "2026-08-18T00:00:01.000Z"},
+	}
+	if err := client.FinishRun(context.Background(), runID, "completed", len(steps), steps, ""); err != nil {
 		t.Fatal(err)
 	}
 	if len(mock.FinishedRuns) != 1 {
 		t.Fatalf("FINISH not recorded: %v", mock.FinishedRuns)
 	}
 	f := mock.FinishedRuns[0]
-	if f.RunID != runID || f.Status != "completed" || f.TotalSteps != 4 {
+	if f.RunID != runID || f.Status != "completed" || f.TotalSteps != 2 {
 		t.Errorf("FINISH payload = %+v", f)
+	}
+	// Issue #114: steps ride IN the FINISH payload (the CLI has no /steps
+	// endpoint) with the CLI step shape: id, stepNumber, messageId
+	// (null-able), status, startTime.
+	if len(f.Steps) != 2 || f.Steps[0].StepNumber != 1 || f.Steps[0].MessageID == nil || *f.Steps[0].MessageID != "msg-1" ||
+		f.Steps[1].StepNumber != 2 || f.Steps[1].MessageID != nil || f.Steps[1].StartTime == "" {
+		t.Errorf("FINISH steps = %+v, want 2 CLI-shaped steps", f.Steps)
+	}
+}
+
+func TestFinishRunErrorTruncation(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+
+	client, _ := New("tok", testConfig(mock.URL(), nil))
+
+	// errorMessage must be truncated to 5000 runes (CLI parity:
+	// truncateString(errorMessage, 5000) in database.ts) — a full Go stack
+	// trace must not blow the cap.
+	long := strings.Repeat("エ", 6000)
+	if err := client.FinishRun(context.Background(), "run-0001", "failed", 0, nil, long); err != nil {
+		t.Fatal(err)
+	}
+	finished := mock.FinishedRunsSnapshot()
+	if len(finished) != 1 || finished[0].RunID != "run-0001" || finished[0].Status != "failed" {
+		t.Fatalf("finished runs = %+v, want run-0001 failed", finished)
+	}
+	if got := len([]rune(finished[0].ErrorMessage)); got != 5000 {
+		t.Errorf("errorMessage runes = %d, want 5000 (truncated)", got)
 	}
 }
 
@@ -570,266 +742,50 @@ func TestControlCallTimeout(t *testing.T) {
 	}
 }
 
-func TestProxyWiring(t *testing.T) {
-	cfg := testConfig("", func(c *config.Config) { c.HTTPProxy = "http://127.0.0.1:9999" })
-	client, err := New("tok", cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if client.http.Transport.(*http.Transport).Proxy == nil {
-		t.Error("HTTP proxy not wired")
-	}
-
-	socksCfg := testConfig("", func(c *config.Config) { c.SOCKS5Proxy = "socks5://127.0.0.1:1080" })
-	socksClient, err := New("tok", socksCfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if socksClient.http.Transport.(*http.Transport).DialContext == nil {
-		t.Error("SOCKS5 dialer not wired")
-	}
-}
-
-// TestSOCKS5RotationDisablesKeepAlives verifies round-robin/random rotation
-// is not defeated by pooled idle connections: with multiple SOCKS5 proxies
-// the transport must redial per request (DisableKeepAlives) so the
-// per-request proxy choice is actually dialed, while the single-proxy path
-// keeps pooled connections.
-func TestSOCKS5RotationDisablesKeepAlives(t *testing.T) {
-	multi, err := New("tok", testConfig("", func(c *config.Config) {
-		c.SOCKS5Proxies = []string{"socks5://127.0.0.1:1001", "socks5://127.0.0.1:1002"}
-		c.ProxyRotation = "round-robin"
-	}))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !multi.http.Transport.(*http.Transport).DisableKeepAlives {
-		t.Error("multi-proxy rotation must disable keep-alives so every request dials through its assigned proxy")
-	}
-
-	single, err := New("tok", testConfig("", func(c *config.Config) { c.SOCKS5Proxy = "socks5://127.0.0.1:1080" }))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if single.http.Transport.(*http.Transport).DisableKeepAlives {
-		t.Error("single SOCKS5 proxy must keep pooled keep-alive connections")
-	}
-}
-
-// TestSOCKS5IgnoresEnvProxy verifies the SOCKS5 branches drop the
-// ProxyFromEnvironment inherited from http.DefaultTransport.Clone: an
-// operator HTTP_PROXY/HTTPS_PROXY env var must never double-route SOCKS5
-// traffic through a second proxy.
-func TestSOCKS5IgnoresEnvProxy(t *testing.T) {
-	t.Setenv("HTTP_PROXY", "http://127.0.0.1:9998")
-	t.Setenv("HTTPS_PROXY", "http://127.0.0.1:9998")
-
-	multi, err := New("tok", testConfig("", func(c *config.Config) {
-		c.SOCKS5Proxies = []string{"socks5://127.0.0.1:1001", "socks5://127.0.0.1:1002"}
-	}))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if tr := multi.http.Transport.(*http.Transport); tr.Proxy != nil {
-		t.Error("SOCKS5_PROXIES transport still routes via ProxyFromEnvironment")
-	}
-
-	single, err := New("tok", testConfig("", func(c *config.Config) { c.SOCKS5Proxy = "socks5://127.0.0.1:1080" }))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if tr := single.http.Transport.(*http.Transport); tr.Proxy != nil {
-		t.Error("SOCKS5_PROXY transport still routes via ProxyFromEnvironment")
-	}
-}
-
-// TestHTTPProxyStealthUsesConnectTunnel verifies HTTP_PROXY + TLS_FINGERPRINT
-// routes the stealth dialer through an explicit CONNECT tunnel instead of
-// transport.Proxy: Go calls DialTLSContext with the proxy's address for
-// proxied HTTPS (not the origin), so transport.Proxy would hand the stealth
-// ClientHello to the plain CONNECT proxy and break the tunnel.
-func TestHTTPProxyStealthUsesConnectTunnel(t *testing.T) {
-	stealthClient, err := New("tok", testConfig("", func(c *config.Config) {
-		c.HTTPProxy = "http://127.0.0.1:9999"
-		c.TLSFingerprint = "chrome126"
-	}))
-	if err != nil {
-		t.Fatal(err)
-	}
-	tr := stealthClient.http.Transport.(*http.Transport)
-	if tr.Proxy != nil {
-		t.Error("HTTP_PROXY + TLS_FINGERPRINT must not route via transport.Proxy (Go would TLS to the proxy, not the origin)")
-	}
-	if tr.DialTLSContext == nil {
-		t.Error("HTTP_PROXY + TLS_FINGERPRINT must wire the stealth DialTLSContext over the CONNECT tunnel")
-	}
-
-	plainClient, err := New("tok", testConfig("", func(c *config.Config) { c.HTTPProxy = "http://127.0.0.1:9999" }))
-	if err != nil {
-		t.Fatal(err)
-	}
-	plainTr := plainClient.http.Transport.(*http.Transport)
-	if plainTr.Proxy == nil {
-		t.Error("HTTP_PROXY without TLS_FINGERPRINT should keep transport.Proxy routing")
-	}
-	if plainTr.DialTLSContext != nil {
-		t.Error("HTTP_PROXY without TLS_FINGERPRINT must not wire DialTLSContext")
-	}
-}
-
-// TestHTTPConnectDial exercises the CONNECT tunnel against a real proxy
-// listener: the CONNECT request line carries the target, Proxy-Authorization
-// is sent when the proxy URL has credentials, bytes flow both ways through
-// the tunnel, and a non-200 CONNECT response is rejected.
-func TestHTTPConnectDial(t *testing.T) {
-	t.Run("tunnel", func(t *testing.T) {
-		ln, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer func() { _ = ln.Close() }()
-
-		type proxyObs struct {
-			reqLine string
-			echo    string
-		}
-		obs := make(chan proxyObs, 1)
-		go func() {
-			conn, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			defer func() { _ = conn.Close() }()
-			br := bufio.NewReader(conn)
-			reqLine, err := br.ReadString('\n')
-			if err != nil {
-				return
-			}
-			for {
-				line, err := br.ReadString('\n')
-				if err != nil || line == "\r\n" {
-					break
-				}
-			}
-			_, _ = io.WriteString(conn, "HTTP/1.1 200 Connection established\r\n\r\n")
-			buf := make([]byte, 4)
-			if _, err := io.ReadFull(br, buf); err != nil {
-				return
-			}
-			_, _ = io.WriteString(conn, "pong")
-			obs <- proxyObs{reqLine: reqLine, echo: string(buf)}
-		}()
-
-		dial := httpConnectDial(&url.URL{Scheme: "http", Host: ln.Addr().String()})
-		conn, err := dial(context.Background(), "tcp", "origin.example:443")
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer func() { _ = conn.Close() }()
-		if _, err := conn.Write([]byte("ping")); err != nil {
-			t.Fatal(err)
-		}
-		reply := make([]byte, 4)
-		if _, err := io.ReadFull(conn, reply); err != nil {
-			t.Fatal(err)
-		}
-		if string(reply) != "pong" {
-			t.Errorf("tunnel reply = %q, want pong", reply)
-		}
-		got := <-obs
-		if !strings.Contains(got.reqLine, "CONNECT origin.example:443 HTTP/1.1") {
-			t.Errorf("CONNECT request line = %q, want target origin.example:443", got.reqLine)
-		}
-		if got.echo != "ping" {
-			t.Errorf("tunnel carried %q, want ping", got.echo)
-		}
-	})
-
-	t.Run("proxy auth", func(t *testing.T) {
-		ln, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer func() { _ = ln.Close() }()
-
-		authCh := make(chan string, 1)
-		go func() {
-			conn, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			defer func() { _ = conn.Close() }()
-			br := bufio.NewReader(conn)
-			var auth string
-			for {
-				line, err := br.ReadString('\n')
-				if err != nil {
-					return
-				}
-				if strings.HasPrefix(strings.ToLower(line), "proxy-authorization:") {
-					auth = strings.TrimSpace(line[strings.IndexByte(line, ':')+1:])
-				}
-				if line == "\r\n" {
-					break
-				}
-			}
-			_, _ = io.WriteString(conn, "HTTP/1.1 200 Connection established\r\n\r\n")
-			authCh <- auth
-			_, _ = io.Copy(io.Discard, br)
-		}()
-
-		dial := httpConnectDial(&url.URL{Scheme: "http", User: url.UserPassword("alice", "s3cret"), Host: ln.Addr().String()})
-		conn, err := dial(context.Background(), "tcp", "origin.example:443")
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer func() { _ = conn.Close() }()
-		want := "Basic " + base64.StdEncoding.EncodeToString([]byte("alice:s3cret"))
-		if got := <-authCh; !strings.EqualFold(got, want) {
-			t.Errorf("Proxy-Authorization = %q, want %q", got, want)
-		}
-	})
-
-	t.Run("non-200 rejected", func(t *testing.T) {
-		ln, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer func() { _ = ln.Close() }()
-		go func() {
-			conn, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			defer func() { _ = conn.Close() }()
-			br := bufio.NewReader(conn)
-			for {
-				line, err := br.ReadString('\n')
-				if err != nil || line == "\r\n" {
-					break
-				}
-			}
-			_, _ = io.WriteString(conn, "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
-		}()
-
-		dial := httpConnectDial(&url.URL{Scheme: "http", Host: ln.Addr().String()})
-		conn, err := dial(context.Background(), "tcp", "origin.example:443")
-		if err == nil {
-			_ = conn.Close()
-			t.Fatal("CONNECT through a 403 proxy succeeded, want error")
-		}
-		if !strings.Contains(err.Error(), "403") {
-			t.Errorf("error = %q, want proxy 403 status", err)
-		}
-	})
-}
-
 // TestCrossHostRedirectStripsToken verifies a cross-host redirect does not
 // carry x-codebuff-api-key (or Authorization): Go strips the latter itself
 // but not the former, so the raw token used to leak to any redirect target.
 // Same-host redirects keep their credentials (CDN / bare-host -> www).
 func TestCrossHostRedirectStripsToken(t *testing.T) {
 	const token = "tok-secret-redirect"
+
+	t.Run("scheme downgrade strips token", func(t *testing.T) {
+		// https -> http to the SAME host (plaintext) must drop both
+		// credential headers; the token must never cross onto a cleartext
+		// hop, even when the hostname is unchanged.
+		check := func(t *testing.T, from, to string, wantStripped bool) {
+			t.Helper()
+			client, err := New(token, testConfig("http://127.0.0.1:1", nil))
+			if err != nil {
+				t.Fatal(err)
+			}
+			via := []*http.Request{{
+				URL:    mustParseURL(t, from),
+				Header: http.Header{},
+			}}
+			via[0].Header.Set("x-codebuff-api-key", token)
+			via[0].Header.Set("Authorization", "Bearer "+token)
+			req := &http.Request{URL: mustParseURL(t, to), Header: via[0].Header.Clone()}
+			if err := client.http.CheckRedirect(req, via); err != nil {
+				t.Fatalf("CheckRedirect: %v", err)
+			}
+			gotKey := req.Header.Get("x-codebuff-api-key")
+			gotAuth := req.Header.Get("Authorization")
+			if wantStripped {
+				if gotKey != "" || gotAuth != "" {
+					t.Errorf("redirect %s -> %s kept credentials (key %q auth %q), want stripped", from, to, gotKey, gotAuth)
+				}
+			} else {
+				if gotKey != token || gotAuth != "Bearer "+token {
+					t.Errorf("redirect %s -> %s stripped credentials (key %q auth %q), want kept", from, to, gotKey, gotAuth)
+				}
+			}
+		}
+		check(t, "https://www.codebuff.com", "http://www.codebuff.com", true)
+		check(t, "https://www.codebuff.com", "http://www.codebuff.com:8080", true)
+		check(t, "https://www.codebuff.com", "https://www.codebuff.com", false)
+		check(t, "http://www.codebuff.com", "https://www.codebuff.com", false)
+	})
 
 	keySeen := make(chan string, 1)
 	authSeen := make(chan string, 1)
@@ -889,9 +845,18 @@ func TestCrossHostRedirectStripsToken(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = sameResp.Body.Close()
-	if got := <-sameKey; got != token {
-		t.Errorf("same-host redirect carried x-codebuff-api-key %q, want %q kept", got, token)
+	if got := <-sameKey; got != "" {
+		t.Errorf("same-host request carried x-codebuff-api-key %q, want absent (client no longer sends it, issue #107)", got)
 	}
+}
+
+func mustParseURL(t *testing.T, raw string) *url.URL {
+	t.Helper()
+	u, err := url.Parse(raw)
+	if err != nil {
+		t.Fatalf("url.Parse(%q): %v", raw, err)
+	}
+	return u
 }
 
 func TestClientIDFormat(t *testing.T) {
@@ -1305,8 +1270,10 @@ func TestClassifyDeploymentOutsideHoursRetryable(t *testing.T) {
 
 // TestStealthProfileResolvedOncePerRequest verifies that for TLS_FINGERPRINT
 // auto/random the concrete profile is resolved ONCE per request: newRequest
-// stashes it (and applies its headers), and the dialer reads the same stash
-// for the ClientHello — so headers and TLS fingerprint never mismatch.
+// stashes it, and the dialer reads the same stash for the ClientHello — so
+// the TLS fingerprint always matches the resolved profile. The request
+// carries the CLI UA and NO browser headers (#109): header application is
+// inverted — only the utls ClientHello impersonates the browser.
 func TestStealthProfileResolvedOncePerRequest(t *testing.T) {
 	client, err := New("tok-a", testConfig("", func(c *config.Config) { c.TLSFingerprint = "auto" }))
 	if err != nil {
@@ -1323,9 +1290,15 @@ func TestStealthProfileResolvedOncePerRequest(t *testing.T) {
 	if stashed.ID == stealth.ProfileIDAuto || stashed.ID == stealth.ProfileIDRandom {
 		t.Fatalf("stashed profile %s is not concrete (auto must resolve once)", stashed.ID)
 	}
-	// The browser headers were applied from the SAME concrete profile.
-	if got := req.Header.Get("User-Agent"); got != stashed.UserAgent {
-		t.Errorf("request User-Agent %q != stashed profile User-Agent %q", got, stashed.UserAgent)
+	// The request carries the pinned CLI UA, not the profile's browser UA.
+	if got := req.Header.Get("User-Agent"); got != cliUserAgent {
+		t.Errorf("request User-Agent %q != the CLI UA %q (no browser persona on API calls, #109)", got, cliUserAgent)
+	}
+	for _, hdr := range []string{"Sec-Fetch-Site", "Sec-Fetch-Mode", "Sec-Fetch-Dest",
+		"Sec-CH-UA", "Sec-CH-UA-Mobile", "Sec-CH-UA-Platform"} {
+		if got := req.Header.Get(hdr); got != "" {
+			t.Errorf("%s = %q on an upstream API request, want absent (#109)", hdr, got)
+		}
 	}
 	// The dialer must use the stashed profile for this request's dial.
 	if dial := client.dialProfileFor(req.Context()); dial != stashed {
@@ -1416,92 +1389,6 @@ func TestPacificMidnightFallback(t *testing.T) {
 	}
 }
 
-func TestProxyRotationRoundRobin(t *testing.T) {
-	client, err := New("tok-a", testConfig("", func(c *config.Config) {
-		c.SOCKS5Proxies = []string{"socks5://127.0.0.1:1001", "socks5://127.0.0.1:1002"}
-		c.ProxyRotation = "round-robin"
-	}))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(client.socksProxies) != 2 || len(client.socksDialers) != 2 {
-		t.Fatalf("proxies = %v, dialers = %d, want 2 each", client.socksProxies, len(client.socksDialers))
-	}
-
-	got := make([]int, 0, 5)
-	for i := 0; i < 5; i++ {
-		req, err := client.newRequest(context.Background(), http.MethodGet, "/api/v1/freebuff/session", nil)
-		if err != nil {
-			t.Fatal(err)
-		}
-		idx, ok := req.Context().Value(proxyIndexKey{}).(int)
-		if !ok {
-			t.Fatal("proxy index not stashed in request context")
-		}
-		got = append(got, idx)
-	}
-	want := []int{0, 1, 0, 1, 0}
-	if len(got) != len(want) {
-		t.Fatalf("rotation sequence = %v, want %v", got, want)
-	}
-	for i := range want {
-		if got[i] != want[i] {
-			t.Errorf("rotation sequence = %v, want %v (consecutive requests must alternate)", got, want)
-			break
-		}
-	}
-}
-
-func TestProxyRotationRandom(t *testing.T) {
-	client, err := New("tok-a", testConfig("", func(c *config.Config) {
-		c.SOCKS5Proxies = []string{"socks5://127.0.0.1:1001", "socks5://127.0.0.1:1002"}
-		c.ProxyRotation = "random"
-	}))
-	if err != nil {
-		t.Fatal(err)
-	}
-	seen := map[int]int{}
-	for i := 0; i < 40; i++ {
-		req, err := client.newRequest(context.Background(), http.MethodGet, "/", nil)
-		if err != nil {
-			t.Fatal(err)
-		}
-		idx, ok := req.Context().Value(proxyIndexKey{}).(int)
-		if !ok {
-			t.Fatal("proxy index not stashed in request context")
-		}
-		seen[idx]++
-	}
-	if len(seen) != 2 {
-		t.Errorf("random rotation used %d proxies across 40 requests, want both", len(seen))
-	}
-}
-
-func TestProxyIndexFor(t *testing.T) {
-	cfg := testConfig("", func(c *config.Config) {
-		c.SOCKS5Proxies = []string{"socks5://127.0.0.1:1001", "socks5://127.0.0.1:1002", "socks5://127.0.0.1:1003"}
-	})
-	// No stash → per-token binding (token tokenIndex → proxy tokenIndex % n).
-	c0, err := New("tok", cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := c0.proxyIndexFor(context.Background()); got != 0 {
-		t.Errorf("per-token (index 0) = %d, want 0", got)
-	}
-	c2, err := NewWithIndex("tok", 2, cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := c2.proxyIndexFor(context.Background()); got != 2 {
-		t.Errorf("per-token (index 2) = %d, want 2", got)
-	}
-	// A stashed index wins — the dialer honors the per-request choice.
-	ctx := context.WithValue(context.Background(), proxyIndexKey{}, 1)
-	if got := c0.proxyIndexFor(ctx); got != 1 {
-		t.Errorf("proxyIndexFor(stash=1) = %d, want 1", got)
-	}
-}
 func TestCreateSessionForModelHeaders(t *testing.T) {
 	mock := testutil.NewMock()
 	defer mock.Close()
@@ -1548,15 +1435,21 @@ func TestGetSessionWithOptsHeaders(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	st, err := client.GetSessionWithOpts(context.Background(), "inst-1", true, true)
+	st, err := client.GetSessionWithOpts(context.Background(), "inst-1", true)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if st.Status != "active" {
 		t.Errorf("status = %q, want active", st.Status)
 	}
-	if gotCompact != "1" || gotHeartbeat != "1" || gotInstance != "inst-1" {
-		t.Errorf("headers: compact=%q, heartbeat=%q, instance=%q", gotCompact, gotHeartbeat, gotInstance)
+	if gotCompact != "1" || gotInstance != "inst-1" {
+		t.Errorf("headers: compact=%q, instance=%q (want 1 / inst-1)", gotCompact, gotInstance)
+	}
+	// Gap #2: the CLI never beats — x-freebuff-heartbeat is Desktop-only
+	// (reference/freebuff freebuff-models.ts:1212-1215), so a compact poll
+	// must NOT carry it.
+	if gotHeartbeat != "" {
+		t.Errorf("x-freebuff-heartbeat = %q, want absent on compact polls", gotHeartbeat)
 	}
 }
 
@@ -1641,8 +1534,11 @@ type flakyRT struct {
 
 func (f *flakyRT) RoundTrip(req *http.Request) (*http.Response, error) {
 	f.calls.Add(1)
-	b, _ := io.ReadAll(req.Body)
-	_ = req.Body.Close()
+	var b []byte
+	if req.Body != nil {
+		b, _ = io.ReadAll(req.Body)
+		_ = req.Body.Close()
+	}
 	f.seen = append(f.seen, b)
 	f.seenHeaders = append(f.seenHeaders, req.Header.Clone())
 	if int(f.calls.Load()) <= f.failN {
@@ -1674,8 +1570,9 @@ func newRetryClient(t *testing.T, baseURL string, retries int, fingerprint strin
 	return client, rt
 }
 
-// TestDumpRedactsTokenHeaders verifies the debug dump redacts both the
-// Authorization header and x-codebuff-api-key (which carries the same token).
+// TestDumpRedactsTokenHeaders verifies the debug dump redacts the
+// Authorization header (the only credential on the wire since #107 dropped
+// x-codebuff-api-key; the redaction list still covers it defensively).
 // Regression: dump() only redacted Authorization, so DEBUG_DUMP=true leaked
 // the plaintext token into dump/ files via x-codebuff-api-key.
 func TestDumpRedactsTokenHeaders(t *testing.T) {
@@ -1715,8 +1612,11 @@ func TestDumpRedactsTokenHeaders(t *testing.T) {
 	if !strings.Contains(dump, "Authorization: [redacted]") {
 		t.Errorf("dump file missing redacted Authorization header:\n%s", dump)
 	}
-	if !strings.Contains(dump, "X-Codebuff-Api-Key: [redacted]") {
-		t.Errorf("dump file missing redacted X-Codebuff-Api-Key header:\n%s", dump)
+	// #107: x-codebuff-api-key is no longer sent, so it must not appear in
+	// the dump at all (the defensive redaction list stays for any future
+	// setter).
+	if strings.Contains(strings.ToLower(dump), "x-codebuff-api-key") {
+		t.Errorf("dump file contains an x-codebuff-api-key header line (never sent now):\n%s", dump)
 	}
 }
 
@@ -1904,16 +1804,24 @@ func TestRetryRotatesPinnedFingerprint(t *testing.T) {
 	if id != stealth.ProfileIDSafari18 {
 		t.Errorf("stealthProfile = %s, want safari18 (chrome126 rotated to a distinct JA3)", id)
 	}
-	// The retried request carried the rotated profile's browser headers:
-	// the first attempt used chrome126, the retry re-applied safari18.
+	// Headers stay CLI-shaped across the retry (#109): the fingerprint
+	// rotates at the TLS layer only; no browser persona ever touches the API
+	// request, so there are no Sec-CH-UA/Sec-Fetch-* headers to carry over.
 	if rt.calls.Load() != 2 {
 		t.Fatalf("upstream attempts = %d, want 2", rt.calls.Load())
 	}
-	if got := rt.seenHeaders[0].Get("User-Agent"); got != stealth.ProfileChrome126.UserAgent {
-		t.Errorf("attempt 1 User-Agent = %q, want chrome126", got)
+	for i, wantAttempt := range []string{"attempt 1", "attempt 2 (rotated)"} {
+		if got := rt.seenHeaders[i].Get("User-Agent"); got != cliUserAgent {
+			t.Errorf("%s User-Agent = %q, want the CLI UA %q", wantAttempt, got, cliUserAgent)
+		}
 	}
-	if got := rt.seenHeaders[1].Get("User-Agent"); got != stealth.ProfileSafari18.UserAgent {
-		t.Errorf("attempt 2 User-Agent = %q, want safari18 (rotated)", got)
+	for _, hdr := range []string{"Sec-CH-UA", "Sec-CH-UA-Mobile", "Sec-CH-UA-Platform",
+		"Sec-Fetch-Site", "Sec-Fetch-Mode", "Sec-Fetch-Dest"} {
+		for i := 0; i < 2; i++ {
+			if got := rt.seenHeaders[i].Get(hdr); got != "" {
+				t.Errorf("attempt %d %s = %q, want absent (no browser headers on API calls, #109)", i+1, hdr, got)
+			}
+		}
 	}
 }
 
@@ -2251,6 +2159,49 @@ func TestClassifyErrorMatrix(t *testing.T) {
 		}
 	})
 
+	t.Run("session_model_mismatch limited on egress IP", func(t *testing.T) {
+		cases := []struct {
+			name      string
+			body      string
+			hdr       http.Header
+			wantRetry time.Duration
+		}{
+			{
+				name: "limited marker",
+				body: `{"status":"session_model_mismatch","message":"model kimi/kimi-k2-0725 is limited on this IP"}`,
+			},
+			{
+				name:      "retry-after header honored",
+				body:      `{"status":"session_model_mismatch","message":"model kimi/kimi-k2-0725 is limited on this IP"}`,
+				hdr:       http.Header{"Retry-After": {"120"}},
+				wantRetry: 120 * time.Second,
+			},
+			{
+				name: "production limited free access message",
+				body: `{"error":"session_model_mismatch","message":"Limited free access is only available with DeepSeek V4 Flash or MiMo 2.5."}`,
+			},
+			{
+				name: "status variant with limited free access",
+				body: `{"status":"session_model_mismatch","message":"Limited free access is only available with DeepSeek V4 Flash."}`,
+			},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				err := classifyError(409, tc.body, tc.hdr)
+				var lie *LimitedIpError
+				if !errors.As(err, &lie) {
+					t.Fatalf("err = %v, want *LimitedIpError", err)
+				}
+				if !errors.Is(err, ErrModelIPLimited) {
+					t.Errorf("errors.Is(ErrModelIPLimited) = false, got %v", err)
+				}
+				if tc.wantRetry > 0 && lie.RetryAfter != tc.wantRetry {
+					t.Errorf("RetryAfter = %s, want %s", lie.RetryAfter, tc.wantRetry)
+				}
+			})
+		}
+	})
+
 	t.Run("500 with rate_limited body", func(t *testing.T) {
 		// Pin current behavior: the rate_limited body marker wins even on a
 		// 500, producing a RateLimitError.
@@ -2306,7 +2257,7 @@ func TestEnsureCliSystemMarkerBranches(t *testing.T) {
 		}
 	})
 
-	t.Run("marker already present is untouched", func(t *testing.T) {
+	t.Run("marker already present in string is untouched", func(t *testing.T) {
 		content := cliSystemMarker + "\n\nextra instructions"
 		p := map[string]any{"messages": []any{
 			map[string]any{"role": "system", "content": content},
@@ -2322,9 +2273,103 @@ func TestEnsureCliSystemMarkerBranches(t *testing.T) {
 		}
 	})
 
-	t.Run("non-string system content replaced", func(t *testing.T) {
+	t.Run("marker already present in structured parts is untouched", func(t *testing.T) {
+		parts := []any{
+			map[string]any{"type": "text", "text": cliSystemMarker + " customized"},
+		}
 		p := map[string]any{"messages": []any{
-			map[string]any{"role": "system", "content": []any{"structured"}},
+			map[string]any{"role": "system", "content": parts},
+			map[string]any{"role": "user", "content": "hi"},
+		}}
+		ensureCliSystemMarker(p)
+		msgs := p["messages"].([]any)
+		if len(msgs) != 2 {
+			t.Fatalf("messages = %v, want unchanged length", msgs)
+		}
+		gotParts, ok := msgs[0].(map[string]any)["content"].([]any)
+		if !ok || len(gotParts) != 1 {
+			t.Fatalf("structured parts modified: %v", gotParts)
+		}
+		if gotParts[0].(map[string]any)["text"] != cliSystemMarker+" customized" {
+			t.Errorf("structured text modified: %v", gotParts[0])
+		}
+	})
+
+	t.Run("phrase mid-string in string prepends marker", func(t *testing.T) {
+		// #110: the server gate is a TRIMMED PREFIX test at position 0 — a
+		// system message that merely mentions the phrase mid-string must NOT
+		// suppress the canonical prefix.
+		content := "Please act as " + cliSystemMarkerPhrase + " and be concise."
+		p := map[string]any{"messages": []any{
+			map[string]any{"role": "system", "content": content},
+			map[string]any{"role": "user", "content": "hi"},
+		}}
+		ensureCliSystemMarker(p)
+		msgs := p["messages"].([]any)
+		if len(msgs) != 2 {
+			t.Fatalf("messages = %v, want length 2", msgs)
+		}
+		got := msgs[0].(map[string]any)["content"].(string)
+		if !strings.HasPrefix(got, cliSystemMarker+"\n\n") || !strings.Contains(got, content) {
+			t.Errorf("system content = %q, want marker prepended to the mid-string mention", got)
+		}
+	})
+
+	t.Run("phrase mid-string in structured part prepends marker", func(t *testing.T) {
+		parts := []any{
+			map[string]any{"type": "text", "text": "Remember: " + cliSystemMarkerPhrase + "."},
+		}
+		p := map[string]any{"messages": []any{
+			map[string]any{"role": "system", "content": parts},
+		}}
+		ensureCliSystemMarker(p)
+		msgs := p["messages"].([]any)
+		gotParts, ok := msgs[0].(map[string]any)["content"].([]any)
+		if !ok || len(gotParts) != 2 {
+			t.Fatalf("system parts = %v, want 2 with marker prepended", msgs[0])
+		}
+		if gotParts[0].(map[string]any)["text"] != cliSystemMarker {
+			t.Errorf("marker part = %v, want the CLI marker first", gotParts[0])
+		}
+	})
+
+	t.Run("structured system content array prepends marker", func(t *testing.T) {
+		originalParts := []any{
+			map[string]any{"type": "text", "text": "custom instructions"},
+			map[string]any{"type": "text", "text": "more instructions"},
+		}
+		p := map[string]any{"messages": []any{
+			map[string]any{"role": "system", "content": originalParts},
+		}}
+		ensureCliSystemMarker(p)
+		msgs := p["messages"].([]any)
+		parts, ok := msgs[0].(map[string]any)["content"].([]any)
+		if !ok || len(parts) != 3 {
+			t.Fatalf("system parts = %v, want 3 parts with marker prepended", msgs[0])
+		}
+		markerPart, ok := parts[0].(map[string]any)
+		if !ok || markerPart["type"] != "text" || markerPart["text"] != cliSystemMarker {
+			t.Errorf("marker part = %v, want text type with CLI marker", parts[0])
+		}
+		if parts[1].(map[string]any)["text"] != "custom instructions" || parts[2].(map[string]any)["text"] != "more instructions" {
+			t.Errorf("original parts lost: %v", parts)
+		}
+	})
+
+	t.Run("non-string non-array system content replaced", func(t *testing.T) {
+		p := map[string]any{"messages": []any{
+			map[string]any{"role": "system", "content": 12345},
+		}}
+		ensureCliSystemMarker(p)
+		msgs := p["messages"].([]any)
+		if got := msgs[0].(map[string]any)["content"]; got != cliSystemMarker {
+			t.Errorf("system content = %v, want the CLI marker", got)
+		}
+	})
+
+	t.Run("empty string system content replaced with marker", func(t *testing.T) {
+		p := map[string]any{"messages": []any{
+			map[string]any{"role": "system", "content": ""},
 		}}
 		ensureCliSystemMarker(p)
 		msgs := p["messages"].([]any)
@@ -2545,8 +2590,8 @@ func TestRedirectMultihop(t *testing.T) {
 		if got := <-bKeySeen; got != "" {
 			t.Errorf("intermediate host B received token %q, want stripped", got)
 		}
-		if got := <-aKeySeen; got != token {
-			t.Errorf("loop-back hop to A carried %q, want %q kept", got, token)
+		if got := <-aKeySeen; got != "" {
+			t.Errorf("loop-back hop to A carried %q, want absent (client no longer sends x-codebuff-api-key, issue #107)", got)
 		}
 	})
 
@@ -2612,303 +2657,6 @@ func TestRedirectMultihop(t *testing.T) {
 			t.Errorf("port-differing hop carried token %q, want stripped", got)
 		}
 	})
-}
-
-// TestNewWithIndexPrecedence guards the proxy precedence combos (G8):
-// SOCKS5_PROXIES > SOCKS5_PROXY > HTTP_PROXY, and the winner disables the
-// env-proxy path.
-func TestNewWithIndexPrecedence(t *testing.T) {
-	t.Run("socks proxies beat single socks proxy", func(t *testing.T) {
-		client, err := NewWithIndex("tok", 0, testConfig("", func(c *config.Config) {
-			c.SOCKS5Proxies = []string{"socks5://127.0.0.1:1001", "socks5://127.0.0.1:1002"}
-			c.SOCKS5Proxy = "socks5://127.0.0.1:9999"
-		}))
-		if err != nil {
-			t.Fatal(err)
-		}
-		if len(client.socksProxies) != 2 || len(client.socksDialers) != 2 {
-			t.Fatalf("socksProxies = %v, want the SOCKS5_PROXIES list", client.socksProxies)
-		}
-		tr := client.http.Transport.(*http.Transport)
-		if tr.Proxy != nil {
-			t.Error("env HTTP proxy not disabled when SOCKS5_PROXIES wins")
-		}
-		if !tr.DisableKeepAlives {
-			t.Error("multi-proxy rotation should disable keep-alives")
-		}
-	})
-
-	t.Run("socks proxies beat http proxy", func(t *testing.T) {
-		client, err := NewWithIndex("tok", 0, testConfig("", func(c *config.Config) {
-			c.SOCKS5Proxies = []string{"socks5://127.0.0.1:1001"}
-			c.HTTPProxy = "http://127.0.0.1:9999"
-		}))
-		if err != nil {
-			t.Fatal(err)
-		}
-		tr := client.http.Transport.(*http.Transport)
-		if tr.Proxy != nil {
-			t.Error("HTTP_PROXY applied even though SOCKS5_PROXIES wins")
-		}
-	})
-
-	t.Run("single socks proxy beats http proxy", func(t *testing.T) {
-		client, err := NewWithIndex("tok", 0, testConfig("", func(c *config.Config) {
-			c.SOCKS5Proxy = "socks5://127.0.0.1:9999"
-			c.HTTPProxy = "http://127.0.0.1:9998"
-		}))
-		if err != nil {
-			t.Fatal(err)
-		}
-		if len(client.socksProxies) != 0 {
-			t.Errorf("socksProxies = %v, want empty for the singular SOCKS5_PROXY", client.socksProxies)
-		}
-		tr := client.http.Transport.(*http.Transport)
-		if tr.Proxy != nil {
-			t.Error("HTTP_PROXY applied even though SOCKS5_PROXY wins")
-		}
-		if tr.DialContext == nil {
-			t.Error("SOCKS5 dialer not wired into DialContext")
-		}
-	})
-}
-
-// socks5TestServer is a minimal RFC 1928 SOCKS5 server (optional RFC 1929
-// username/password auth) used to observe which proxy actually gets dialed
-// and which credentials arrive.
-type socks5TestServer struct {
-	ln          net.Listener
-	requireAuth bool
-	user, pass  string
-
-	mu        sync.Mutex
-	conns     int
-	gotUser   string
-	gotPass   string
-	authFails int
-}
-
-func newSocks5TestServer(t *testing.T, requireAuth bool, user, pass string) *socks5TestServer {
-	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("socks5 listen: %v", err)
-	}
-	s := &socks5TestServer{ln: ln, requireAuth: requireAuth, user: user, pass: pass}
-	go s.serve()
-	t.Cleanup(func() { _ = ln.Close() })
-	return s
-}
-
-func (s *socks5TestServer) Addr() string { return s.ln.Addr().String() }
-
-func (s *socks5TestServer) serve() {
-	for {
-		c, err := s.ln.Accept()
-		if err != nil {
-			return
-		}
-		go s.handle(c)
-	}
-}
-
-func (s *socks5TestServer) handle(c net.Conn) {
-	defer func() { _ = c.Close() }()
-	br := bufio.NewReader(c)
-
-	hdr := make([]byte, 2)
-	if _, err := io.ReadFull(br, hdr); err != nil || hdr[0] != 5 {
-		return
-	}
-	methods := make([]byte, int(hdr[1]))
-	if _, err := io.ReadFull(br, methods); err != nil {
-		return
-	}
-	if s.requireAuth {
-		if _, err := c.Write([]byte{5, 2}); err != nil {
-			return
-		}
-		ahdr := make([]byte, 2)
-		if _, err := io.ReadFull(br, ahdr); err != nil || ahdr[0] != 1 {
-			return
-		}
-		uname := make([]byte, int(ahdr[1]))
-		if _, err := io.ReadFull(br, uname); err != nil {
-			return
-		}
-		phdr := make([]byte, 1)
-		if _, err := io.ReadFull(br, phdr); err != nil {
-			return
-		}
-		pw := make([]byte, int(phdr[0]))
-		if _, err := io.ReadFull(br, pw); err != nil {
-			return
-		}
-		s.mu.Lock()
-		s.gotUser, s.gotPass = string(uname), string(pw)
-		s.mu.Unlock()
-		if string(uname) != s.user || string(pw) != s.pass {
-			s.mu.Lock()
-			s.authFails++
-			s.mu.Unlock()
-			_, _ = c.Write([]byte{1, 1})
-			return
-		}
-		if _, err := c.Write([]byte{1, 0}); err != nil {
-			return
-		}
-	} else if _, err := c.Write([]byte{5, 0}); err != nil {
-		return
-	}
-
-	req := make([]byte, 3)
-	if _, err := io.ReadFull(br, req); err != nil || req[0] != 5 || req[1] != 1 {
-		return
-	}
-	atyp := make([]byte, 1)
-	if _, err := io.ReadFull(br, atyp); err != nil {
-		return
-	}
-	var host string
-	switch atyp[0] {
-	case 1:
-		b := make([]byte, 4)
-		if _, err := io.ReadFull(br, b); err != nil {
-			return
-		}
-		host = net.IP(b).String()
-	case 3:
-		l := make([]byte, 1)
-		if _, err := io.ReadFull(br, l); err != nil {
-			return
-		}
-		b := make([]byte, int(l[0]))
-		if _, err := io.ReadFull(br, b); err != nil {
-			return
-		}
-		host = string(b)
-	case 4:
-		b := make([]byte, 16)
-		if _, err := io.ReadFull(br, b); err != nil {
-			return
-		}
-		host = net.IP(b).String()
-	default:
-		return
-	}
-	port := make([]byte, 2)
-	if _, err := io.ReadFull(br, port); err != nil {
-		return
-	}
-	target := net.JoinHostPort(host, strconv.Itoa(int(binary.BigEndian.Uint16(port))))
-
-	up, err := net.Dial("tcp", target)
-	if err != nil {
-		_, _ = c.Write([]byte{5, 5, 0, 1, 0, 0, 0, 0, 0, 0})
-		return
-	}
-	defer func() { _ = up.Close() }()
-	if _, err := c.Write([]byte{5, 0, 0, 1, 0, 0, 0, 0, 0, 0}); err != nil {
-		return
-	}
-	s.mu.Lock()
-	s.conns++
-	s.mu.Unlock()
-	done := make(chan struct{}, 1)
-	go func() {
-		_, _ = io.Copy(up, br)
-		done <- struct{}{}
-	}()
-	_, _ = io.Copy(c, up)
-	<-done
-}
-
-// TestSocks5UserinfoDialThrough is the regression test for Audit B2 (fix 4):
-// an authenticated socks5://user:pass@ URL must actually authenticate against
-// a proxy that requires it, and the credentials must arrive intact.
-func TestSocks5UserinfoDialThrough(t *testing.T) {
-	mock := testutil.NewMock()
-	defer mock.Close()
-	mock.ChatBody = testutil.SSEEvent(`{"id":"x","object":"chat.completion.chunk","choices":[]}`)
-
-	srv := newSocks5TestServer(t, true, "alice", "s3cret")
-	client, err := New("tok", testConfig(mock.URL(), func(c *config.Config) {
-		c.SOCKS5Proxies = []string{"socks5://alice:s3cret@" + srv.Addr()}
-	}))
-	if err != nil {
-		t.Fatal(err)
-	}
-	rc, err := client.ChatCompletions(context.Background(), ChatOptions{Model: "m", RunID: "r"}, []byte(`{"model":"m"}`))
-	if err != nil {
-		t.Fatalf("chat through authenticated proxy failed: %v", err)
-	}
-	_ = rc.Close()
-
-	srv.mu.Lock()
-	gotUser, gotPass, conns, fails := srv.gotUser, srv.gotPass, srv.conns, srv.authFails
-	srv.mu.Unlock()
-	if gotUser != "alice" || gotPass != "s3cret" {
-		t.Errorf("proxy saw auth %q/%q, want alice/s3cret (userinfo must reach the SOCKS5 handshake)", gotUser, gotPass)
-	}
-	if conns != 1 || fails != 0 {
-		t.Errorf("proxy conns=%d authFails=%d, want 1/0", conns, fails)
-	}
-}
-
-// TestProxyRotationActualConnections exercises PROXY_ROTATION end to end
-// (E2E flow 4): with round-robin across two SOCKS5 proxies, each chat
-// request actually dials a different proxy (DisableKeepAlives forces the
-// re-dial), and every request reaches the upstream.
-func TestProxyRotationActualConnections(t *testing.T) {
-	mock := testutil.NewMock()
-	defer mock.Close()
-	mock.ChatBody = testutil.SSEEvent(`{"id":"x","object":"chat.completion.chunk","choices":[]}`)
-
-	s1 := newSocks5TestServer(t, false, "", "")
-	s2 := newSocks5TestServer(t, false, "", "")
-	client, err := New("tok", testConfig(mock.URL(), func(c *config.Config) {
-		c.SOCKS5Proxies = []string{"socks5://" + s1.Addr(), "socks5://" + s2.Addr()}
-		c.ProxyRotation = "round-robin"
-	}))
-	if err != nil {
-		t.Fatal(err)
-	}
-	for range 2 {
-		rc, err := client.ChatCompletions(context.Background(), ChatOptions{Model: "m", RunID: "r"}, []byte(`{"model":"m"}`))
-		if err != nil {
-			t.Fatalf("chat through rotated proxy failed: %v", err)
-		}
-		_ = rc.Close()
-	}
-	s1.mu.Lock()
-	c1 := s1.conns
-	s1.mu.Unlock()
-	s2.mu.Lock()
-	c2 := s2.conns
-	s2.mu.Unlock()
-	if c1 != 1 || c2 != 1 {
-		t.Errorf("proxy connections = %d/%d, want 1/1 (each request must land on a different proxy)", c1, c2)
-	}
-	if mock.Requests != 2 {
-		t.Errorf("upstream requests = %d, want 2", mock.Requests)
-	}
-}
-
-// TestProxyIndexForZeroProxies guards the division-by-zero fix (fix 3, Audit
-// B4): proxyIndexFor must not panic with zero proxies, with or without a
-// stashed (out-of-range) index in the context.
-func TestProxyIndexForZeroProxies(t *testing.T) {
-	client, err := New("tok", testConfig("", nil))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := client.proxyIndexFor(context.Background()); got != 0 {
-		t.Errorf("proxyIndexFor(bare ctx) = %d, want 0", got)
-	}
-	stashed := context.WithValue(context.Background(), proxyIndexKey{}, 7)
-	if got := client.proxyIndexFor(stashed); got != 0 {
-		t.Errorf("proxyIndexFor(stashed 7, no proxies) = %d, want 0 (no panic)", got)
-	}
 }
 
 // TestFailedReplayMetricsDisagreement pins the current metrics behavior on a
@@ -2987,7 +2735,7 @@ func TestEndSession404Tolerated(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := client.EndSession(context.Background(), "inst-1"); err != nil {
+		if err := client.EndSession(context.Background()); err != nil {
 			t.Errorf("EndSession 404 = %v, want nil", err)
 		}
 	})
@@ -3003,38 +2751,51 @@ func TestEndSession404Tolerated(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := client.EndSession(context.Background(), "inst-1"); err == nil {
+		if err := client.EndSession(context.Background()); err == nil {
 			t.Error("EndSession 500 succeeded, want error")
 		}
 	})
 }
 
-// TestClassify429ChatLevel guards 429 ip_capped/spend_limited bodies at the
-// chat level (G10): they classify as RateLimitError carrying the status.
+// TestClassify429ChatLevel guards 429 chat-level bodies (G10): ip_capped
+// classifies as the distinct IpCappedError (admission-only, NOT a quota
+// reset — never ErrRateLimited), while spend_limited keeps quota-lock
+// RateLimitError semantics.
 func TestClassify429ChatLevel(t *testing.T) {
-	cases := []struct {
-		name       string
-		body       string
-		wantStatus string
-	}{
-		{"ip_capped", `{"status":"ip_capped","activeUsersForIp":5,"limit":4,"retryAfterMs":30000}`, "ip_capped"},
-		{"spend_limited", `{"status":"spend_limited","message":"Daily budget reached","retryAfterMs":60000}`, "spend_limited"},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			err := classifyError(http.StatusTooManyRequests, tc.body, http.Header{})
-			var rle *RateLimitError
-			if !errors.As(err, &rle) {
-				t.Fatalf("err = %v, want RateLimitError", err)
-			}
-			if !errors.Is(err, ErrRateLimited) {
-				t.Errorf("err = %v, want ErrRateLimited", err)
-			}
-			if rle.Status != tc.wantStatus {
-				t.Errorf("RateLimitError.Status = %q, want %q", rle.Status, tc.wantStatus)
-			}
-		})
-	}
+	t.Run("ip_capped", func(t *testing.T) {
+		err := classifyError(http.StatusTooManyRequests,
+			`{"status":"ip_capped","activeUsersForIp":5,"limit":4,"retryAfterMs":30000}`, http.Header{})
+		if errors.Is(err, ErrRateLimited) {
+			t.Fatal("ip_capped classified as ErrRateLimited, want distinct ErrIpCapped")
+		}
+		var ice *IpCappedError
+		if !errors.As(err, &ice) {
+			t.Fatalf("err = %v, want *IpCappedError", err)
+		}
+		if !errors.Is(err, ErrIpCapped) {
+			t.Errorf("err = %v, want ErrIpCapped", err)
+		}
+		if ice.ActiveUsersForIP != 5 || ice.Limit != 4 {
+			t.Errorf("IpCappedError = %+v, want ActiveUsersForIP 5 limit 4", ice)
+		}
+		if ice.RetryAfter != 30*time.Second {
+			t.Errorf("RetryAfter = %v, want 30s (bounded to retryAfterMs only)", ice.RetryAfter)
+		}
+	})
+	t.Run("spend_limited", func(t *testing.T) {
+		err := classifyError(http.StatusTooManyRequests,
+			`{"status":"spend_limited","message":"Daily budget reached","retryAfterMs":60000}`, http.Header{})
+		var rle *RateLimitError
+		if !errors.As(err, &rle) {
+			t.Fatalf("err = %v, want RateLimitError", err)
+		}
+		if !errors.Is(err, ErrRateLimited) {
+			t.Errorf("err = %v, want ErrRateLimited", err)
+		}
+		if rle.Status != "spend_limited" {
+			t.Errorf("RateLimitError.Status = %q, want spend_limited", rle.Status)
+		}
+	})
 }
 
 // TestChatNonObjectBodyAndGzipError guards G12: a non-object chat body is
@@ -3205,7 +2966,7 @@ func TestRetryRotatesFingerprintAtDialLayer(t *testing.T) {
 		}
 		// Production hard-codes InsecureSkipVerify=false; the local test
 		// server's self-signed cert requires true.
-		return stealth.Dialer(prof, nil, true)(ctx, network, addr)
+		return stealth.Dialer(prof, nil, true, nil)(ctx, network, addr)
 	}
 
 	rc, err := client.ChatCompletions(context.Background(), ChatOptions{Model: "m"}, []byte(`{"model":"m"}`))
@@ -3225,86 +2986,6 @@ func TestRetryRotatesFingerprintAtDialLayer(t *testing.T) {
 	}
 	if got := client.FingerprintRotations(); got != 1 {
 		t.Errorf("FingerprintRotations = %d, want 1", got)
-	}
-}
-
-// TestConnectTunnelStealthRealSockets is E2E flow 6: HTTP_PROXY with
-// credentials plus a pinned TLS fingerprint routes the origin TLS through a
-// CONNECT tunnel over real sockets, authenticating to the proxy.
-func TestConnectTunnelStealthRealSockets(t *testing.T) {
-	origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = io.WriteString(w, testutil.SSEEvent(`{"id":"x","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"tunneled"},"finish_reason":null}]}`))
-	}))
-	defer origin.Close()
-
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = ln.Close() }()
-	proxyAddr := ln.Addr().String()
-	authSeen := make(chan string, 1)
-	go func() {
-		for {
-			c, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			go func(c net.Conn) {
-				defer func() { _ = c.Close() }()
-				br := bufio.NewReader(c)
-				req, err := http.ReadRequest(br)
-				if err != nil {
-					return
-				}
-				authSeen <- req.Header.Get("Proxy-Authorization")
-				up, err := net.Dial("tcp", req.Host)
-				if err != nil {
-					return
-				}
-				defer func() { _ = up.Close() }()
-				_, _ = io.WriteString(c, "HTTP/1.1 200 Connection Established\r\n\r\n")
-				done := make(chan struct{}, 1)
-				go func() {
-					_, _ = io.Copy(up, br)
-					done <- struct{}{}
-				}()
-				_, _ = io.Copy(c, up)
-				<-done
-			}(c)
-		}
-	}()
-
-	proxyURL := "http://user:pass@" + proxyAddr
-	client, err := New("tok", testConfig(origin.URL, func(c *config.Config) {
-		c.HTTPProxy = proxyURL
-		c.TLSFingerprint = "chrome126"
-	}))
-	if err != nil {
-		t.Fatal(err)
-	}
-	tr := client.http.Transport.(*http.Transport)
-	pu, _ := url.Parse(proxyURL)
-	tr.DialTLSContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-		prof := client.dialProfileFor(ctx)
-		// InsecureSkipVerify=true only because the local origin is
-		// self-signed; production hard-codes false.
-		return stealth.Dialer(prof, httpConnectDial(pu), true)(ctx, network, addr)
-	}
-
-	rc, err := client.ChatCompletions(context.Background(), ChatOptions{Model: "m"}, []byte(`{"model":"m"}`))
-	if err != nil {
-		t.Fatalf("chat through CONNECT tunnel failed: %v", err)
-	}
-	data, _ := io.ReadAll(rc)
-	_ = rc.Close()
-	if !strings.Contains(string(data), `"content":"tunneled"`) {
-		t.Errorf("stream missing tunneled chunk: %s", data)
-	}
-	wantAuth := "Basic " + base64.StdEncoding.EncodeToString([]byte("user:pass"))
-	if got := <-authSeen; got != wantAuth {
-		t.Errorf("CONNECT Proxy-Authorization = %q, want %q", got, wantAuth)
 	}
 }
 
@@ -3351,11 +3032,13 @@ func TestFullChatLifecycleChained(t *testing.T) {
 	if len(mock.RecordedChatHeaders) != 1 {
 		t.Fatalf("recorded chat headers = %d, want 1", len(mock.RecordedChatHeaders))
 	}
-	if got := mock.RecordedChatHeaders[0].Get("x-freebuff-instance-id"); got != st.InstanceID {
-		t.Errorf("chat x-freebuff-instance-id = %q, want %q", got, st.InstanceID)
+	// #106: the chat POST carries no instance/model headers — they ride in
+	// the body metadata only.
+	if got := mock.RecordedChatHeaders[0].Get("x-freebuff-instance-id"); got != "" {
+		t.Errorf("chat x-freebuff-instance-id = %q, want absent (#106)", got)
 	}
-	if got := mock.RecordedChatHeaders[0].Get("x-freebuff-model"); got != "m" {
-		t.Errorf("chat x-freebuff-model = %q, want m", got)
+	if got := mock.RecordedChatHeaders[0].Get("x-freebuff-model"); got != "" {
+		t.Errorf("chat x-freebuff-model = %q, want absent (#106)", got)
 	}
 	if !mock.BodyContains(`"freebuff_instance_id":"` + st.InstanceID + `"`) {
 		t.Error("chat body missing freebuff_instance_id in codebuff_metadata")
@@ -3364,10 +3047,10 @@ func TestFullChatLifecycleChained(t *testing.T) {
 		t.Error("chat body missing run_id in codebuff_metadata")
 	}
 
-	if err := client.FinishRun(ctx, runID, 3); err != nil {
+	if err := client.FinishRun(ctx, runID, "completed", 3, nil, ""); err != nil {
 		t.Fatalf("FinishRun: %v", err)
 	}
-	if err := client.EndSession(ctx, st.InstanceID); err != nil {
+	if err := client.EndSession(ctx); err != nil {
 		t.Fatalf("EndSession: %v", err)
 	}
 
@@ -3383,9 +3066,9 @@ func TestFullChatLifecycleChained(t *testing.T) {
 	}
 }
 
-// TestCompactHeartbeatAbsentTolerant is E2E flow 8: a compact heartbeat poll
-// without quota/offer fields parses cleanly with nil maps.
-func TestCompactHeartbeatAbsentTolerant(t *testing.T) {
+// TestCompactPollAbsentTolerant is E2E flow 8: a compact poll without quota/
+// offer fields parses cleanly with nil maps, and carries no heartbeat header.
+func TestCompactPollAbsentTolerant(t *testing.T) {
 	mock := testutil.NewMock()
 	defer mock.Close()
 	gotCompact := make(chan string, 1)
@@ -3401,9 +3084,9 @@ func TestCompactHeartbeatAbsentTolerant(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	st, err := client.GetSessionWithOpts(context.Background(), "inst-1", true, true)
+	st, err := client.GetSessionWithOpts(context.Background(), "inst-1", true)
 	if err != nil {
-		t.Fatalf("compact heartbeat poll: %v", err)
+		t.Fatalf("compact poll: %v", err)
 	}
 	if st.Status != "active" || st.InstanceID != "inst-1" {
 		t.Errorf("state = %+v, want active inst-1", st)
@@ -3417,7 +3100,577 @@ func TestCompactHeartbeatAbsentTolerant(t *testing.T) {
 	if got := <-gotCompact; got != "1" {
 		t.Errorf("compact header = %q, want 1", got)
 	}
-	if got := <-gotHeartbeat; got != "1" {
-		t.Errorf("heartbeat header = %q, want 1", got)
+	if got := <-gotHeartbeat; got != "" {
+		t.Errorf("heartbeat header = %q, want absent (CLI never beats)", got)
+	}
+}
+
+// ── Wave 1 issue tests (#75, #81, #82, #79, #80, #76) ────────────────────
+
+// TestClassifyCapacityDeferred verifies #75: a free_mode_capacity_deferred
+// response classifies as the distinct CapacityDeferredError (retryable
+// same-session condition), never a token cooldown or session invalidation.
+func TestClassifyCapacityDeferred(t *testing.T) {
+	err := classifyError(http.StatusTooManyRequests, `{"error":{"code":"free_mode_capacity_deferred","message":"Free mode is at capacity; your request will be retried automatically"}}`, http.Header{})
+	var cde *CapacityDeferredError
+	if !errors.As(err, &cde) {
+		t.Fatalf("err = %v, want *CapacityDeferredError", err)
+	}
+	if !errors.Is(err, ErrCapacityDeferred) {
+		t.Errorf("err = %v, want ErrCapacityDeferred", err)
+	}
+	// Unwraps to a Retryable UpstreamError (errors.As finds it), but
+	// writeError surfaces 429 free_mode_capacity_deferred + Retry-After
+	// via its dedicated CapacityDeferredError branch (#105).
+	var ue *UpstreamError
+	if !errors.As(err, &ue) || !ue.Retryable {
+		t.Errorf("err = %v, want unwrap to Retryable UpstreamError", err)
+	}
+	if cde.Status != http.StatusTooManyRequests {
+		t.Errorf("Status = %d, want 429", cde.Status)
+	}
+}
+
+// TestChatCompletionsRetriesCapacityDeferredSameSession verifies #75: a
+// free_mode_capacity_deferred 429 is retried IN PLACE against the same
+// lease/session (byte-identical body, same instance id) up to the
+// TRANSIENT_RETRIES budget, and surfaces the typed retryable error once the
+// budget is exhausted.
+func TestChatCompletionsRetriesCapacityDeferredSameSession(t *testing.T) {
+	body := []byte(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`)
+	deferred := `{"error":{"code":"free_mode_capacity_deferred","message":"Free mode is at capacity; your request will be retried automatically"}}`
+
+	t.Run("retries same session then succeeds", func(t *testing.T) {
+		mock := testutil.NewMock()
+		defer mock.Close()
+		var calls atomic.Int32
+		mock.ChatHandler = func(w http.ResponseWriter, r *http.Request) {
+			if calls.Add(1) == 1 {
+				w.Header().Set("Content-Type", "application/json")
+				// #105: a short retry-after — the client must sleep it (floor
+				// 10s) before re-POSTing, not retry immediately.
+				w.Header().Set("Retry-After", "1")
+				w.WriteHeader(http.StatusTooManyRequests)
+				_, _ = io.WriteString(w, deferred)
+				return
+			}
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(200)
+			_, _ = io.WriteString(w, testutil.SSEEvent(`{"id":"x","object":"chat.completion.chunk","choices":[]}`))
+		}
+		client, err := New("tok-a", testConfig(mock.URL(), func(c *config.Config) { c.TransientRetries = 1 }))
+		if err != nil {
+			t.Fatal(err)
+		}
+		start := time.Now()
+		rc, err := client.ChatCompletions(context.Background(), ChatOptions{Model: "m", RunID: "r", SessionInstanceID: "inst-1"}, body)
+		if err != nil {
+			t.Fatalf("ChatCompletions after capacity-deferred retry: %v", err)
+		}
+		_ = rc.Close()
+		// The retry-after (1s) must have been honored before the retry POST.
+		if elapsed := time.Since(start); elapsed < 900*time.Millisecond {
+			t.Errorf("capacity-deferred retry elapsed %v, want >= the 1s Retry-After sleep (#105)", elapsed)
+		}
+
+		if got := calls.Load(); got != 2 {
+			t.Errorf("upstream chat calls = %d, want 2 (original + same-session retry)", got)
+		}
+		if got := client.CapacityDeferredRetries(); got != 1 {
+			t.Errorf("CapacityDeferredRetries = %d, want 1", got)
+		}
+		if len(mock.RecordedChatHeaders) != 2 {
+			t.Fatalf("recorded %d chat requests, want 2", len(mock.RecordedChatHeaders))
+		}
+		// Same session on the retry: the instance id rides in the body
+		// metadata, not the chat headers (#106).
+		if got := mock.RecordedChatHeaders[1].Get("x-freebuff-instance-id"); got != "" {
+			t.Errorf("retry x-freebuff-instance-id = %q, want absent (chat headers carry no instance id)", got)
+		}
+		if !strings.Contains(mock.RecordedChatBodies[0], `"freebuff_instance_id":"inst-1"`) {
+			t.Error("chat body missing freebuff_instance_id in codebuff_metadata")
+		}
+		if mock.RecordedChatBodies[0] != mock.RecordedChatBodies[1] {
+			t.Error("retried body differs from original (must be byte-identical)")
+		}
+	})
+
+	t.Run("budget exhausted surfaces typed retryable error", func(t *testing.T) {
+		mock2 := testutil.NewMock()
+		defer mock2.Close()
+		var calls2 atomic.Int32
+		mock2.ChatHandler = func(w http.ResponseWriter, r *http.Request) {
+			calls2.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Retry-After", "1")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = io.WriteString(w, deferred)
+		}
+		client2, err := New("tok-b", testConfig(mock2.URL(), func(c *config.Config) { c.TransientRetries = 1 }))
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = client2.ChatCompletions(context.Background(), ChatOptions{Model: "m", RunID: "r"}, body)
+		if !errors.Is(err, ErrCapacityDeferred) {
+			t.Fatalf("err = %v, want ErrCapacityDeferred", err)
+		}
+		var cde *CapacityDeferredError
+		if !errors.As(err, &cde) {
+			t.Fatalf("err = %v, want *CapacityDeferredError", err)
+		}
+		var ue *UpstreamError
+		if !errors.As(err, &ue) || !ue.Retryable {
+			t.Errorf("err = %v, want unwrap to Retryable UpstreamError", err)
+		}
+		if got := calls2.Load(); got != 2 {
+			t.Errorf("upstream chat calls = %d, want 2 (original + 1 budgeted retry)", got)
+		}
+		if got := client2.CapacityDeferredRetries(); got != 1 {
+			t.Errorf("CapacityDeferredRetries = %d, want 1", got)
+		}
+	})
+
+	t.Run("zero budget never retries", func(t *testing.T) {
+		mock3 := testutil.NewMock()
+		defer mock3.Close()
+		var calls3 atomic.Int32
+		mock3.ChatHandler = func(w http.ResponseWriter, r *http.Request) {
+			calls3.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = io.WriteString(w, deferred)
+		}
+		client3, err := New("tok-c", testConfig(mock3.URL(), func(c *config.Config) { c.TransientRetries = 0 }))
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = client3.ChatCompletions(context.Background(), ChatOptions{Model: "m", RunID: "r"}, body)
+		if !errors.Is(err, ErrCapacityDeferred) {
+			t.Fatalf("err = %v, want ErrCapacityDeferred", err)
+		}
+		if got := calls3.Load(); got != 1 {
+			t.Errorf("upstream chat calls = %d, want 1 (retries disabled)", got)
+		}
+	})
+
+	t.Run("budget resets per request", func(t *testing.T) {
+		// Regression (review P1): the capacity-deferred budget must be
+		// per-request, not client-lifetime. Two sequential requests on the
+		// SAME client must each get their own TRANSIENT_RETRIES budget.
+		mock4 := testutil.NewMock()
+		defer mock4.Close()
+		var calls4 atomic.Int32
+		mock4.ChatHandler = func(w http.ResponseWriter, r *http.Request) {
+			if calls4.Add(1)%2 == 1 { // first call of each request: deferred
+				w.Header().Set("Content-Type", "application/json")
+				w.Header().Set("Retry-After", "1")
+				w.WriteHeader(http.StatusTooManyRequests)
+				_, _ = io.WriteString(w, deferred)
+				return
+			}
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(200)
+			_, _ = io.WriteString(w, testutil.SSEEvent(`{"id":"x","object":"chat.completion.chunk","choices":[]}`))
+		}
+		client4, err := New("tok-d", testConfig(mock4.URL(), func(c *config.Config) { c.TransientRetries = 1 }))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i := 0; i < 2; i++ {
+			rc, err := client4.ChatCompletions(context.Background(), ChatOptions{Model: "m", RunID: "r"}, body)
+			if err != nil {
+				t.Fatalf("request %d after capacity-deferred retry: %v", i+1, err)
+			}
+			_ = rc.Close()
+		}
+		if got := calls4.Load(); got != 4 {
+			t.Errorf("upstream chat calls = %d, want 4 (2 requests x 2 calls: original + retry each)", got)
+		}
+		if got := client4.CapacityDeferredRetries(); got != 2 {
+			t.Errorf("CapacityDeferredRetries = %d, want 2 (one retry per request)", got)
+		}
+	})
+}
+
+// TestClassifyIpCappedNoPacificMidnight verifies #81: a 429 ip_capped body
+// with no explicit retryAfterMs gets a bounded 1m default — never the
+// Pacific-midnight quota lock.
+func TestClassifyIpCappedNoPacificMidnight(t *testing.T) {
+	err := classifyError(http.StatusTooManyRequests, `{"status":"ip_capped"}`, http.Header{})
+	if errors.Is(err, ErrRateLimited) {
+		t.Fatal("ip_capped classified as ErrRateLimited, want distinct ErrIpCapped")
+	}
+	var ice *IpCappedError
+	if !errors.As(err, &ice) {
+		t.Fatalf("err = %v, want *IpCappedError", err)
+	}
+	if ice.RetryAfter != time.Minute {
+		t.Errorf("RetryAfter = %v, want 1m bounded default (no Pacific midnight)", ice.RetryAfter)
+	}
+	if errors.Is(err, ErrIpCapped) == false {
+		t.Errorf("err = %v, want ErrIpCapped", err)
+	}
+}
+
+// TestClassifyWaitingRoomQueued verifies #81: a 429 waiting_room_queued body
+// is a transient admission race (endsTheSession:false) — surfaced as a
+// WaitingRoomError, never session-invalid (no session refresh/recreate).
+func TestClassifyWaitingRoomQueued(t *testing.T) {
+	err := classifyError(http.StatusTooManyRequests, `{"error":{"code":"waiting_room_queued","message":"row caught mid-admit"}}`, http.Header{})
+	if errors.Is(err, ErrSessionInvalid) {
+		t.Fatal("waiting_room_queued classified as session-invalid, want transient WaitingRoomError")
+	}
+	var wr *WaitingRoomError
+	if !errors.As(err, &wr) {
+		t.Fatalf("err = %v, want *WaitingRoomError", err)
+	}
+}
+
+// TestClassifySessionLimitReached verifies #82: a 409 session_limit_reached
+// response is a distinct non-invalid error carrying the code — the ACCOUNT
+// is over its concurrent-tab budget but the session row is fine
+// (endsTheSession:false), so no session refresh/recreate may trigger.
+func TestClassifySessionLimitReached(t *testing.T) {
+	err := classifyError(http.StatusConflict, `{"error":{"code":"session_limit_reached","message":"Concurrent tab limit reached"}}`, http.Header{})
+	if errors.Is(err, ErrSessionInvalid) {
+		t.Fatal("session_limit_reached classified as session-invalid; the row is fine")
+	}
+	var sle *SessionLimitError
+	if !errors.As(err, &sle) {
+		t.Fatalf("err = %v, want *SessionLimitError", err)
+	}
+	if !errors.Is(err, ErrSessionLimitReached) {
+		t.Errorf("err = %v, want ErrSessionLimitReached", err)
+	}
+	if sle.Status != http.StatusConflict {
+		t.Errorf("Status = %d, want 409", sle.Status)
+	}
+}
+
+// TestChatSendsActingUserID verifies #79: when ACTING_USER_ID is configured
+// the client sends x-freebuff-acting-user-id on the chat path (the CLI
+// sends the account's own id derived from /api/v1/me); when unset the
+// header is omitted.
+func TestChatSendsActingUserID(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mock.ChatBody = testutil.SSEEvent(`{"id":"x","object":"chat.completion.chunk","choices":[]}`)
+
+	t.Run("set", func(t *testing.T) {
+		client, err := New("tok-a", testConfig(mock.URL(), func(c *config.Config) { c.ActingUserID = "user-123" }))
+		if err != nil {
+			t.Fatal(err)
+		}
+		rc, err := client.ChatCompletions(context.Background(), ChatOptions{Model: "m", RunID: "r"}, []byte(`{"model":"m"}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = rc.Close()
+		if len(mock.RecordedChatHeaders) != 1 {
+			t.Fatalf("want 1 chat request, got %d", len(mock.RecordedChatHeaders))
+		}
+		if got := mock.RecordedChatHeaders[0].Get("x-freebuff-acting-user-id"); got != "user-123" {
+			t.Errorf("x-freebuff-acting-user-id = %q, want user-123", got)
+		}
+	})
+	t.Run("unset omits header", func(t *testing.T) {
+		client, err := New("tok-a", testConfig(mock.URL(), nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		rc, err := client.ChatCompletions(context.Background(), ChatOptions{Model: "m", RunID: "r"}, []byte(`{"model":"m"}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = rc.Close()
+		if got := mock.RecordedChatHeaders[1].Get("x-freebuff-acting-user-id"); got != "" {
+			t.Errorf("x-freebuff-acting-user-id = %q, want unset", got)
+		}
+	})
+}
+
+// TestWaitingRoomChainWireFidelity verifies #124: the pre-session ad chain
+// matches the CLI wire shape — header UA Freebuff-CLI/0.0.149 (never the
+// old 2.0.42 login UA), body userAgent = the Chrome-124 browser UA,
+// device carries the host IANA timezone/locale, messages stays [] with no
+// sessionId (fresh waiting-room), and the streak GET inherits newRequest's
+// cliUserAgent (no UA override).
+func TestWaitingRoomChainWireFidelity(t *testing.T) {
+	var mu sync.Mutex
+	var adsHeaders, streakHeaders http.Header
+	var adsBody map[string]any
+	adsHits, streakHits := 0, 0
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch {
+		case r.URL.Path == "/api/v1/ads" && r.Method == http.MethodPost:
+			adsHits++
+			adsHeaders = r.Header.Clone()
+			_ = json.NewDecoder(r.Body).Decode(&adsBody)
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, `{"ads":[],"provider":"gravity"}`)
+		case r.URL.Path == "/api/v1/freebuff/streak" && r.Method == http.MethodGet:
+			streakHits++
+			streakHeaders = r.Header.Clone()
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, `{}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	client, err := New("tok-a", testConfig(ts.URL, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.FireWaitingRoomChain(context.Background())
+
+	mu.Lock()
+	defer mu.Unlock()
+	if adsHits == 0 {
+		t.Fatal("ads request not fired")
+	}
+	if streakHits == 0 {
+		t.Fatal("streak request not fired")
+	}
+	// Header UA: Freebuff-CLI/<installed binary version>.
+	if got := adsHeaders.Get("User-Agent"); got != freebuffCliUA {
+		t.Errorf("ads header User-Agent = %q, want %q", got, freebuffCliUA)
+	}
+	// Body userAgent: the platform-consistent Chrome-124 browser UA (ad
+	// targeting) — must agree with the device block's os.
+	if got := adsBody["userAgent"]; got != adBrowserUserAgent() {
+		t.Errorf("ads body userAgent = %q, want %q", got, adBrowserUserAgent())
+	}
+	// Device block: host-derived IANA tz/locale, not hardcoded UTC/en-US.
+	device, ok := adsBody["device"].(map[string]any)
+	if !ok {
+		t.Fatalf("ads body device = %T, want object", adsBody["device"])
+	}
+	tz, _ := device["timezone"].(string)
+	if tz == "" || tz == "Local" {
+		t.Errorf("ads device timezone = %q, want host IANA name or UTC", tz)
+	} else if _, err := time.LoadLocation(tz); err != nil {
+		t.Errorf("ads device timezone %q is not a valid IANA zone", tz)
+	}
+	loc, _ := device["locale"].(string)
+	if loc == "" || loc == "C" || loc == "POSIX" || strings.Contains(loc, "_") {
+		t.Errorf("ads device locale = %q, want a BCP-47-style locale (e.g. en-US)", loc)
+	}
+	// The device os follows the host's wire mapping (darwin→macos) and the
+	// body UA agrees with it — the CLI picks both from the same platform.
+	if os, _ := device["os"].(string); os != deviceOS() {
+		t.Errorf("ads device os = %q, want %q (host wire mapping)", os, deviceOS())
+	}
+	// Faithful details kept: empty messages and NO sessionId (the chain
+	// fires before a session exists).
+	if msgs, _ := adsBody["messages"].([]any); len(msgs) != 0 {
+		t.Errorf("ads body messages = %v, want []", msgs)
+	}
+	if _, hasSession := adsBody["sessionId"]; hasSession {
+		t.Error("ads body carries sessionId, want omitted (fresh waiting-room)")
+	}
+	// Streak GET: no UA override — it inherits newRequest's cliUserAgent.
+	if got := streakHeaders.Get("User-Agent"); got != cliUserAgent {
+		t.Errorf("streak User-Agent = %q, want %q (cliUserAgent, no override)", got, cliUserAgent)
+	}
+}
+
+// TestInjectEnvelopeTraceSessionIDAndFreshClientID verifies #80+#103: the
+// envelope injects trace_session_id when carried by ChatOptions (stable per
+// run) while client_id is a FRESH random draw per call (never derived from
+// the run id).
+func TestInjectEnvelopeTraceSessionIDAndFreshClientID(t *testing.T) {
+	out, err := injectEnvelope([]byte(`{"model":"m"}`), "free", ChatOptions{RunID: "run-1", TraceSessionID: "trace-abc"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sent map[string]any
+	if err := json.Unmarshal(out, &sent); err != nil {
+		t.Fatal(err)
+	}
+	md := sent["codebuff_metadata"].(map[string]any)
+	if md["trace_session_id"] != "trace-abc" {
+		t.Errorf("trace_session_id = %v, want trace-abc", md["trace_session_id"])
+	}
+	if id, _ := md["client_id"].(string); !regexp.MustCompile(`^[a-z0-9]{13}$`).MatchString(id) || strings.HasPrefix(id, "run:") {
+		t.Errorf("client_id = %v, want a fresh unprefixed 13-char base36 draw (#103)", md["client_id"])
+	}
+	// Re-injecting the same run yields a DIFFERENT client_id across calls.
+	out2, err := injectEnvelope([]byte(`{"model":"m"}`), "free", ChatOptions{RunID: "run-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sent2 map[string]any
+	_ = json.Unmarshal(out2, &sent2)
+	if md2 := sent2["codebuff_metadata"].(map[string]any); md2["client_id"] == md["client_id"] {
+		t.Errorf("client_id = %v, want a fresh draw per request (same run)", md2["client_id"])
+	}
+	// Without a run id the SDK-faithful 13-char base36 draw is kept.
+	out3, err := injectEnvelope([]byte(`{"model":"m"}`), "free", ChatOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sent3 map[string]any
+	_ = json.Unmarshal(out3, &sent3)
+	md3 := sent3["codebuff_metadata"].(map[string]any)
+	if id, _ := md3["client_id"].(string); !regexp.MustCompile(`^[0-9a-z]{13}$`).MatchString(id) {
+		t.Errorf("client_id %q not 13-char base36 when no run id", id)
+	}
+}
+
+// TestProbeAccountSendsIncludeUnusedRateLimits verifies #76: the zero-cost
+// GET probe carries x-freebuff-include-unused-rate-limits: 1 so the response
+// includes accessTier/glmPromo/resetAt/rateLimitsByModel for dashboard
+// display, and sessionCall parses the new fields.
+func TestProbeAccountSendsIncludeUnusedRateLimits(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	var gotHeader string
+	mock.SessionHandler = func(w http.ResponseWriter, r *http.Request) {
+		gotHeader = r.Header.Get("x-freebuff-include-unused-rate-limits")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"status":"active","instanceId":"inst-1","accessTier":"limited","glmPromo":{"dailySessions":2,"endsAt":"2026-08-20T07:00:00.000Z"},"rateLimitsByModel":{"deepseek/deepseek-v4-flash":{"model":"deepseek/deepseek-v4-flash","limit":6,"recentCount":2,"period":"pacific_day","resetAt":"2026-08-18T07:00:00.000Z"}}}`)
+	}
+	client, err := New("tok-a", testConfig(mock.URL(), nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := client.ProbeAccount(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotHeader != "1" {
+		t.Errorf("x-freebuff-include-unused-rate-limits = %q, want 1", gotHeader)
+	}
+	if st.AccessTier != "limited" {
+		t.Errorf("AccessTier = %q, want limited", st.AccessTier)
+	}
+	if st.GlmPromo == "" || !strings.Contains(st.GlmPromo, "dailySessions") {
+		t.Errorf("GlmPromo = %q, want raw glmPromo JSON", st.GlmPromo)
+	}
+	if st.RateLimitsByModel == nil || st.RateLimitsByModel["deepseek/deepseek-v4-flash"].Limit != 6 {
+		t.Errorf("RateLimitsByModel = %+v, want parsed per-model quota", st.RateLimitsByModel)
+	}
+}
+
+func TestDeviceOSWireContract(t *testing.T) {
+	tests := []struct {
+		goos string
+		want string
+	}{
+		{"darwin", "macos"}, // Go reports darwin, wire contract wants macos
+		{"windows", "windows"},
+		{"linux", "linux"},
+		{"freebsd", "linux"}, // CLI falls back to linux for unknown platforms
+		{"", "linux"},
+	}
+	for _, tt := range tests {
+		if got := deviceOSFor(tt.goos); got != tt.want {
+			t.Errorf("deviceOSFor(%q) = %q, want %q", tt.goos, got, tt.want)
+		}
+	}
+}
+
+// TestReqIDContextHelpers pins the D1 ctx plumbing: withReqID stores the id
+// and ReqID reads it through descendant contexts (the timeout wraps in
+// ChatCompletions/do derive from the wrapped ctx).
+func TestReqIDContextHelpers(t *testing.T) {
+	if got := ReqID(context.Background()); got != "" {
+		t.Errorf("ReqID(background) = %q, want empty", got)
+	}
+	ctx := withReqID(context.Background(), "req-123")
+	if got := ReqID(ctx); got != "req-123" {
+		t.Errorf("ReqID = %q, want req-123", got)
+	}
+	child, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+	if got := ReqID(child); got != "req-123" {
+		t.Errorf("ReqID(child) = %q, want req-123 (value must survive descendant wraps)", got)
+	}
+}
+
+// TestDumpWriteFailureLogsWarn verifies T18: when DEBUG_DUMP is enabled but
+// the dump write fails (a regular file occupies the dump/ path), the failure
+// is logged as a WARN with path and err instead of being swallowed.
+func TestDumpWriteFailureLogsWarn(t *testing.T) {
+	orig := slog.Default()
+	var sink bytes.Buffer
+	slog.SetDefault(slog.New(slog.NewTextHandler(&sink, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	t.Cleanup(func() { slog.SetDefault(orig) })
+
+	t.Chdir(t.TempDir())
+	// A regular FILE named "dump": MkdirAll fails and WriteFile hits
+	// ENOTDIR/EEXIST — deterministic failure injection.
+	if err := os.WriteFile("dump", []byte("occupied"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	client, err := New("tok", testConfig("", func(c *config.Config) { c.DebugDump = true }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := http.NewRequest(http.MethodPost, "https://www.codebuff.com/v1/chat/completions", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.dump("chat", req, http.StatusOK, "response body")
+
+	logs := sink.String()
+	if !strings.Contains(logs, "debug dump write failed") {
+		t.Fatalf("dump WARN missing: %s", logs)
+	}
+	if !strings.Contains(logs, "path=") || !strings.Contains(logs, "err=") {
+		t.Errorf("dump WARN missing path/err attrs: %s", logs)
+	}
+}
+
+// TestClassifyLoadSheddingAndPeakHours pins issue #133: 429 bodies with the
+// load-saturation and peak-hours markers classify as bounded cooldowns with
+// distinct statuses — never the Pacific-midnight lock parseRateLimit would
+// apply to a no-timestamp 429.
+func TestClassifyLoadSheddingAndPeakHours(t *testing.T) {
+	tests := []struct {
+		name        string
+		body        string
+		wantStatus  string
+		wantCooldwn time.Duration
+	}{
+		{"load saturation", `{"status":"insufficient_quota","message":"The current group's upstream load is saturated, please try again later (request id: 42)"}`, "load_shedding", LoadShedCooldown},
+		{"limit burst rate", `{"status":"limit_burst_rate","message":"upstream load saturated, try again later"}`, "load_shedding", LoadShedCooldown},
+		{"peak hours", `{"status":"rate_limited","message":"Usage is temporarily limited during peak hours, when upstream model prices double"}`, "peak_hours", PeakHoursCooldown},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := classifyError(http.StatusTooManyRequests, tt.body, http.Header{})
+			var rle *RateLimitError
+			if !errors.As(err, &rle) {
+				t.Fatalf("classifyError = %T %v, want *RateLimitError", err, err)
+			}
+			if rle.Status != tt.wantStatus {
+				t.Errorf("Status = %q, want %q", rle.Status, tt.wantStatus)
+			}
+			if rle.RetryAfter != tt.wantCooldwn {
+				t.Errorf("RetryAfter = %v, want %v (bounded, not midnight)", rle.RetryAfter, tt.wantCooldwn)
+			}
+			if !rle.ResetAt.IsZero() {
+				t.Errorf("ResetAt = %v, want zero (no Pacific-midnight lock)", rle.ResetAt)
+			}
+		})
+	}
+
+	// The daily-cap path is untouched: a plain rate_limited 429 without the
+	// markers still goes through parseRateLimit's midnight default.
+	err := classifyError(http.StatusTooManyRequests, `{"status":"rate_limited","message":"daily quota"}`, http.Header{})
+	var rle *RateLimitError
+	if !errors.As(err, &rle) {
+		t.Fatalf("plain 429 = %T %v, want *RateLimitError", err, err)
+	}
+	if rle.Status != "" && rle.Status == "load_shedding" {
+		t.Error("plain 429 misclassified as load_shedding")
+	}
+	if rle.ResetAt.IsZero() {
+		t.Error("plain no-timestamp 429 lost the Pacific-midnight lock")
 	}
 }

@@ -20,19 +20,22 @@ codebuff.com 上游
 
 ## 为什么用 Go 二进制（部署模型，未验证）
 
-- **原生 Linux 容器**（非 WASM）：uTLS TLS 指纹、SOCKS5/HTTP 代理全部可用 —— stealth 层完整保留
-- **逻辑代码零改动**：`internal/` 全部原样（含 dashboard / egress / logring）。唯一新增的是根目录 `main.go` —— 作为 `vercel.json` 的构建目标（上游入口在 `cmd/freebuff-proxy/main.go`），根目录提供一个**镜像入口**（完整代理能力，去掉云上无意义的 `-doctor/-update/-setup/-test-token` 与交互 banner，并遵循 12-factor：`PORT` 存在时优先监听它）
+- **原生 Linux 容器**（非 WASM）：uTLS TLS 指纹 + HTTP/2 上游协商完整可用 —— stealth 层完整保留（上游已移除 SOCKS5/HTTP 代理出口，本仓库随之移除）
+- **逻辑代码零改动**：`internal/` 全部原样（含 dashboard / logring / egress，egress 探测已按上游改为按需、不再随启动循环）。唯一新增的是根目录 `main.go` —— 作为 `vercel.json` 的构建目标（上游入口在 `cmd/freebuff-proxy/main.go`），根目录提供一个**镜像入口**（完整代理能力，去掉云上无意义的 `-doctor/-update/-setup/-test-token/-install-service/…` 交互子命令与启动 banner，并遵循 12-factor：`PORT` 存在时优先监听它）
 - **免费**（Hobby）：100 万 Function Invocations/月 + 360 GB-h + 4 CPU-h + 100 GB 带宽，美东 `iad1` 出口，**无需绑卡**
 - **限制**：单次请求最长 300s（含 SSE 流式，单次 AI 推理足够）；实例空闲 scale-to-zero → 内存态会话/run 池、dashboard 状态、日志环会被重置（每次冷启动重新握手，功能不受影响）
 
 ## 新特性（本次同步跟进上游）
 
 - **Admin Dashboard**：内嵌单二进制 Web UI（`/admin`，htmx + Pico）。见下方「Admin Dashboard（云端说明）」。
-- **egress 出口探测**：启动时对 Cloudflare trace 探测出口国家/IP（region/tier 模型可用性的依据）。
+- **HTTP/2 上游协商**：`HTTP2_UPSTREAM=true`（默认）以 `h2,http/1.1` 与上游协商，ALPN 对齐真实浏览器（JA4 指纹）。
+- **每来源 IP 限流**：`RATE_LIMIT_PER_IP`/`RATE_LIMIT_BURST` 保护上游免遭突发（默认关闭）。
+- **Webhook 告警**：`WEBHOOK_URL` 设置后，token 池耗尽/封禁时 fire-and-forget 告警（云端可用，纯出站 HTTPS POST）。
 - **Hybrid 模式**：`HYBRID_MODE=true` 时 pooled + bridge 共存。
-- **quota 透明**：`/healthz` 新增 per-token `quota` map（上次 admission 携带时）；`/v1/models` 携带 `available`/`status`/`current_access_tier`。
+- **quota / spend 透明**：`/healthz` 新增 per-token `quota` map + `SpendLimit`/`SpendPct`（上次 admission 携带时）；`/v1/models` 携带 `available`/`status`/`current_access_tier`。
 - **region/tier 模型可用性**：`MODELS_HIDE_UNAVAILABLE=true` 时 `/v1/models` 裁剪不可用模型。
-- **Session 持久化**：`SESSION_PERSIST=true` 时把未过期会话写盘（`SESSION_STATE_FILE`，0600，按 token 的 SHA-256 哈希为键、原始 token 不落盘），重启后恢复而避免烧新的每日会话额度。⚠️ Vercel 只读/易失文件系统上**无法真正持久化**（冷启动即重置），此项在 Vercel 上仅作占位。
+- **Session + Run 持久化**：`SESSION_PERSIST=true` 时把未过期会话与活动 run 写盘（`SESSION_STATE_FILE`，0600，按 token 的 SHA-256 哈希为键、原始 token 不落盘），重启后恢复而避免烧新的每日会话额度。⚠️ Vercel 只读/易失文件系统上**无法真正持久化**（冷启动即重置），此项在 Vercel 上仅作占位。
+- **egress 出口探测已移除**：上游 #123 不再随启动循环探测 Cloudflare trace（官方 CLI 从不请求该域名），改为 `-doctor` 按需探测；本仓库无交互子命令，云端不保留该探测。
 
 ## 快速部署
 
@@ -128,7 +131,7 @@ go test ./...                            # 上游完整测试套件（全过）
 |---|---|---|
 | 会话/run 池 | 内存常驻，跨请求复用 | 实例 scale-to-zero，空闲后重置（冷启动重建） |
 | dashboard / 日志环 | 内存常驻 | 冷启动重置；写 `.env` 只读失败 |
-| egress 探测 | 本机出口 | iad1 美东（region/tier 降级依据） |
+| egress 探测 | 本地自建可 `-doctor` 按需探测 | 已移除（上游 #123 不再随启动探测） |
 | 请求时长 | 无硬限制 | **300s 上限**（Hobby） |
 | 出口 | 本机 IP / 自配代理 | 美东 iad1（动态 IP） |
 | `/admin/reload` | 热重载本地 .env | 无意义（无本地配置文件） |
@@ -138,7 +141,7 @@ go test ./...                            # 上游完整测试套件（全过）
 ## 上游
 
 - 项目：https://github.com/trefeon/freebuff-proxy
-- 同步基线：上游 commit `3cf82c5`（2026-08-16）。协议转换层（`internal/convert`、`internal/upstream`、`internal/stealth`、`internal/registry`、`internal/dashboard`、`internal/egress`、`internal/logring`、`internal/session`）随上游更新；本仓库逻辑代码与上游逐字节一致，唯一差异是根 `main.go`、`vercel.json`、本 README（Vercel 适配层）。
+- 同步基线：上游 commit `b047e34`。协议转换层（`internal/convert`、`internal/upstream`、`internal/stealth`、`internal/registry`、`internal/dashboard`、`internal/egress`、`internal/logring`、`internal/session`、`internal/notify`）随上游更新；本仓库逻辑代码与上游逐字节一致，唯一差异是根 `main.go`、`vercel.json`、本 README（Vercel 适配层）。
 
 ## License
 

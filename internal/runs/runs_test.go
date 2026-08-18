@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -110,11 +112,18 @@ func TestFinishRunDropsFromActive(t *testing.T) {
 	}
 	mgr.Release(run)
 
-	mgr.FinishRun(context.Background(), run, 3)
+	// Issue #114: record 3 completed steps — totalSteps must come from the
+	// recorded steps (preferred over the request-count fallback) and the
+	// steps must ride IN the FINISH payload.
+	for i := 0; i < 3; i++ {
+		mgr.RecordStep(run, "")
+	}
+	mgr.FinishRun(context.Background(), run)
 
 	eventually(t, "FINISH payload", func() bool {
 		f, ok := finishedRun(mock, "run-0001")
-		return ok && f.Status == "completed" && f.TotalSteps == 3
+		return ok && f.Status == "completed" && f.TotalSteps == 3 && len(f.Steps) == 3 &&
+			f.Steps[0].StepNumber == 1 && f.Steps[2].StepNumber == 3
 	})
 
 	// Dropped from active: the next acquire must START afresh.
@@ -151,11 +160,14 @@ func TestInvalidateRestarts(t *testing.T) {
 	if next.RunID != "run-0002" {
 		t.Fatalf("run after Invalidate = %q, want run-0002 (re-START)", next.RunID)
 	}
-	if len(mock.StartedRuns) != 2 {
-		t.Errorf("STARTs = %d, want 2", len(mock.StartedRuns))
+	if started := mock.StartedRunsSnapshot(); len(started) != 2 {
+		t.Errorf("STARTs = %d, want 2", len(started))
 	}
-	if len(mock.FinishedRuns) != 0 {
-		t.Errorf("invalidated run must not be FINISHed, got %v", mock.FinishedRuns)
+	// Issue #91: each START also creates+FINISHes a context-pruner child
+	// run asynchronously — filter those out; the parent must never be
+	// FINISHed by Invalidate.
+	if finished := nonChildFinished(mock); len(finished) != 0 {
+		t.Errorf("invalidated run must not be FINISHed, got %v", finished)
 	}
 }
 
@@ -233,10 +245,11 @@ func TestShutdownFinishesAllAndEndsSession(t *testing.T) {
 		t.Errorf("active runs after shutdown = %d, want 0", snap.ActiveRuns)
 	}
 
-	// Idempotent: a second shutdown must not duplicate FINISHes.
+	// Idempotent: a second shutdown must not duplicate FINISHes. Child-run
+	// FINISHes (issue #91) are excluded from the count.
 	mgr.Shutdown(context.Background())
-	if len(mock.FinishedRuns) != 2 {
-		t.Errorf("finished runs after double shutdown = %d, want 2", len(mock.FinishedRuns))
+	if got := len(nonChildFinished(mock)); got != 2 {
+		t.Errorf("finished runs after double shutdown = %d, want 2", got)
 	}
 }
 
@@ -322,14 +335,14 @@ func TestPrewarmStartsAllAgentsOnce(t *testing.T) {
 	mgr, _ := newTestManager(t, mock, time.Hour)
 
 	mgr.Prewarm(context.Background(), []string{agentA, agentB})
-	if len(mock.StartedRuns) != 2 {
-		t.Fatalf("STARTs after prewarm = %d, want 2", len(mock.StartedRuns))
+	if started := mock.StartedRunsSnapshot(); len(started) != 2 {
+		t.Fatalf("STARTs after prewarm = %d, want 2", len(started))
 	}
 
 	// A second prewarm must not restart existing runs.
 	mgr.Prewarm(context.Background(), []string{agentA, agentB})
-	if len(mock.StartedRuns) != 2 {
-		t.Errorf("STARTs after second prewarm = %d, want still 2", len(mock.StartedRuns))
+	if started := mock.StartedRunsSnapshot(); len(started) != 2 {
+		t.Errorf("STARTs after second prewarm = %d, want still 2", len(started))
 	}
 
 	run, err := mgr.Acquire(context.Background(), agentA)
@@ -558,7 +571,7 @@ func TestShutdownSkipsMidFinishRun(t *testing.T) {
 
 	mgr.Shutdown(context.Background())
 
-	finished := mock.FinishedRunsSnapshot()
+	finished := nonChildFinished(mock)
 	if len(finished) != 1 {
 		t.Fatalf("finished runs = %v, want exactly 1 (only agentB's run)", finished)
 	}
@@ -672,5 +685,498 @@ func TestClearCooldowns(t *testing.T) {
 	}
 	if m.BanError() != nil {
 		t.Error("ban window not cleared")
+	}
+}
+
+// TestCooldownIpCappedCapsReAdmits pins #118: the CLI treats ip_capped as
+// terminal-until-reset (never an automatic re-admission loop), so the
+// proxy's CooldownIpCapped honors the FULL retryAfterMs (+jitter) for the
+// first refusals of a Pacific day, then locks the token until the next
+// Pacific midnight after maxIpCappedReAdmitsPerDay — with the remembered
+// error's Retry-After reflecting the remaining window.
+func TestCooldownIpCappedCapsReAdmits(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mgr, _ := newTestManager(t, mock, time.Hour)
+
+	ice := &upstream.IpCappedError{ActiveUsersForIP: 8, Limit: 6, RetryAfter: 60 * time.Second, Body: `{"status":"ip_capped"}`}
+
+	// Refusals 1..max-1: bounded window = full retryAfterMs + jitter (the
+	// jitter only ever extends the window, never shrinks it).
+	for i := 1; i < maxIpCappedReAdmitsPerDay; i++ {
+		mgr.CooldownIpCapped(ice)
+		until := mgr.CooldownUntil()
+		if !time.Now().Before(until) {
+			t.Fatalf("refusal %d: cooldown already expired, want now+retryAfter(+jitter)", i)
+		}
+		if time.Until(until) < ice.RetryAfter-time.Second {
+			t.Errorf("refusal %d: window %v shorter than retryAfterMs %v (jitter must not shrink it)",
+				i, time.Until(until), ice.RetryAfter)
+		}
+		if got := mgr.IpCappedError(); got == nil || got.RetryAfter != 60*time.Second {
+			t.Errorf("refusal %d: IpCappedError = %+v, want remembered original window", i, got)
+		}
+	}
+
+	// Budget exhausted: terminal until the next Pacific midnight.
+	mgr.CooldownIpCapped(ice)
+	want := upstream.NextPacificMidnight()
+	if until := mgr.CooldownUntil(); until.Sub(want) > time.Second || want.Sub(until) > time.Second {
+		t.Errorf("terminal lock until = %v, want ~Pacific midnight %v", until, want)
+	}
+	got := mgr.IpCappedError()
+	if got == nil {
+		t.Fatal("IpCappedError() = nil after budget exhausted, want remembered terminal error")
+	}
+	// The remembered error surfaces the REMAINING window to midnight. Near
+	// Pacific midnight that window is legitimately short — the suite can
+	// run across the boundary — so assert it matches the actual window
+	// (within test-execution drift) instead of a fixed floor.
+	if got.RetryAfter <= 0 {
+		t.Fatal("terminal RetryAfter = 0, want the remaining window to midnight")
+	}
+	if d := got.RetryAfter - time.Until(want); d > 2*time.Second || d < -2*time.Second {
+		t.Errorf("terminal RetryAfter = %v, want the remaining window to midnight (~%v)", got.RetryAfter, time.Until(want))
+	}
+
+	// Further refusals the same day must not move the lock (no re-admit loop).
+	first := mgr.CooldownUntil()
+	mgr.CooldownIpCapped(ice)
+	if until := mgr.CooldownUntil(); !until.Equal(first) {
+		t.Errorf("terminal lock moved on extra refusal: %v -> %v", first, until)
+	}
+
+	// Acquire skips the token during the terminal window (shared cooldown).
+	if _, err := mgr.Acquire(context.Background(), agentA); err == nil {
+		t.Error("Acquire during terminal ip_capped lock succeeded, want skip error")
+	}
+
+	// Pacific day rollover resets the budget: the next refusal gets a
+	// bounded window again instead of staying locked.
+	mgr.mu.Lock()
+	mgr.ipCappedDayReset = time.Time{} // force the "new day" branch
+	mgr.mu.Unlock()
+	mgr.CooldownIpCapped(ice)
+	until := mgr.CooldownUntil()
+	if until.Equal(want) {
+		t.Fatal("lock did not lift on the new Pacific day")
+	}
+	if !time.Now().Before(until) || time.Until(until) > ice.RetryAfter+2*time.Minute {
+		t.Errorf("post-reset window = %v, want now+retryAfterMs(+jitter)", time.Until(until))
+	}
+
+	// ClearCooldowns (dashboard unlock) resets the budget too.
+	mgr.CooldownIpCapped(ice)
+	mgr.CooldownIpCapped(ice)
+	mgr.CooldownIpCapped(ice)
+	if !time.Now().Before(mgr.CooldownUntil()) {
+		t.Fatal("expected terminal lock before ClearCooldowns")
+	}
+	mgr.ClearCooldowns()
+	mgr.CooldownIpCapped(ice)
+	if until := mgr.CooldownUntil(); !time.Now().Before(until) || time.Until(until) > ice.RetryAfter+2*time.Minute {
+		t.Errorf("post-ClearCooldowns window = %v, want bounded window (budget reset)", time.Until(until))
+	}
+}
+
+func TestSingleFlightRunAcquisition(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mgr, _ := newTestManager(t, mock, time.Hour)
+
+	const concurrency = 20
+	var wg sync.WaitGroup
+	runs := make([]*Run, concurrency)
+	errs := make([]error, concurrency)
+
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			r, err := mgr.Acquire(context.Background(), agentA)
+			runs[idx] = r
+			errs[idx] = err
+		}(i)
+	}
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("goroutine %d failed: %v", i, err)
+		}
+		if runs[i] == nil {
+			t.Fatalf("goroutine %d returned nil run", i)
+		}
+		if runs[i].RunID != "run-0001" {
+			t.Errorf("goroutine %d RunID = %q, want run-0001", i, runs[i].RunID)
+		}
+		mgr.Release(runs[i])
+	}
+
+	started := mock.StartedRunsSnapshot()
+	if len(started) != 1 {
+		t.Fatalf("StartedRuns count = %d, want 1 (single-flight coalesced)", len(started))
+	}
+}
+
+func TestSingleFlightRunRotation(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mgr, _ := newTestManager(t, mock, 50*time.Millisecond)
+
+	// First acquire
+	r1, err := mgr.Acquire(context.Background(), agentA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r1.RunID != "run-0001" {
+		t.Fatalf("first RunID = %q, want run-0001", r1.RunID)
+	}
+	mgr.Release(r1)
+
+	// Wait for rotation interval to pass
+	time.Sleep(70 * time.Millisecond)
+
+	const concurrency = 20
+	var wg sync.WaitGroup
+	runs := make([]*Run, concurrency)
+	errs := make([]error, concurrency)
+
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			r, err := mgr.Acquire(context.Background(), agentA)
+			runs[idx] = r
+			errs[idx] = err
+		}(i)
+	}
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("goroutine %d failed: %v", i, err)
+		}
+		if runs[i] == nil {
+			t.Fatalf("goroutine %d returned nil run", i)
+		}
+		if runs[i].RunID != "run-0002" {
+			t.Errorf("goroutine %d RunID = %q, want run-0002", i, runs[i].RunID)
+		}
+		mgr.Release(runs[i])
+	}
+
+	started := mock.StartedRunsSnapshot()
+	if len(started) != 2 {
+		t.Fatalf("StartedRuns count = %d, want 2 (initial + 1 coalesced rotation)", len(started))
+	}
+}
+
+// ── Wave 1 issue tests (#80) ─────────────────────────────────────────────
+
+// TestTraceSessionIDMintedPerRun verifies #80: each run mints a crypto/rand
+// trace session id once and reuses it across the run's requests; a rotated
+// run gets a fresh one.
+func TestTraceSessionIDMintedPerRun(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mgr, _ := newTestManager(t, mock, time.Hour)
+
+	run, err := mgr.Acquire(context.Background(), agentA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.TraceSessionID == "" {
+		t.Fatal("TraceSessionID empty, want minted UUID per run")
+	}
+	first := run.TraceSessionID
+	mgr.Release(run)
+
+	// A second acquire of the same run (no rotation) reuses the same id.
+	run2, err := mgr.Acquire(context.Background(), agentA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run2.TraceSessionID != first {
+		t.Errorf("TraceSessionID = %q after re-acquire, want %q (stable per run)", run2.TraceSessionID, first)
+	}
+	mgr.Release(run2)
+
+	// Force a rotation: age the current run past the rotation interval so
+	// the next acquire rotates it; a fresh run gets a fresh trace id.
+	mgr.mu.Lock()
+	mgr.runs[agentA].StartedAt = time.Now().Add(-2 * time.Hour)
+	mgr.mu.Unlock()
+	run3, err := mgr.Acquire(context.Background(), agentA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run3.TraceSessionID == "" {
+		t.Fatal("TraceSessionID empty after rotation")
+	}
+	if run3.TraceSessionID == first {
+		t.Errorf("TraceSessionID = %q after rotation, want a fresh id", run3.TraceSessionID)
+	}
+	mgr.Release(run3)
+}
+
+// lockedBuffer is a mutex-guarded bytes.Buffer for captureSlogLocked: the
+// deferred finish worker logs asynchronously while the test reads, so the
+// underlying buffer must not be written concurrently with a read.
+type lockedBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (w *lockedBuffer) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.b.Write(p)
+}
+
+func (w *lockedBuffer) String() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.b.String()
+}
+
+// captureSlogLocked swaps the default slog handler for a locked Debug-level
+// recorder and returns a restore func plus a snapshot of everything logged
+// since capture.
+func captureSlogLocked() (restore func(), logged func() string) {
+	buf := &lockedBuffer{}
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	return func() { slog.SetDefault(prev) }, buf.String
+}
+
+// TestRunStartedFinishedLogTraceSessionID verifies T3: the run's
+// trace_session_id (the value threaded into codebuff_metadata) appears on
+// BOTH "runs: run started" and "runs: run finished" with the same value.
+func TestRunStartedFinishedLogTraceSessionID(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mgr, _ := newTestManager(t, mock, 40*time.Millisecond)
+
+	restore, logged := captureSlogLocked()
+	defer restore()
+
+	first, err := mgr.Acquire(context.Background(), agentA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mgr.Release(first)
+	// Let the run age past the rotation interval: the next acquire rotates
+	// it away and FINISHes it asynchronously through the deferred queue.
+	time.Sleep(60 * time.Millisecond)
+	second, err := mgr.Acquire(context.Background(), agentA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mgr.Release(second)
+
+	startedRe := regexp.MustCompile(`runs: run started[^\n]*trace_session_id=([0-9a-f-]+)`)
+	started := startedRe.FindStringSubmatch(logged())
+	if started == nil {
+		t.Fatalf("no run started line with trace_session_id:\n%s", logged())
+	}
+
+	eventually(t, "run finished line", func() bool {
+		return strings.Contains(logged(), "runs: run finished")
+	})
+	finishedRe := regexp.MustCompile(`runs: run finished[^\n]*trace_session_id=([0-9a-f-]+)`)
+	finished := finishedRe.FindStringSubmatch(logged())
+	if finished == nil {
+		t.Fatalf("run finished line missing trace_session_id:\n%s", logged())
+	}
+	if finished[1] != started[1] {
+		t.Errorf("run finished trace_session_id = %q, want the run started value %q", finished[1], started[1])
+	}
+}
+
+// ── Wave 3 W3-A (T14): runs lifecycle telemetry ──────────────────────────
+
+// TestRunFinishedLogCarriesLifecycleAttrs verifies W3-A T14: the "runs: run
+// finished" record carries duration_ms (run lifetime), steps (the run's
+// in-memory recorded step count), and termination ("finish" via the FINISH
+// queue), alongside the existing run_id/requests/trace_session_id fields.
+func TestRunFinishedLogCarriesLifecycleAttrs(t *testing.T) {
+	testutil.UnsetConfigEnv(t)
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mgr, _ := newTestManager(t, mock, 40*time.Millisecond)
+
+	restore, logged := captureSlogLocked()
+	defer restore()
+
+	first, err := mgr.Acquire(context.Background(), agentA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mgr.RecordStep(first, "chatcmpl-1")
+	mgr.RecordStep(first, "chatcmpl-2")
+	mgr.Release(first)
+	// Let the run age past the rotation interval: the next acquire rotates
+	// it away and FINISHes it asynchronously through the deferred queue.
+	time.Sleep(60 * time.Millisecond)
+	second, err := mgr.Acquire(context.Background(), agentA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mgr.Release(second)
+
+	eventually(t, "run finished record", func() bool {
+		return strings.Contains(logged(), "runs: run finished")
+	})
+
+	re := regexp.MustCompile(`runs: run finished[^\n]*duration_ms=([0-9]+) steps=([0-9]+) termination=([a-z]+)`)
+	m := re.FindStringSubmatch(logged())
+	if m == nil {
+		t.Fatalf("run finished record missing lifecycle attrs:\n%s", logged())
+	}
+	if m[3] != "finish" {
+		t.Errorf("termination = %q, want finish (FINISH queue path)", m[3])
+	}
+	if m[2] != "2" {
+		t.Errorf("steps = %s, want 2 (recorded before rotation)", m[2])
+	}
+	duration, err := strconv.Atoi(m[1])
+	if err != nil || duration < 0 {
+		t.Errorf("duration_ms = %q, want a non-negative integer", m[1])
+	}
+}
+
+// TestRunFinishedDropLogsTermination verifies W3-A T14's drop arm: a
+// draining run force-dropped without FINISH (DrainTTL, issue #55) emits the
+// same "runs: run finished" record with termination=drop, while the existing
+// TTL-expired warn keeps its run_id/agent_id/age fields unchanged.
+func TestRunFinishedDropLogsTermination(t *testing.T) {
+	testutil.UnsetConfigEnv(t)
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mgr, _ := newTestManagerOpts(t, mock, Options{
+		RotationInterval: time.Hour,
+		DrainTTL:         50 * time.Millisecond,
+	})
+
+	run, err := mgr.Acquire(context.Background(), agentA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mgr.RecordStep(run, "chatcmpl-1")
+	mgr.Release(run)
+
+	// Age the run past its draining TTL so Maintain's prune pass drops it
+	// without FINISH (mirrors a persistently failing FINISH, issue #55).
+	mgr.mu.Lock()
+	run.drainedAt = time.Now().Add(-time.Hour)
+	mgr.draining = append(mgr.draining, run)
+	mgr.mu.Unlock()
+
+	restore, logged := captureSlogLocked()
+	defer restore()
+	mgr.Maintain(context.Background())
+
+	out := logged()
+	if !strings.Contains(out, "runs: dropping draining run (TTL expired)") {
+		t.Fatalf("expected TTL-expired drop warn:\n%s", out)
+	}
+	// The existing warn keeps its run_id/agent_id/age fields (unchanged).
+	warnRe := regexp.MustCompile(`runs: dropping draining run \(TTL expired\)[^\n]*run_id=run-0001[^\n]*agent_id=agent-alpha[^\n]*age=`)
+	if !warnRe.MatchString(out) {
+		t.Errorf("TTL-expired warn lost its fields:\n%s", out)
+	}
+	dropRe := regexp.MustCompile(`runs: run finished[^\n]*duration_ms=[0-9]+ steps=([0-9]+) termination=drop`)
+	m := dropRe.FindStringSubmatch(out)
+	if m == nil {
+		t.Fatalf("no run finished drop record:\n%s", out)
+	}
+	if m[1] != "1" {
+		t.Errorf("dropped run steps = %s, want 1", m[1])
+	}
+	// Dropped without FINISH: nothing may have reached the upstream.
+	if got := len(nonChildFinished(mock)); got != 0 {
+		t.Errorf("dropped run must not be FINISHed upstream, got %d finished runs", got)
+	}
+}
+
+// TestShutdownAbandonWarnLogsFields verifies W3-A T14: the shutdown drain
+// abandoning WARN logs pending_jobs/runs/key instead of the whole manager
+// struct (a *RunManager dump would leak internal state to the log).
+func TestShutdownAbandonWarnLogsFields(t *testing.T) {
+	testutil.UnsetConfigEnv(t)
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mock.SetFinishDelay(250 * time.Millisecond)
+	// The rotation sequence STARTs four runs (two per agent); the default
+	// pool holds three ids.
+	mock.RunIDs = append([]string{"run-0001", "run-0002", "run-0003", "run-0004", "run-0005"}, mock.RunIDs...)
+	mgr, _ := newTestManager(t, mock, 40*time.Millisecond)
+
+	// Rotate both agents so the worker is mid-FINISH (slow mock) with a
+	// second FINISH queued when Shutdown's deadline expires.
+	first, err := mgr.Acquire(context.Background(), agentA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mgr.Release(first)
+	time.Sleep(60 * time.Millisecond)
+	second, err := mgr.Acquire(context.Background(), agentA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mgr.Release(second)
+	time.Sleep(60 * time.Millisecond)
+	b1, err := mgr.Acquire(context.Background(), agentB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mgr.Release(b1)
+	time.Sleep(60 * time.Millisecond)
+	b2, err := mgr.Acquire(context.Background(), agentB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mgr.Release(b2)
+
+	// The worker is mid-FINISH (250ms slow mock) when Shutdown abandons,
+	// so at least the second rotation's job must still be queued; the
+	// logged values must match what the queue/runs hold at that moment.
+	mgr.mu.Lock()
+	wantPending := len(mgr.finishQueue)
+	wantRuns := len(mgr.runs)
+	mgr.mu.Unlock()
+	if wantPending < 1 {
+		t.Fatalf("setup: queued finish jobs = %d, want >= 1 (worker must be busy)", wantPending)
+	}
+
+	restore, logged := captureSlogLocked()
+	defer restore()
+	expired, cancel := context.WithCancel(context.Background())
+	cancel()
+	mgr.Shutdown(expired)
+
+	out := logged()
+	re := regexp.MustCompile(`runs: finish-queue drain exceeded shutdown deadline; abandoning remaining jobs[^\n]*pending_jobs=([0-9]+) runs=([0-9]+) key=([0-9a-f]+)`)
+	m := re.FindStringSubmatch(out)
+	if m == nil {
+		t.Fatalf("abandon warn missing pending_jobs/runs/key:\n%s", out)
+	}
+	if m[1] != fmt.Sprint(wantPending) || m[2] != fmt.Sprint(wantRuns) {
+		t.Errorf("abandon warn pending_jobs/runs = %s/%s, want %d/%d", m[1], m[2], wantPending, wantRuns)
+	}
+	if m[3] == "" {
+		t.Error("abandon warn key empty")
+	}
+	if strings.Contains(out, "manager=") {
+		t.Error("abandon warn leaked the manager struct (manager= attr present)")
+	}
+
+	// The worker must still drain and exit so no goroutine outlives the
+	// mock server.
+	select {
+	case <-mgr.finishExited:
+	case <-time.After(3 * time.Second):
+		t.Fatal("finish worker did not exit after shutdown abandon")
 	}
 }

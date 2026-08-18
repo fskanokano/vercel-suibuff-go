@@ -449,20 +449,20 @@ func TestMetricsEmptyPool(t *testing.T) {
 	}
 }
 
-// TestAuthSchemeCaseSensitive pins the Authorization scheme check: only the
-// exact "Bearer " prefix is recognized, so a lowercase "bearer " falls
-// through to the (absent) x-api-key and is rejected with 401 — and an empty
-// Bearer value is also rejected.
-func TestAuthSchemeCaseSensitive(t *testing.T) {
+// TestAuthSchemeCaseInsensitive pins the Authorization scheme check: case-insensitive
+// "Bearer " / "bearer " / "BEARER " prefix is recognized (RFC 7235 / RFC 6750),
+// while an empty value or missing space is rejected with 401.
+func TestAuthSchemeCaseInsensitive(t *testing.T) {
 	mock := testutil.NewMock()
 	defer mock.Close()
 	ts, _ := newTestServer(t, []string{"sk-test"}, mock)
 	chatURL := ts.URL + "/v1/chat/completions"
 
 	for _, hdr := range []map[string]string{
-		{"Authorization": "bearer sk-test"}, // lowercase scheme
-		{"Authorization": "Bearer "},        // empty value
-		{"Authorization": "Bearer"},         // no space after scheme
+		{"Authorization": "Bearer "}, // empty value
+		{"Authorization": "bearer "}, // lowercase empty value
+		{"Authorization": "Bearer"},  // no space after scheme
+		{"Authorization": "Basic sk-test"},
 	} {
 		resp, data := doJSON(t, http.MethodPost, chatURL, chatBody(modelA), hdr)
 		if resp.StatusCode != http.StatusUnauthorized {
@@ -470,10 +470,17 @@ func TestAuthSchemeCaseSensitive(t *testing.T) {
 		}
 	}
 
-	// The exact scheme + value still passes.
-	resp, data := doJSON(t, http.MethodPost, chatURL, chatBody(modelA), map[string]string{"Authorization": "Bearer sk-test"})
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("exact Bearer status = %d, want 200: %s", resp.StatusCode, data)
+	// Case variations of Bearer scheme + value pass.
+	for _, hdr := range []map[string]string{
+		{"Authorization": "Bearer sk-test"},
+		{"Authorization": "bearer sk-test"},
+		{"Authorization": "BEARER sk-test"},
+		{"Authorization": "bEaReR sk-test"},
+	} {
+		resp, data := doJSON(t, http.MethodPost, chatURL, chatBody(modelA), hdr)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("scheme %v status = %d, want 200: %s", hdr, resp.StatusCode, data)
+		}
 	}
 }
 
@@ -533,13 +540,16 @@ func TestChatCountryBlockCooldown(t *testing.T) {
 }
 
 // TestBridgeChatSessionInvalidBoundedRetry pins the bridge-path recovery
-// budget: a session_superseded chat error recreates the session once and
+// budget: a session-invalid chat error recreates the session once and
 // retries, then fails with 502 — never an unbounded recreate loop.
+// session_superseded is its OWN terminal sentinel (see
+// TestBridgeChatSessionSupersededTerminal) — this test uses session_expired
+// to pin the invalidate+reacquire-once budget for ErrSessionInvalid.
 func TestBridgeChatSessionInvalidBoundedRetry(t *testing.T) {
 	mock := testutil.NewMock()
 	defer mock.Close()
 	mock.ChatStatus = http.StatusBadRequest
-	mock.ChatErrorBody = `{"error":{"message":"session_superseded"}}`
+	mock.ChatErrorBody = `{"error":{"message":"session_expired"}}`
 	ts, _ := newBridgeTestServer(t, mock)
 
 	resp, data := doJSON(t, http.MethodPost, ts.URL+"/v1/chat/completions", chatBody(modelA),
@@ -555,6 +565,75 @@ func TestBridgeChatSessionInvalidBoundedRetry(t *testing.T) {
 	}
 	if got := mock.SessionCreates; got != 2 {
 		t.Errorf("upstream session creates = %d, want exactly 2 (session recreated once)", got)
+	}
+}
+
+// TestBridgeChatSessionSupersededRetries pins #119 on the bridge path: 409
+// session_superseded retries once — the cached session is dropped and a fresh
+// session is acquired for the retry. This avoids the 30s model lock 9router
+// applies on a 503 response. Two chat attempts, two session creates, success
+// on the retry.
+func TestBridgeChatSessionSupersededRetries(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	// First chat attempt returns session_superseded, second succeeds.
+	callCount := 0
+	originalHandler := mock.ChatHandler
+	mock.ChatHandler = func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		if callCount == 1 {
+			// First call: session_superseded
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":{"message":"session_superseded"}}`))
+			return
+		}
+		// Second call: success
+		if originalHandler != nil {
+			originalHandler(w, r)
+		} else {
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte("data: " + chunk("cmpl-test", 1234567890, `"choices":[{"delta":{"content":"ok"},"index":0}]`) + "\n\n"))
+			_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		}
+	}
+	ts, _ := newBridgeTestServer(t, mock)
+
+	resp, data := doJSON(t, http.MethodPost, ts.URL+"/v1/chat/completions", chatBody(modelA),
+		map[string]string{"Authorization": "Bearer client-tok-ss"})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", resp.StatusCode, data)
+	}
+	if got := len(mock.RecordedChatHeaders); got != 2 {
+		t.Errorf("upstream chat attempts = %d, want exactly 2 (retry on superseded)", got)
+	}
+	if got := mock.SessionCreates; got != 2 {
+		t.Errorf("session creates = %d, want exactly 2 (invalidated + re-acquired)", got)
+	}
+}
+
+// TestBridgeChatSessionSupersededBoundedRetry pins #119 on the bridge path:
+// when the retry ALSO fails on session_superseded, the attempt budget caps at
+// 2 attempts and surfaces 503 session_superseded.
+func TestBridgeChatSessionSupersededBoundedRetry(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mock.ChatStatus = http.StatusBadRequest
+	mock.ChatErrorBody = `{"error":{"message":"session_superseded"}}`
+	ts, _ := newBridgeTestServer(t, mock)
+
+	resp, data := doJSON(t, http.MethodPost, ts.URL+"/v1/chat/completions", chatBody(modelA),
+		map[string]string{"Authorization": "Bearer client-tok-ss"})
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503: %s", resp.StatusCode, data)
+	}
+	if !strings.Contains(string(data), "session_superseded") {
+		t.Errorf("body missing session_superseded: %s", data)
+	}
+	if got := len(mock.RecordedChatHeaders); got != 2 {
+		t.Errorf("upstream chat attempts = %d, want exactly 2 (bounded retry on superseded)", got)
+	}
+	if got := mock.SessionCreates; got != 2 {
+		t.Errorf("session creates = %d, want exactly 2 (invalidated + re-acquired once)", got)
 	}
 }
 

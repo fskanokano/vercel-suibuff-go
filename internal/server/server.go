@@ -34,20 +34,26 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"freebuff-proxy/internal/config"
 	"freebuff-proxy/internal/convert"
 	"freebuff-proxy/internal/dashboard"
 	"freebuff-proxy/internal/logring"
+	"freebuff-proxy/internal/phasetiming"
 	"freebuff-proxy/internal/pool"
+	"freebuff-proxy/internal/ratelimit"
 	"freebuff-proxy/internal/registry"
 	"freebuff-proxy/internal/runs"
 	"freebuff-proxy/internal/session"
+	"freebuff-proxy/internal/tokenestimate"
+	"freebuff-proxy/internal/updatecheck"
 	"freebuff-proxy/internal/upstream"
 )
 
@@ -68,6 +74,10 @@ type Server struct {
 	logger  *slog.Logger
 	started time.Time
 
+	// logs is the optional dashboard log viewer ring (nil = disabled); its
+	// Counts feed freebuff_proxy_log_events_total on /metrics.
+	logs *logring.Handler
+
 	// dash is the embedded admin UI (htmx + vendored assets).
 	dash *dashboard.Dashboard
 	// adminAuth guards the dashboard: a stateless HMAC-signed session cookie
@@ -79,21 +89,96 @@ type Server struct {
 	// configPath is the -config JSON path ("" when none); reloads re-apply it
 	// so JSON overrides survive dashboard saves and /admin/reload.
 	configPath string
+
+	// version is the running release tag (""/dev for dev builds); the
+	// dashboard badge compares it against the latest GitHub release (#50b).
+	// updates is the cached latest-release checker (nil = no badge).
+	version string
+	updates *updatecheck.Checker
+
+	// authClient drives the headless OAuth login wizard (issue #62): a
+	// token-less upstream client whose transport/stealth wiring matches the
+	// pooled clients. nil disables the wizard endpoints with 503.
+	authClient *upstream.Client
+	// tokenEstimator counts tokens locally for /v1/messages/count_tokens
+	// (nil only if the embedded codec failed to initialize at startup).
+	tokenEstimator *tokenestimate.Estimator
+	// loginFlows is the in-flight login-flow registry keyed by flow id
+	// (fingerprint): start POSTs /api/auth/cli/code, status polls it until
+	// the authToken lands (then AddToken + persist).
+	loginMu    sync.Mutex
+	loginFlows map[string]*loginFlow
+	// rateLimiter caps client request rates per source IP (issue #137).
+	rateLimiter *ratelimit.Limiter
+	// rateLimitRejections tracks total client requests rejected by local rate limiter.
+	rateLimitRejections atomic.Int64
 }
+
+// loginFlow is one in-flight headless login (issue #62).
+type loginFlow struct {
+	ID         string // short flow id shown to the client (fingerprint prefix)
+	Code       *upstream.CLILoginCode
+	Started    time.Time
+	Done       bool
+	Completing bool // one status poll is mid-completion (guards double-add)
+	Token      string
+	Error      string
+	Index      int // pooled token index after AddToken (0 when bridge)
+}
+
+// loginFlowTTL drops stale flows (never completed; browser closed).
+const loginFlowTTL = 10 * time.Minute
+
+// WithVersion wires the running release tag + update checker for the
+// dashboard badge (issue #50b). A nil checker disables the badge.
+func WithVersion(version string, updates *updatecheck.Checker) Option {
+	return func(s *Server) {
+		s.version = version
+		s.updates = updates
+	}
+}
+
+// WithLoginClient wires the token-less upstream client that drives the
+// headless OAuth login wizard (issue #62). A nil client disables the
+// wizard endpoints with 503.
+func WithLoginClient(c *upstream.Client) Option {
+	return func(s *Server) {
+		s.authClient = c
+	}
+}
+
+// Option configures optional server features (release-version badge).
+type Option func(*Server)
 
 // New builds the server over the configured pool and registry. A nil logger
 // falls back to slog.Default(). The started timestamp pins /v1/models
 // "created" and /healthz uptime. logs is the optional dashboard log viewer
 // ring (nil disables the /admin/logs page data). configPath is the -config
 // JSON path the process was started with ("" = none), used by reloads so a
-// dashboard save or /admin/reload re-applies the JSON overrides.
-func New(cfg *config.Config, p *pool.Pool, reg *registry.Registry, logger *slog.Logger, logs *logring.Handler, configPath string) *Server {
+// dashboard save or /admin/reload re-applies the JSON overrides. opts
+// configure optional features (release-version badge, login wizard client).
+func New(cfg *config.Config, p *pool.Pool, reg *registry.Registry, logger *slog.Logger, logs *logring.Handler, configPath string, opts ...Option) *Server {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	s := &Server{pool: p, reg: reg, logger: logger, started: time.Now(), configPath: configPath}
+	s := &Server{pool: p, reg: reg, logger: logger, started: time.Now(), configPath: configPath, loginFlows: make(map[string]*loginFlow), logs: logs}
 	s.cfg.Store(cfg)
-	s.dash = dashboard.New(func() *config.Config { return s.cfg.Load() }, p, reg, logger, logs)
+	s.rateLimiter = ratelimit.New(cfg.RateLimitPerIP, cfg.RateLimitBurst, 10000)
+	// The token estimator shares one o200k_base codec process-wide, so
+	// count_tokens requests never rebuild the vocabulary.
+	est, err := tokenestimate.New()
+	if err != nil {
+		logger.Warn("token estimator unavailable; /v1/messages/count_tokens will fail", "err", err)
+	}
+	s.tokenEstimator = est
+	for _, opt := range opts {
+		opt(s)
+	}
+	dashOpts := []dashboard.Option{}
+	if s.version != "" {
+		dashOpts = append(dashOpts, dashboard.WithVersion(s.version, s.updates))
+	}
+	s.dash = dashboard.New(func() *config.Config { return s.cfg.Load() }, p, reg, logger, logs, dashOpts...)
 	s.adminAuth = newAdminAuth()
 	return s
 }
@@ -103,6 +188,10 @@ func New(cfg *config.Config, p *pool.Pool, reg *registry.Registry, logger *slog.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/chat/completions", s.requireAuth(s.handleChat))
+	mux.HandleFunc("POST /v1/responses", s.requireAuth(s.handleResponses))
+	mux.HandleFunc("POST /v1/messages", s.requireAuth(s.handleMessages))
+	mux.HandleFunc("POST /v1/messages/count_tokens", s.requireAuth(s.handleMessagesCountTokens))
+	mux.HandleFunc("POST /v1/embeddings", s.requireAuth(s.handleEmbeddings))
 	mux.HandleFunc("GET /v1/models", s.requireAuth(s.handleModels))
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
 	mux.HandleFunc("GET /metrics", s.handleMetrics)
@@ -114,12 +203,21 @@ func (s *Server) Handler() http.Handler {
 	// Config (read + write) and logs expose secrets and are gated further:
 	// with ADMIN_TOKEN unset they require a loopback client.
 	mux.HandleFunc("GET /admin/login", s.handleAdminLogin)
-	mux.HandleFunc("POST /admin/login", s.handleAdminLogin)
+	// POST /admin/login consumes the per-IP login-attempt budget, so it must
+	// carry the same CSRF gate as the other mutating admin routes: without it
+	// a malicious page could fire cross-origin POSTs with wrong tokens and
+	// lock the victim out of the dashboard (5 fails → 1-minute lockout,
+	// repeatable). GET stays unwrapped — it just renders the login page.
+	mux.HandleFunc("POST /admin/login", s.adminCSRF(http.HandlerFunc(s.handleAdminLogin)))
 	mux.Handle("GET /admin", s.dashboardAuth(s.dash.Page("overview")))
 	mux.Handle("GET /admin/tokens", s.dashboardAuth(s.dash.Page("tokens")))
 	mux.Handle("GET /admin/models", s.dashboardAuth(s.dash.Page("models")))
 	mux.Handle("GET /admin/traces", s.dashboardAuth(s.dash.Page("traces")))
 	mux.Handle("GET /admin/setup", s.dashboardAuth(s.dash.Page("setup")))
+	mux.Handle("GET /admin/playground", s.dashboardAuth(s.dash.Page("playground")))
+	mux.Handle("POST /admin/playground/chat", s.dashboardAuth(s.adminSensitive(s.adminCSRF(http.HandlerFunc(s.handlePlaygroundChat)))))
+	mux.Handle("POST /admin/login/start", s.dashboardAuth(s.adminSensitive(s.adminCSRF(http.HandlerFunc(s.handleLoginStart)))))
+	mux.Handle("GET /admin/login/status", s.dashboardAuth(s.adminSensitive(http.HandlerFunc(s.handleLoginStatus))))
 	mux.Handle("GET /admin/config", s.dashboardAuth(s.adminSensitive(s.dash.Page("config"))))
 	mux.Handle("GET /admin/logs", s.dashboardAuth(s.adminSensitive(s.dash.Page("logs"))))
 	mux.Handle("GET /admin/metrics", s.dashboardAuth(s.dash.Page("metrics")))
@@ -137,17 +235,127 @@ func (s *Server) Handler() http.Handler {
 	// the strip the path is "" and a trailing-slash directory request would
 	// slip past the guard into FileServerFS, which renders a listing.
 	mux.Handle("GET /admin/assets/", noDirListing(http.StripPrefix("/admin/assets/", http.FileServerFS(mustSubFS(dashboard.AssetsFS(), "assets")))))
+	// CORS middleware wraps the whole route table: it answers OPTIONS
+	// preflights on the /v1/* API surface with 204 and stamps the allow
+	// headers on every /v1/* response. Admin routes are intentionally left
+	// untouched (cookie-authenticated dashboard; SameSite=Strict already
+	// blocks cross-site reads, and an allow-origin would add nothing there).
+	cors := s.corsMiddleware(mux)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
+		// D1: mint the request's correlation id exactly once here, then
+		// carry it in the request context so every downstream log line
+		// (chat routing/done/trace, request failed, upstream do/retry)
+		// shares it. Handlers reached without this wrapper (direct calls
+		// in tests) mint a fallback id in chatCore.
+		reqID := newReqID()
+		r = r.WithContext(context.WithValue(r.Context(), reqIDKey{}, reqID))
 		sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
-		mux.ServeHTTP(sw, r)
-		s.logger.Info("access",
+		cors.ServeHTTP(sw, r)
+		attrs := []any{
+			"req_id", reqID,
 			"method", r.Method,
 			"path", r.URL.Path,
 			"status", sw.status,
 			"ms", time.Since(start).Milliseconds(),
 			"remote", remoteHost(r),
-		)
+		}
+		// The client's X-Request-Id is preserved as a separate
+		// client_request_id field (never trusted as the correlation key).
+		if crid := clientRequestID(r); crid != "" {
+			attrs = append(attrs, "client_request_id", crid)
+		}
+		// T17: LOG_ACCESS=false disables access lines entirely. Quiet
+		// endpoints (/healthz, /metrics, OPTIONS preflights) are
+		// rate-limited to one access line per path per accessQuietWindow so
+		// a poller or browser preflight does not flood the log; every other
+		// path keeps one line per request. req_id/client_request_id survive
+		// in both cases.
+		if !s.cfg.Load().LogAccess {
+			return
+		}
+		if quietAccessPath(r.Method, r.URL.Path) && !accessLogDue(r.URL.Path, start) {
+			return
+		}
+		s.logger.Info("access", attrs...)
+	})
+}
+
+// quietAccessPath reports whether path is a poll/fire-and-forget endpoint
+// whose access lines are rate-limited (T17): /healthz, /metrics, and CORS
+// OPTIONS preflights. Every other path logs one access line per request.
+func quietAccessPath(method, path string) bool {
+	return path == "/healthz" || path == "/metrics" || method == http.MethodOptions
+}
+
+// accessQuietWindow is the quiet-endpoint access gate window: at most one
+// access line per path per window (T17). A var so tests can shrink it.
+var accessQuietWindow = 60 * time.Second
+
+// accessLogGate is the per-process quiet-path access gate: map[path]lastLog
+// plus a mutex (T17). The path set is bounded by the route table, so no
+// cleanup is needed.
+var accessLogGate = struct {
+	mu       sync.Mutex
+	lastSeen map[string]time.Time
+}{lastSeen: make(map[string]time.Time)}
+
+// accessLogDue reports whether an access line may fire for path now,
+// recording the current attempt. The first request for a path and any
+// request at least accessQuietWindow after the last line fire; requests
+// inside the window are suppressed.
+func accessLogDue(path string, now time.Time) bool {
+	accessLogGate.mu.Lock()
+	defer accessLogGate.mu.Unlock()
+	last, ok := accessLogGate.lastSeen[path]
+	if !ok || now.Sub(last) >= accessQuietWindow {
+		accessLogGate.lastSeen[path] = now
+		return true
+	}
+	return false
+}
+
+// resetAccessLogGate clears the quiet-path access gate (test hook).
+func resetAccessLogGate() {
+	accessLogGate.mu.Lock()
+	defer accessLogGate.mu.Unlock()
+	clear(accessLogGate.lastSeen)
+}
+
+// corsOrigin returns the configured Access-Control-Allow-Origin, treating an
+// empty value as the "*" default (an empty .env line must not disable CORS).
+func (s *Server) corsOrigin() string {
+	origin := strings.TrimSpace(s.cfg.Load().CORSAllowedOrigin)
+	if origin == "" {
+		return "*"
+	}
+	return origin
+}
+
+// corsMiddleware answers CORS preflights on the /v1/* API surface and stamps
+// the allow headers on /v1/* responses. An OPTIONS request for any /v1/*
+// path is answered with 204 before the route table sees it (so unknown
+// /v1/* subpaths still get a clean preflight, matching the reference
+// proxy-freebuff OPTIONS → 204). Admin routes pass through untouched.
+func (s *Server) corsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/v1/") {
+			h := w.Header()
+			origin := s.corsOrigin()
+			h.Set("Access-Control-Allow-Origin", origin)
+			// When the origin is pinned (not "*"), vary on Origin so caches
+			// never serve the pinned header to a different requester.
+			if origin != "*" {
+				h.Add("Vary", "Origin")
+			}
+			h.Set("Access-Control-Allow-Headers", "Content-Type, Authorization, x-api-key, anthropic-version")
+			h.Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
+			if r.Method == http.MethodOptions {
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+		}
+		next.ServeHTTP(w, r)
 	})
 }
 
@@ -250,14 +458,25 @@ func (s *Server) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+// extractBearerToken extracts the token from an Authorization header if it has
+// a case-insensitive "Bearer " prefix (per RFC 7235 / RFC 6750). Returns the
+// trimmed token and true if the prefix matches, or ("", false) otherwise.
+func extractBearerToken(authHeader string) (string, bool) {
+	authHeader = strings.TrimSpace(authHeader)
+	if len(authHeader) >= 7 && strings.EqualFold(authHeader[:7], "bearer ") {
+		return strings.TrimSpace(authHeader[7:]), true
+	}
+	return "", false
+}
+
 // authorized reports whether the request carries a configured API key,
 // either as "Authorization: Bearer <key>" or "x-api-key: <key>". Comparison
 // is constant-time against every configured key.
 func (s *Server) authorized(r *http.Request) bool {
 	cfg := s.cfg.Load()
 	provided := ""
-	if h := r.Header.Get("Authorization"); strings.HasPrefix(h, "Bearer ") {
-		provided = strings.TrimPrefix(h, "Bearer ")
+	if tok, ok := extractBearerToken(r.Header.Get("Authorization")); ok {
+		provided = tok
 	} else if h := r.Header.Get("x-api-key"); h != "" {
 		provided = h
 	}
@@ -285,8 +504,8 @@ func (s *Server) requireAdminToken(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 		provided := ""
-		if h := r.Header.Get("Authorization"); strings.HasPrefix(h, "Bearer ") {
-			provided = strings.TrimSpace(strings.TrimPrefix(h, "Bearer "))
+		if tok, ok := extractBearerToken(r.Header.Get("Authorization")); ok {
+			provided = tok
 		}
 		if provided == "" || subtle.ConstantTimeCompare([]byte(provided), []byte(cfg.AdminToken)) != 1 {
 			s.writeJSONError(w, http.StatusUnauthorized,
@@ -434,6 +653,18 @@ func (a *adminAuth) clearFails(ip string) {
 	delete(a.fails, ip)
 }
 
+// loginFailState snapshots the failure entry for ip: the current attempt
+// count and whether ip is locked out (T15 audit trail).
+func (a *adminAuth) loginFailState(ip string) (attempts int, locked bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	e, ok := a.fails[ip]
+	if !ok {
+		return 0, false
+	}
+	return e.count, !e.until.IsZero() && time.Now().Before(e.until)
+}
+
 // dashboardAuth guards the browser UI. With ADMIN_TOKEN unset the dashboard
 // is open (legacy behavior, matching /admin/reload; main.go warns at startup).
 // Otherwise the request must carry a valid fb_admin cookie; missing/invalid
@@ -463,11 +694,14 @@ func (s *Server) dashboardAuth(next http.Handler) http.Handler {
 // logs) in the default-open mode: when ADMIN_TOKEN is unset, only loopback
 // clients may access them, so a remotely reachable proxy cannot leak or let
 // anyone rewrite the .env. With ADMIN_TOKEN set the cookie gate already ran
-// (this middleware is wrapped inside dashboardAuth).
+// (this middleware is wrapped inside dashboardAuth). The Host header must
+// also be loopback-named: a DNS-rebinding page (attacker.com → 127.0.0.1)
+// arrives from a loopback RemoteAddr while its Host stays attacker-owned,
+// which would otherwise defeat the gate (SEC-2).
 func (s *Server) adminSensitive(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		cfg := s.cfg.Load()
-		if cfg.AdminToken == "" && !isLoopback(r) {
+		if cfg.AdminToken == "" && (!isLoopback(r) || !isLoopbackHost(r.Host)) {
 			s.dash.RenderRestricted(w, r, "This page is only available to loopback clients while ADMIN_TOKEN is unset.")
 			return
 		}
@@ -483,6 +717,21 @@ func isLoopback(r *http.Request) bool {
 	}
 	ip := net.ParseIP(host)
 	return ip != nil && ip.IsLoopback()
+}
+
+// isLoopbackHost reports whether the request's Host header names a loopback
+// target (127.0.0.1, ::1, localhost, *.localhost). Used by the open-mode
+// adminSensitive gate to stop DNS-rebinding access.
+func isLoopbackHost(hostport string) bool {
+	host, _, err := net.SplitHostPort(hostport)
+	if err != nil {
+		host = hostport // bare host (no port)
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
+	}
+	h := strings.ToLower(strings.TrimSuffix(host, "."))
+	return h == "localhost" || strings.HasSuffix(h, ".localhost")
 }
 
 // adminCSRF rejects cross-origin mutating admin requests. Browsers send
@@ -532,6 +781,10 @@ func (s *Server) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
 	ip := remoteHost(r)
 	if r.Method == http.MethodPost {
 		if !s.adminAuth.allow(ip) {
+			// T15: audit the lockout rejection — attempts is the lockout
+			// bound that was crossed; the submitted credential is never
+			// logged.
+			s.logger.Warn("admin login failed", "remote", ip, "attempts", maxLoginFails, "reason", "locked_out")
 			s.dash.RenderLogin(w, r, "Too many failed attempts — try again in a minute.")
 			return
 		}
@@ -547,6 +800,13 @@ func (s *Server) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.adminAuth.recordFail(ip)
+		attempts, locked := s.adminAuth.loginFailState(ip)
+		if locked {
+			attempts = maxLoginFails
+		}
+		// T15: audit a failed login — remote, running attempt count, and
+		// reason only; the credential itself is never logged.
+		s.logger.Warn("admin login failed", "remote", ip, "attempts", attempts, "reason", "invalid_token")
 		s.dash.RenderLogin(w, r, "Invalid admin token.")
 		return
 	}
@@ -595,11 +855,11 @@ func (s *Server) handleTokenFinish(w http.ResponseWriter, r *http.Request) {
 	s.dash.RenderConfigResult(w, r, true, "Token "+strconv.Itoa(id)+" runs finished.")
 }
 
-// probeModel returns the safest model to probe a token with: the fallback
-// default (deepseek-v4-flash — the model every account gets, incl. limited
-// tier) when it is in the catalog, else the first catalog model. Alphabetical
-// models[0] would otherwise pick anthropic/claude-fable-5, a capacity-gated
-// offer model that makes token tests/smoke fail on most accounts.
+// probeModel returns the safest model to default a smoke test to: the
+// fallback default (deepseek-v4-flash — the model every account gets, incl.
+// limited tier) when it is in the catalog, else the first catalog model.
+// Alphabetical models[0] would otherwise pick anthropic/claude-fable-5, a
+// capacity-gated offer model that makes smoke tests fail on most accounts.
 func probeModel(reg *registry.Registry) string {
 	models := reg.Models()
 	if len(models) == 0 {
@@ -613,57 +873,113 @@ func probeModel(reg *registry.Registry) string {
 	return models[0]
 }
 
-// handleTokenTest probes a token with a real upstream session handshake
-// (create + end) against the fallback model.
+// quotaSummary renders the live per-model session quota from a probe's
+// RateLimitsByModel map (models sorted for determinism), plus the account
+// tier and glmPromo when the response carried them (the
+// x-freebuff-include-unused-rate-limits probe header asks upstream to
+// include the unused limits); "" when the upstream response carried no quota
+// data (compact responses omit it).
+func quotaSummary(st *upstream.SessionState) string {
+	if st == nil || (len(st.RateLimitsByModel) == 0 && st.AccessTier == "" && st.GlmPromo == "") {
+		return ""
+	}
+	var parts []string
+	if st.AccessTier != "" {
+		parts = append(parts, "tier "+st.AccessTier)
+	}
+	models := make([]string, 0, len(st.RateLimitsByModel))
+	for id := range st.RateLimitsByModel {
+		models = append(models, id)
+	}
+	sort.Strings(models)
+	for _, id := range models {
+		q := st.RateLimitsByModel[id]
+		entry := fmt.Sprintf("%s %s/%s", id, strconv.FormatFloat(q.Limit, 'f', -1, 64), strconv.FormatFloat(q.RecentCount, 'f', -1, 64))
+		if q.Period != "" {
+			entry += " " + q.Period
+		}
+		if !q.ResetAt.IsZero() {
+			entry += fmt.Sprintf(", resets %s", q.ResetAt.Format(time.RFC3339))
+		}
+		parts = append(parts, entry)
+	}
+	if st.GlmPromo != "" {
+		parts = append(parts, "glmPromo "+st.GlmPromo)
+	}
+	return "quota: " + strings.Join(parts, "; ")
+}
+
+// handleTokenTest probes a token with a zero-cost upstream GET probe (no
+// session claim, no model needed) and renders the result plus the live
+// per-model quota when the upstream response carries it.
 func (s *Server) handleTokenTest(w http.ResponseWriter, r *http.Request) {
 	id, err := tokenActionID(r)
-	var model string
-	if err == nil {
-		model = probeModel(s.reg)
-		if model == "" {
-			err = errors.New("registry has no models to probe")
-		}
-	}
-	var instanceID string
+	var state *upstream.SessionState
 	if err == nil {
 		ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 		defer cancel()
-		instanceID, err = s.pool.TestToken(ctx, id, model)
+		state, err = s.pool.ProbeToken(ctx, id)
 	}
 	if err != nil {
-		s.logger.Warn("dashboard token test failed", "token", id, "err", err)
+		if errors.Is(err, upstream.ErrNoActiveSession) {
+			s.logger.Info("dashboard token probe ok (no active session)", "token", id)
+			s.dash.RenderConfigResult(w, r, true, "Token "+strconv.Itoa(id)+" OK — zero-cost probe succeeded (no active session).")
+			return
+		}
+		s.logger.Warn("dashboard token probe failed", "token", id, "err", err)
 		s.dash.RenderConfigResult(w, r, false, "Token "+strconv.Itoa(id)+" test failed: "+err.Error())
 		return
 	}
-	s.logger.Info("dashboard token test ok", "token", id, "model", model, "instance", instanceID)
-	s.dash.RenderConfigResult(w, r, true, "Token "+strconv.Itoa(id)+" OK — session handshake succeeded ("+model+").")
+	msg := "Token " + strconv.Itoa(id) + " OK — zero-cost probe succeeded"
+	if q := quotaSummary(state); q != "" {
+		msg += " (" + q + ")"
+	}
+	msg += "."
+	s.logger.Info("dashboard token probe ok", "token", id)
+	s.dash.RenderConfigResult(w, r, true, msg)
 }
 
 // handleTokenTestAll probes every pooled token (dashboard "Test all"). Each
-// token gets a real session handshake with its own timeout; per-token results
-// are rendered as a fragment.
+// probe is a zero-cost upstream GET (no session claim, no model needed);
+// per-token results are rendered as a fragment.
 func (s *Server) handleTokenTestAll(w http.ResponseWriter, r *http.Request) {
-	probeModel := probeModel(s.reg)
 	count := 0
 	for _, snap := range s.pool.PoolSnapshot().Tokens {
 		i := snap.Token
-		if probeModel == "" {
-			break
-		}
 		ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
-		instanceID, err := s.pool.TestToken(ctx, i, probeModel)
+		state, err := s.pool.ProbeToken(ctx, i)
 		cancel()
-		ok := err == nil
+		ok := err == nil || errors.Is(err, upstream.ErrNoActiveSession)
 		msg := "ok"
-		if !ok {
+		switch {
+		case errors.Is(err, upstream.ErrNoActiveSession):
+			msg = "ok (no active session)"
+		case err != nil:
 			msg = err.Error()
+		default:
+			if q := quotaSummary(state); q != "" {
+				msg = "ok (" + q + ")"
+			}
 		}
-		s.dash.RenderTestResult(w, r, i, ok, msg, instanceID)
+		s.dash.RenderTestResult(w, r, i, ok, msg, "")
 		count++
 	}
 	if count == 0 {
 		s.dash.RenderConfigResult(w, r, false, "No tokens to test (bridge mode has no fixed AUTH_TOKENS).")
 	}
+}
+
+// handleEmbeddings answers POST /v1/embeddings with a structured
+// unsupported-endpoint error: the proxy serves chat completions only, and
+// the error body points clients at /v1/chat/completions and the live model
+// list so a picker/fallback client can self-correct. 400 with the
+// documented "unsupported_endpoint" code (distinct from the mux's bare 404,
+// which gives an embeddings client no actionable signal).
+func (s *Server) handleEmbeddings(w http.ResponseWriter, r *http.Request) {
+	s.logger.Warn("unsupported endpoint requested", "path", r.URL.Path, "remote", remoteHost(r), "status", http.StatusBadRequest)
+	s.writeJSONError(w, http.StatusBadRequest,
+		"this proxy serves chat completions only; embeddings are not supported. Use POST /v1/chat/completions with one of: "+strings.Join(s.reg.Models(), ", "),
+		"unsupported_endpoint", "unsupported_endpoint", 0)
 }
 
 // smokeRequest is the dashboard smoke-test payload (a real chat through the
@@ -722,6 +1038,7 @@ func (s *Server) handleSmoke(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
 	defer cancel()
+	ctx, phases := phasetiming.WithContext(ctx)
 
 	cfg := s.cfg.Load()
 	chatBody := []byte(`{"model":` + strconv.Quote(req.Model) + `,"messages":[{"role":"user","content":` + strconv.Quote(req.Prompt) + `}],"stream":false}`)
@@ -729,6 +1046,7 @@ func (s *Server) handleSmoke(w http.ResponseWriter, r *http.Request) {
 
 	var lease *pool.Lease
 	var up io.ReadCloser
+	acquireStart := time.Now()
 	if cfg.BridgeMode() {
 		if req.Token == "" {
 			s.dash.RenderConfigResult(w, r, false, "Bridge mode: include a client token in the smoke request.")
@@ -738,6 +1056,7 @@ func (s *Server) handleSmoke(w http.ResponseWriter, r *http.Request) {
 	} else {
 		lease, err = s.pool.Acquire(ctx, req.Model)
 	}
+	phases.Since(phasetiming.AcquireMS, acquireStart)
 	if err == nil {
 		up, err = s.pool.Chat(ctx, lease, chatOpts, chatBody)
 	}
@@ -745,6 +1064,7 @@ func (s *Server) handleSmoke(w http.ResponseWriter, r *http.Request) {
 		if lease != nil {
 			s.pool.LeaseRelease(lease)
 		}
+		phases.Since(phasetiming.TotalMS, start)
 		s.logger.Warn("dashboard smoke test failed", "model", req.Model, "err", err)
 		s.dash.RenderConfigResult(w, r, false, "Smoke test failed: "+err.Error())
 		return
@@ -753,13 +1073,235 @@ func (s *Server) handleSmoke(w http.ResponseWriter, r *http.Request) {
 	defer func() { _ = up.Close() }()
 
 	// Read a bounded prefix of the SSE stream for the preview.
+	chatStart := time.Now()
 	preview, readErr := readBounded(up, maxSmokeBytes)
+	phases.Since(phasetiming.UpstreamTTFBMS, chatStart)
+	phases.Since(phasetiming.TotalMS, start)
 	ms := time.Since(start).Milliseconds()
 	if readErr != nil {
 		s.dash.RenderConfigResult(w, r, false, "Smoke test: upstream accepted but stream read failed: "+readErr.Error())
 		return
 	}
-	s.dash.RenderSmokeResult(w, r, req.Model, tokenLabel(lease), ms, preview)
+	s.dash.RenderSmokeResult(w, r, req.Model, tokenLabel(lease), ms, preview, dashboard.PhaseList(phases.All()))
+}
+
+// handlePlaygroundChat is the dashboard playground's streaming chat
+// endpoint (issue #45): it routes a {model, prompt} through the exact same
+// /v1/chat/completions pipeline (acquire → upstream → SSE relay) without an
+// API key — dashboard auth + CSRF already ran. The page streams the SSE.
+func (s *Server) handlePlaygroundChat(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		s.writeJSONError(w, http.StatusBadRequest, "failed to read request: "+err.Error(), "invalid_request_error", "invalid_json", 0)
+		return
+	}
+	var req struct {
+		Model  string `json:"model"`
+		Prompt string `json:"prompt"`
+		Stream bool   `json:"stream"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
+		s.writeJSONError(w, http.StatusBadRequest, "request must be a JSON object", "invalid_request_error", "invalid_json", 0)
+		return
+	}
+	req.Model = strings.TrimSpace(req.Model)
+	req.Prompt = strings.TrimSpace(req.Prompt)
+	if req.Model == "" {
+		if m := probeModel(s.reg); m != "" {
+			req.Model = m
+		} else {
+			s.writeJSONError(w, http.StatusBadRequest, "no model specified and no models in the registry", "invalid_request_error", "model_not_found", 0)
+			return
+		}
+	}
+	if req.Prompt == "" {
+		req.Prompt = "ping"
+	}
+	// Build a chat-completions request and run it through the real handler
+	// (streaming forced, exactly like /v1/chat/completions).
+	chatBody := []byte(`{"model":` + strconv.Quote(req.Model) +
+		`,"messages":[{"role":"user","content":` + strconv.Quote(req.Prompt) + `}],"stream":true}`)
+	playReq := r.Clone(r.Context())
+	playReq.Body = io.NopCloser(bytes.NewReader(chatBody))
+	playReq.ContentLength = int64(len(chatBody))
+	s.handleChat(w, playReq)
+}
+
+// handleLoginStart begins the headless OAuth login wizard (issue #62):
+// POST /admin/login/start → the server requests a fresh /api/auth/cli/code
+// from upstream and returns {flow_id, login_url, expires_at} for the page
+// to hand to the user; the page then polls GET /admin/login/status.
+func (s *Server) handleLoginStart(w http.ResponseWriter, r *http.Request) {
+	if s.authClient == nil {
+		s.writeJSONError(w, http.StatusServiceUnavailable, "login wizard disabled (no upstream auth client)", "server_error", "login_unavailable", 0)
+		return
+	}
+	s.pruneLoginFlows()
+	code, err := s.authClient.StartCLILogin(r.Context())
+	if err != nil {
+		s.logger.Warn("login wizard: start failed", "err", err)
+		s.writeJSONError(w, http.StatusBadGateway, "failed to start browser login: "+err.Error(), "server_error", "login_start_failed", 0)
+		return
+	}
+	flowID := shortFlowID(code.FingerprintID)
+	flow := &loginFlow{ID: flowID, Code: code, Started: time.Now()}
+	s.loginMu.Lock()
+	s.loginFlows[code.FingerprintID] = flow
+	s.loginMu.Unlock()
+	s.logger.Info("login wizard: started", "flow", flowID)
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"flow_id":     flowID,
+		"fingerprint": code.FingerprintID, // full id: the status poll key
+		"login_url":   code.LoginURL,
+		"expires_at":  code.ExpiresAt.UTC().Format(time.RFC3339),
+	})
+}
+
+// handleLoginStatus polls an in-flight login (issue #62): the server polls
+// upstream /api/auth/cli/status; when the authToken appears the token is
+// added to the live pool AND persisted to .env (survives restart), like the
+// dashboard "Add token" action.
+func (s *Server) handleLoginStatus(w http.ResponseWriter, r *http.Request) {
+	s.pruneLoginFlows()
+	fp := strings.TrimSpace(r.URL.Query().Get("fingerprint"))
+	if fp == "" {
+		s.writeJSONError(w, http.StatusBadRequest, "missing fingerprint query param", "invalid_request_error", "bad_request", 0)
+		return
+	}
+	s.loginMu.Lock()
+	flow := s.loginFlows[fp]
+	s.loginMu.Unlock()
+	if flow == nil {
+		s.writeJSONError(w, http.StatusNotFound, "login flow not found or expired — start a new one", "invalid_request_error", "login_flow_missing", 0)
+		return
+	}
+	// Read the completion state under the lock: concurrent status polls
+	// (second tab, htmx retry) must not both proceed to addTokenPersist —
+	// the completing flag is set before the network poll so exactly one
+	// goroutine owns the add.
+	s.loginMu.Lock()
+	done := flow.Done
+	completing := flow.Completing
+	flow.Completing = true
+	s.loginMu.Unlock()
+	if done {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"status": "completed", "token_index": flow.Index, "token": flow.Token})
+		return
+	}
+	if completing {
+		// Another poll is mid-completion; report pending so the client
+		// re-polls instead of double-adding.
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"status": "pending"})
+		return
+	}
+	status, err := s.authClient.PollCLILogin(r.Context(), flow.Code)
+	if err != nil {
+		// Transient poll failure: keep the flow alive, report pending. A
+		// later poll may retry completion.
+		s.loginMu.Lock()
+		flow.Completing = false
+		s.loginMu.Unlock()
+		s.logger.Debug("login wizard: poll failed", "flow", flow.ID, "err", err)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"status": "pending"})
+		return
+	}
+	if !status.Done {
+		s.loginMu.Lock()
+		flow.Completing = false
+		s.loginMu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"status": "pending"})
+		return
+	}
+	// Completed: add to the pool + persist to .env (mirrors handleTokenAdd).
+	// All completion fields are written under the lock so a concurrent poll
+	// observing Done reads a consistent record.
+	flow.Done = true
+	flow.Token = status.AuthToken
+	s.loginMu.Lock()
+	s.loginFlows[fp] = flow
+	s.loginMu.Unlock()
+	index, addErr := s.addTokenPersist(r.Context(), status.AuthToken)
+	if addErr != nil {
+		flow.Error = addErr.Error()
+		s.loginMu.Lock()
+		flow.Completing = false
+		s.loginMu.Unlock()
+		s.logger.Warn("login wizard: token persist failed", "flow", flow.ID, "err", addErr)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"status": "error", "message": addErr.Error()})
+		return
+	}
+	flow.Index = index
+	s.logger.Info("login wizard: completed", "flow", flow.ID, "token_index", index, "user", status.User.Name)
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"status": "completed", "token_index": index, "user": status.User.Name})
+}
+
+// addTokenPersist adds token to the live pool and persists the new
+// AUTH_TOKENS list to .env (mirrors handleTokenAdd's mutation + persistence
+// sequence, without the dashboard fragment render).
+func (s *Server) addTokenPersist(ctx context.Context, token string) (int, error) {
+	cfg := s.cfg.Load()
+	existing := cfg.AuthTokens
+	if len(existing) > 0 {
+		idx, err := s.pool.AddToken(token)
+		if err != nil {
+			return 0, fmt.Errorf("add token to pool: %w", err)
+		}
+		// Persist the runtime list (pool may have bridge additions too, but
+		// AUTH_TOKENS is the fixed set — append only when not already there).
+		tokens := append([]string(nil), existing...)
+		seen := false
+		for _, t := range tokens {
+			if t == token {
+				seen = true
+				break
+			}
+		}
+		if !seen {
+			tokens = append(tokens, token)
+		}
+		if err := s.syncTokensAfterMutation(tokens); err != nil {
+			return 0, err
+		}
+		return idx, nil
+	}
+	// Bridge mode (no fixed tokens): the first wizard token switches to
+	// pooled mode, exactly like handleTokenAdd.
+	idx, err := s.pool.AddToken(token)
+	if err != nil {
+		return 0, fmt.Errorf("add token to pool: %w", err)
+	}
+	if err := s.syncTokensAfterMutation([]string{token}); err != nil {
+		return 0, err
+	}
+	return idx, nil
+}
+
+// shortFlowID renders a compact flow id for the UI/logs.
+func shortFlowID(fp string) string {
+	if len(fp) > 12 {
+		return fp[:12]
+	}
+	return fp
+}
+
+// pruneLoginFlows drops flows older than loginFlowTTL.
+func (s *Server) pruneLoginFlows() {
+	cutoff := time.Now().Add(-loginFlowTTL)
+	s.loginMu.Lock()
+	for fp, flow := range s.loginFlows {
+		if flow.Started.Before(cutoff) {
+			delete(s.loginFlows, fp)
+		}
+	}
+	s.loginMu.Unlock()
 }
 
 // readBounded reads up to n bytes from r, tolerating an EOF mid-prefix.
@@ -856,6 +1398,7 @@ func (s *Server) syncTokensAfterMutation(tokens []string) error {
 	s.cfg.Store(&newCfg)
 	s.reg.SetConfig(&newCfg)
 	s.pool.SetConfig(&newCfg)
+	s.rateLimiter.SetRate(newCfg.RateLimitPerIP, newCfg.RateLimitBurst)
 	return nil
 }
 
@@ -909,11 +1452,11 @@ func (s *Server) handleTokenAdd(w http.ResponseWriter, r *http.Request) {
 	tokens := append(append([]string{}, cfg.AuthTokens...), req.Token)
 	if err := s.syncTokensAfterMutation(tokens); err != nil {
 		_ = s.pool.RemoveLastToken()
-		s.logger.Warn("dashboard token add rolled back", "err", err)
+		s.logger.Warn("dashboard token add rolled back", "remote", remoteHost(r), "err", err)
 		s.dash.RenderConfigResult(w, r, false, err.Error())
 		return
 	}
-	s.logger.Info("dashboard token added", "index", idx)
+	s.logger.Info("dashboard token added", "remote", remoteHost(r), "index", idx)
 	s.dash.RenderConfigResult(w, r, true, "Token added at index "+strconv.Itoa(idx)+" and persisted to .env.")
 }
 
@@ -951,14 +1494,14 @@ func (s *Server) handleTokenRemove(w http.ResponseWriter, r *http.Request) {
 		// handleTokenAdd's rollback).
 		if removed != "" {
 			if _, addErr := s.pool.AddToken(removed); addErr != nil {
-				s.logger.Warn("dashboard token remove rollback re-add failed", "err", addErr)
+				s.logger.Warn("dashboard token remove rollback re-add failed", "remote", remoteHost(r), "err", addErr)
 			}
 		}
-		s.logger.Warn("dashboard token remove rolled back", "err", err)
+		s.logger.Warn("dashboard token remove rolled back", "remote", remoteHost(r), "err", err)
 		s.dash.RenderConfigResult(w, r, false, err.Error())
 		return
 	}
-	s.logger.Info("dashboard token removed")
+	s.logger.Info("dashboard token removed", "remote", remoteHost(r))
 	s.dash.RenderConfigResult(w, r, true, "Last token removed and persisted to .env.")
 }
 
@@ -1029,6 +1572,7 @@ func (s *Server) handleModeSwitch(w http.ResponseWriter, r *http.Request) {
 		s.cfg.Store(&newCfg)
 		s.reg.SetConfig(&newCfg)
 		s.pool.SetConfig(&newCfg)
+		s.rateLimiter.SetRate(newCfg.RateLimitPerIP, newCfg.RateLimitBurst)
 		s.pool.RemoveAllTokens(r.Context())
 		s.logger.Info("dashboard switched to bridge mode")
 		s.dash.RenderConfigResult(w, r, true, "Switched to bridge mode — AUTH_TOKENS cleared; clients now send their own token.")
@@ -1063,6 +1607,7 @@ func (s *Server) handleModeSwitch(w http.ResponseWriter, r *http.Request) {
 		s.cfg.Store(&newCfg)
 		s.reg.SetConfig(&newCfg)
 		s.pool.SetConfig(&newCfg)
+		s.rateLimiter.SetRate(newCfg.RateLimitPerIP, newCfg.RateLimitBurst)
 		s.logger.Info("dashboard switched to pooled mode", "auth_tokens", len(newCfg.AuthTokens))
 		s.dash.RenderConfigResult(w, r, true, "Switched to pooled mode — HYBRID_MODE cleared; all requests now use the pool.")
 	case "hybrid":
@@ -1092,6 +1637,7 @@ func (s *Server) handleModeSwitch(w http.ResponseWriter, r *http.Request) {
 		s.cfg.Store(&newCfg)
 		s.reg.SetConfig(&newCfg)
 		s.pool.SetConfig(&newCfg)
+		s.rateLimiter.SetRate(newCfg.RateLimitPerIP, newCfg.RateLimitBurst)
 		msg := "Switched to hybrid mode — clients with a token relay it; token-less requests use the pool."
 		if len(newCfg.AuthTokens) == 0 {
 			msg += " Warning: no AUTH_TOKENS — token-less requests will fail (502) until a token is added."
@@ -1106,13 +1652,17 @@ func (s *Server) handleModeSwitch(w http.ResponseWriter, r *http.Request) {
 }
 
 // restoreEnvFile writes old content back to .env, or removes the file when it
-// did not exist before. Best-effort rollback for failed mode switches.
+// did not exist before. Best-effort rollback for failed mode switches. When
+// the previous .env existed but was unreadable (oldErr not os.ErrNotExist),
+// nothing is done: removing it would destroy the operator's file, and the old
+// bytes needed for a restore were never read.
 func restoreEnvFile(old []byte, oldErr error) {
-	if oldErr != nil {
+	switch {
+	case oldErr == nil:
+		_ = writeFileAtomic(".env", old)
+	case errors.Is(oldErr, os.ErrNotExist):
 		_ = os.Remove(".env")
-		return
 	}
-	_ = writeFileAtomic(".env", old)
 }
 
 // dialTarget returns the host:port to dial for an upstream base host,
@@ -1127,7 +1677,9 @@ func dialTarget(host string) string {
 
 // handleDiag runs the dashboard diagnostics: config state, upstream
 // reachability (DNS + TLS), registry health, and per-token validity probes —
-// the same checks -doctor performs, rendered as a fragment.
+// the same checks -doctor performs, rendered as a fragment. The probes are
+// zero-cost upstream GETs (no session claim, no model needed), so they always
+// run for pooled and hybrid modes.
 func (s *Server) handleDiag(w http.ResponseWriter, r *http.Request) {
 	checks := []dashboard.DiagCheck{}
 
@@ -1141,17 +1693,25 @@ func (s *Server) handleDiag(w http.ResponseWriter, r *http.Request) {
 		checks = append(checks, dashboard.DiagCheck{OK: true, Message: fmt.Sprintf("Configuration: pooled mode, %d token(s)", len(cfg.AuthTokens))})
 	}
 
-	// Upstream reachability: DNS + TLS to the configured base host.
+	// Upstream reachability: DNS + TLS to the configured base host. The DNS
+	// lookup uses the bare host, not u.Host verbatim: "host:8443" would be
+	// treated as a literal DNS name and NXDOMAIN, a false red row (the -doctor
+	// tool strips the port the same way). The display and dial target keep the
+	// port so the TCP row still connects to the real endpoint.
 	targetHost := "www.codebuff.com"
+	dnsHost := targetHost
 	if u, err := url.Parse(cfg.UpstreamBaseURL); err == nil && u.Host != "" {
 		targetHost = u.Host
+		if h := u.Hostname(); h != "" {
+			dnsHost = h
+		}
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
-	if _, err := net.DefaultResolver.LookupHost(ctx, targetHost); err != nil {
-		checks = append(checks, dashboard.DiagCheck{Message: "DNS lookup failed for " + targetHost + ": " + err.Error()})
+	if _, err := net.DefaultResolver.LookupHost(ctx, dnsHost); err != nil {
+		checks = append(checks, dashboard.DiagCheck{Message: "DNS lookup failed for " + dnsHost + ": " + err.Error()})
 	} else {
-		checks = append(checks, dashboard.DiagCheck{OK: true, Message: "DNS resolves " + targetHost})
+		checks = append(checks, dashboard.DiagCheck{OK: true, Message: "DNS resolves " + dnsHost})
 	}
 	hostForDial := dialTarget(targetHost)
 	if conn, err := net.DialTimeout("tcp", hostForDial, 5*time.Second); err != nil {
@@ -1163,22 +1723,27 @@ func (s *Server) handleDiag(w http.ResponseWriter, r *http.Request) {
 
 	checks = append(checks, dashboard.DiagCheck{OK: true, Message: fmt.Sprintf("Model registry: %d models", s.reg.ModelCount())})
 
-	// Per-token validity probes (pooled and hybrid-with-tokens modes).
+	// Per-token validity probes (pooled and hybrid-with-tokens modes). Each
+	// probe is a zero-cost upstream GET /api/v1/freebuff/session (no session
+	// claim, no model needed), so they always run; a token with no active
+	// session still counts as valid.
 	if !cfg.BridgeMode() {
-		probe := probeModel(s.reg)
-		if probe == "" {
-			checks = append(checks, dashboard.DiagCheck{Warn: true, Message: "Cannot probe tokens: registry has no models"})
-		} else {
-			for _, snap := range s.pool.PoolSnapshot().Tokens {
-				idx := snap.Token
-				probeCtx, probeCancel := context.WithTimeout(r.Context(), 8*time.Second)
-				_, err := s.pool.TestToken(probeCtx, idx, probe)
-				probeCancel()
-				if err != nil {
-					checks = append(checks, dashboard.DiagCheck{Message: fmt.Sprintf("Token #%d validity probe failed: %v", idx+1, err)})
-				} else {
-					checks = append(checks, dashboard.DiagCheck{OK: true, Message: fmt.Sprintf("Token #%d validity probe succeeded", idx+1)})
+		for _, snap := range s.pool.PoolSnapshot().Tokens {
+			idx := snap.Token
+			probeCtx, probeCancel := context.WithTimeout(r.Context(), 8*time.Second)
+			state, err := s.pool.ProbeToken(probeCtx, idx)
+			probeCancel()
+			switch {
+			case errors.Is(err, upstream.ErrNoActiveSession):
+				checks = append(checks, dashboard.DiagCheck{OK: true, Message: fmt.Sprintf("Token #%d validity probe succeeded (no active session)", idx+1)})
+			case err != nil:
+				checks = append(checks, dashboard.DiagCheck{Message: fmt.Sprintf("Token #%d validity probe failed: %v", idx+1, err)})
+			default:
+				msg := fmt.Sprintf("Token #%d validity probe succeeded", idx+1)
+				if q := quotaSummary(state); q != "" {
+					msg += " (" + q + ")"
 				}
+				checks = append(checks, dashboard.DiagCheck{OK: true, Message: msg})
 			}
 		}
 	} else {
@@ -1240,21 +1805,112 @@ func (s *Server) handleConfigSave(w http.ResponseWriter, r *http.Request) {
 	}
 	newCfg, err := config.Load(s.configPath)
 	if err != nil {
-		if oldErr == nil {
+		switch {
+		case oldErr == nil:
 			_ = writeFileAtomic(envPath, old)
-		} else {
+		case errors.Is(oldErr, os.ErrNotExist):
+			// The .env did not exist before the save: remove the rejected
+			// write so the state matches.
 			_ = os.Remove(envPath)
+		default:
+			// The previous .env existed but was unreadable (permissions, ACL):
+			// deleting it would destroy the operator's file. Leave the newly
+			// written content and warn — a restore is impossible without the
+			// old bytes.
+			s.logger.Warn("dashboard config save rejected; previous .env unreadable, not restored", "readErr", oldErr, "err", err)
 		}
 		s.logger.Warn("dashboard config save rejected", "err", err)
 		s.dash.RenderConfigResult(w, r, false, "Configuration rejected: "+err.Error())
 		return
 	}
+	oldCfg := s.cfg.Load()
 	s.cfg.Store(&newCfg)
 	s.reg.SetConfig(&newCfg)
 	s.pool.SetConfig(&newCfg)
+	s.rateLimiter.SetRate(newCfg.RateLimitPerIP, newCfg.RateLimitBurst)
 	s.logger.Info("dashboard config saved and reloaded",
+		"remote", remoteHost(r), "changed_keys", changedConfigKeys(oldCfg, &newCfg),
 		"auth_tokens", len(newCfg.AuthTokens), "safe_mode", newCfg.SafeMode)
 	s.dash.RenderConfigResult(w, r, true, "Saved and reloaded — effective configuration updated.")
+}
+
+// effectiveConfigKV renders cfg as a key→normalized-value map of the
+// effective config surface (mirrors the dashboard config editor's effective
+// table, T15). Secret-bearing values are reduced to counts or set/unset
+// markers, so the map is safe to diff for the changed_keys audit log: only
+// key NAMES are ever logged, never values.
+func effectiveConfigKV(cfg *config.Config) map[string]string {
+	return map[string]string{
+		"LISTEN_ADDR":                           cfg.ListenAddr,
+		"UPSTREAM_BASE_URL":                     cfg.UpstreamBaseURL,
+		"AUTH_TOKENS":                           strconv.Itoa(len(cfg.AuthTokens)),
+		"API_KEYS":                              strconv.Itoa(len(cfg.APIKeys)),
+		"ADMIN_TOKEN":                           boolWord(cfg.AdminToken != ""),
+		"ROTATION_INTERVAL":                     cfg.RotationInterval.String(),
+		"REQUEST_TIMEOUT":                       cfg.RequestTimeout.String(),
+		"SESSION_CALL_TIMEOUT":                  cfg.SessionCallTimeout.String(),
+		"COST_MODE":                             cfg.CostMode,
+		"TLS_FINGERPRINT":                       cfg.TLSFingerprint,
+		"REGISTRY_REFRESH":                      cfg.RegistryRefresh.String(),
+		"DEBUG_DUMP":                            strconv.FormatBool(cfg.DebugDump),
+		"LOG_FILE":                              cfg.LogFile,
+		"LOG_LEVEL":                             cfg.LogLevel,
+		"LOG_FORMAT":                            cfg.LogFormat,
+		"LOG_ACCESS":                            strconv.FormatBool(cfg.LogAccess),
+		"LOG_RING_SIZE":                         strconv.Itoa(cfg.LogRingSize),
+		"MAX_MESSAGES_PER_DAY":                  strconv.Itoa(cfg.MaxMessagesPerDay),
+		"MAX_SPEND_PER_DAY":                     strconv.FormatInt(cfg.MaxSpendPerDay, 10),
+		"IDLE_ROTATION_TIMEOUT":                 cfg.IdleRotationTimeout.String(),
+		"SAFE_MODE":                             strconv.FormatBool(cfg.SafeMode),
+		"HYBRID_MODE":                           strconv.FormatBool(cfg.HybridMode),
+		"MODELS_HIDE_UNAVAILABLE":               strconv.FormatBool(cfg.ModelsHideUnavailable),
+		"CORS_ALLOWED_ORIGIN":                   cfg.CORSAllowedOrigin,
+		"REQUEST_JITTER":                        cfg.RequestJitter.String(),
+		"CLI_VERSION":                           cfg.CLIVersion,
+		"MODEL_ALIASES":                         strconv.Itoa(len(cfg.ModelAliases)),
+		"TRANSIENT_RETRIES":                     strconv.Itoa(cfg.TransientRetries),
+		"SESSION_PERSIST":                       strconv.FormatBool(cfg.SessionPersist),
+		"SESSION_STATE_FILE":                    cfg.SessionStateFile,
+		"HTTP2_UPSTREAM":                        strconv.FormatBool(cfg.HTTP2Upstream),
+		"SESSION_CREATE_MAX_PARALLEL_GLOBAL":    strconv.Itoa(cfg.SessionCreateMaxParallelGlobal),
+		"SESSION_CREATE_MAX_PARALLEL_PER_MODEL": strconv.Itoa(cfg.SessionCreateMaxParallelPerModel),
+		"RUN_FINISH_QUEUE_SIZE":                 strconv.Itoa(cfg.RunFinishQueueSize),
+		"RUN_FINISH_INLINE_TIMEOUT":             cfg.RunFinishInlineTimeout.String(),
+		"RUNS_DRAIN_QUEUE_CAP":                  strconv.Itoa(cfg.RunsDrainQueueCap),
+		"RUNS_DRAIN_TTL":                        cfg.RunsDrainTTL.String(),
+		"SESSION_RE_ADMIT_LEAD":                 cfg.SessionReAdmitLead.String(),
+		"SESSION_PROBE_CACHE_TTL":               cfg.SessionProbeCacheTTL.String(),
+		"WEBHOOK_URL":                           boolWord(cfg.WebhookURL != ""),
+		"FALLBACK_AFTER_MS":                     cfg.FallbackAfter.String(),
+		"FALLBACK_MODEL":                        strconv.Itoa(len(cfg.FallbackModels)),
+		"ADOPT_CLI_SESSION":                     strconv.FormatBool(cfg.AdoptCLISession),
+		"WAITING_ROOM_CHAIN":                    strconv.FormatBool(cfg.WaitingRoomChain),
+	}
+}
+
+// boolWord renders a boolean flag as "set"/"unset" for the redacted
+// effective-config table (never the raw value).
+func boolWord(v bool) string {
+	if v {
+		return "set"
+	}
+	return "unset"
+}
+
+// changedConfigKeys returns the sorted names of effective config keys whose
+// normalized value differs between oldCfg and newCfg (T15 audit trail). The
+// values are compared only; never logged.
+func changedConfigKeys(oldCfg, newCfg *config.Config) []string {
+	oldKV := effectiveConfigKV(oldCfg)
+	newKV := effectiveConfigKV(newCfg)
+	var changed []string
+	for k, v := range newKV {
+		if oldKV[k] != v {
+			changed = append(changed, k)
+		}
+	}
+	sort.Strings(changed)
+	return changed
 }
 
 // writeFileAtomic writes data to path via a temp file + rename: readers never
@@ -1301,8 +1957,8 @@ func writeFileAtomic(path string, data []byte) error {
 // this token IS the client's FreeBuff token relayed upstream.
 func clientToken(r *http.Request) string {
 	provided := ""
-	if h := r.Header.Get("Authorization"); strings.HasPrefix(h, "Bearer ") {
-		provided = strings.TrimPrefix(h, "Bearer ")
+	if tok, ok := extractBearerToken(r.Header.Get("Authorization")); ok {
+		provided = tok
 	} else if h := r.Header.Get("x-api-key"); h != "" {
 		provided = h
 	}
@@ -1314,21 +1970,73 @@ func clientToken(r *http.Request) string {
 // FreeBuff token) and pooled traffic (no bearer; x-api-key is the API_KEYS
 // scheme and must never be relayed upstream as a FreeBuff credential).
 func bearerToken(r *http.Request) string {
-	h := r.Header.Get("Authorization")
-	if !strings.HasPrefix(h, "Bearer ") {
+	if tok, ok := extractBearerToken(r.Header.Get("Authorization")); ok {
+		return tok
+	}
+	return ""
+}
+
+// --- correlation ids ---
+
+// reqIDKey carries the per-request correlation id (req_id) through the
+// request context. The key type is unexported so only this package can
+// read/write it; the upstream client threads the same id a second way (via
+// ChatOptions.RequestID) for its do()/retry log lines.
+type reqIDKey struct{}
+
+// reqIDFrom returns the request's correlation id, or "" when the request
+// did not pass through the access wrapper (direct handler calls in tests).
+func reqIDFrom(ctx context.Context) string {
+	id, _ := ctx.Value(reqIDKey{}).(string)
+	return id
+}
+
+// newReqID mints a UUIDv4 correlation id from crypto/rand (RFC 4122 §4.4:
+// 122 random bits, version 4, variant 1). A rand failure is unrecoverable
+// in practice; fall back to a time-seeded hex id rather than failing the
+// request.
+func newReqID() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return fmt.Sprintf("%x", time.Now().UnixNano())
+	}
+	b[6] = (b[6] & 0x0f) | 0x40 // version 4
+	b[8] = (b[8] & 0x3f) | 0x80 // variant 10
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+}
+
+// clientRequestID sanitizes the client's X-Request-Id header for logging:
+// trimmed, printable ASCII only (0x20-0x7e), max 64 runes. Returns "" when
+// the header is absent or fails the checks — the field is then omitted from
+// log lines (the proxy never trusts a client-supplied id as its correlation
+// key, D1).
+func clientRequestID(r *http.Request) string {
+	v := strings.TrimSpace(r.Header.Get("X-Request-Id"))
+	if v == "" || utf8.RuneCountInString(v) > 64 {
 		return ""
 	}
-	return strings.TrimSpace(strings.TrimPrefix(h, "Bearer "))
+	for _, b := range []byte(v) {
+		if b < 0x20 || b > 0x7e {
+			return ""
+		}
+	}
+	return v
 }
 
 // --- chat ---
 
-// handleChat is the OpenAI chat-completions entry point: sanitize the
-// request, acquire a token lease, call upstream with retry-once recovery,
-// then relay the forced stream to the client (SSE or accumulated JSON).
-func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+// --- chat ---
 
+// relayFunc relays the upstream SSE reader to the client in the endpoint's
+// wire format (chat.completion chunks, Responses events, or Anthropic
+// events). Implementations set their own headers, flush, and write terminal
+// frames. chatStart is when the upstream chat call returned; the first
+// relayed chunk records the upstream TTFB phase.
+type relayFunc func(ctx context.Context, w http.ResponseWriter, up io.Reader, stats *relayStats, chatStart time.Time)
+
+// handleChat is the OpenAI chat-completions entry point: sanitize the
+// request, then route through chatCore with the chat wire format.
+func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBody)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
@@ -1358,8 +2066,6 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	model := s.reg.ResolveModel(rawModel)
-	agentID, _ := s.reg.AgentForModel(model)
-	reasoningEffort := convert.ExtractReasoningEffort(raw)
 	stream := false
 	if v, ok := raw["stream"].(bool); ok {
 		stream = v
@@ -1370,21 +2076,64 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			"request body must be a valid JSON object: "+err.Error(), "invalid_request_error", "invalid_json", 0)
 		return
 	}
+	var relay relayFunc
+	if stream {
+		relay = s.relayStream
+	} else {
+		relay = s.relayJSON
+	}
+	s.chatCore(w, r, model, stream, normalized, convert.ExtractReasoningEffort(raw), "chat", relay)
+}
+
+// chatCore is the shared acquire→relay core for every completion-style
+// endpoint (chat completions, Responses, Anthropic messages): acquire a
+// token lease (bridge/hybrid routing included), call upstream with
+// retry-once recovery, then relay the forced stream to the client through
+// relay. kind names the endpoint in request/done log lines.
+func (s *Server) chatCore(w http.ResponseWriter, r *http.Request, model string, stream bool, normalized []byte, reasoningEffort, kind string, relay relayFunc) {
+	// D1: the access wrapper minted the request's correlation id; direct
+	// handler calls (tests) mint here so it is never empty. The value is
+	// threaded into the request context AND into ChatOptions.RequestID so
+	// the upstream client's do()/retry lines share it.
+	reqID := reqIDFrom(r.Context())
+	if reqID == "" {
+		reqID = newReqID()
+	}
+	st := &chatTraceState{reqID: reqID, clientRequestID: clientRequestID(r)}
+	ctx, phases := phasetiming.WithContext(context.WithValue(r.Context(), reqIDKey{}, reqID))
 	start := time.Now()
 
+	agentID, _ := s.reg.AgentForModel(model)
 	reqAttrs := []any{
 		"model", model,
 		"agent", agentID,
 		"stream", stream,
 		"remote", remoteHost(r),
 	}
-	if rawModel != model {
-		reqAttrs = append(reqAttrs, "raw_model", rawModel)
-	}
 	if reasoningEffort != "" {
 		reqAttrs = append(reqAttrs, "reasoning_effort", reasoningEffort)
 	}
-	s.logger.Info("chat request", reqAttrs...)
+	s.logger.Info(kind+" request", reqAttrs...)
+	// Client-side rate limiting per source IP (issue #137): reject rapid-fire
+	// bursts and spam locally before token lease acquisition or upstream calls.
+	if allowed, retryAfter := s.rateLimiter.Allow(r.RemoteAddr); !allowed {
+		phases.Since(phasetiming.TotalMS, start)
+		retrySec := int(math.Ceil(retryAfter.Seconds()))
+		if retrySec < 1 {
+			retrySec = 1
+		}
+		w.Header().Set("Retry-After", strconv.Itoa(retrySec))
+		s.logger.Warn(kind+" rate limit exceeded",
+			"remote", remoteHost(r),
+			"req_id", reqID,
+			"retry_after_sec", retrySec,
+		)
+		s.rateLimitRejections.Add(1)
+		s.writeJSONError(w, http.StatusTooManyRequests,
+			fmt.Sprintf("client rate limit exceeded (Retry-After: %ds)", retrySec),
+			"rate_limit_exceeded", "rate_limit_exceeded", 0)
+		return
+	}
 	// Bridge routing: pure bridge (no AUTH_TOKENS, not hybrid) always relays
 	// the client's Authorization header as the upstream token; hybrid mode
 	// relays when a token is present and falls back to the pool otherwise.
@@ -1392,6 +2141,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	var up io.ReadCloser
 	var lease *pool.Lease
 	cfg := s.cfg.Load()
+	fallbackUsed := false
 	// In hybrid, only an Authorization: Bearer token selects the bridge
 	// path — an x-api-key is the API_KEYS scheme for pooled clients and
 	// must never be relayed upstream as a FreeBuff credential.
@@ -1407,6 +2157,42 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		// requests fall back to the pool.
 		bridge = tok != ""
 	}
+	// Issue #74 P2: refuse new requests fast when (egress, model) is marked
+	// unfit — the direct egress cannot serve this model for ~5 min. The
+	// pooled path only: bridge clients relay their own token (the client's
+	// own account may serve the model on this egress and their session
+	// slots are theirs to spend), so the registry never gates them.
+	// MarkModelUnfit always stores a LimitedIpError, so lie is non-nil in
+	// practice; the bare sentinel keeps the refusal deterministic if it
+	// ever is nil.
+	if !bridge {
+		if until, lie := s.pool.ModelUnfit(model); !until.IsZero() && time.Now().Before(until) {
+			phases.Since(phasetiming.TotalMS, start)
+			s.logger.Info(kind+" request refused", "model", model, "reason", "model_limited_on_egress", "until", until.Format(time.RFC3339))
+			// Never mutate the registry's stored error (SEC-1): concurrent
+			// refusals would race on RetryAfter. Surface a per-request
+			// shallow copy carrying the computed window.
+			refuseErr := upstream.ErrModelIPLimited
+			if lie != nil {
+				refuseErr = &upstream.LimitedIpError{Model: lie.Model, Body: lie.Body, RetryAfter: time.Until(until)}
+			}
+			s.traceChat(nil, model, time.Since(start).Milliseconds(), "error", "model_ip_limited", phases.All(), st)
+			s.writeError(w, r, refuseErr, model, nil)
+			return
+		}
+	}
+	// Acquire is timed per call; on the retry-once path the last acquire
+	// wins (that is the lease-producing one, matching the pool's
+	// per-attempt session/run phases).
+	acquireTimed := func(acquire func(context.Context, string) (*pool.Lease, error)) func(context.Context, string) (*pool.Lease, error) {
+		return func(ctx context.Context, model string) (*pool.Lease, error) {
+			acquireStart := time.Now()
+			l, err := acquire(ctx, model)
+			phases.Since(phasetiming.AcquireMS, acquireStart)
+			return l, err
+		}
+	}
+	var err error
 	if bridge {
 		if tok == "" {
 			s.writeJSONError(w, http.StatusUnauthorized,
@@ -1414,41 +2200,102 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 				"invalid_request_error", "missing_bearer_token", 0)
 			return
 		}
-		up, lease, err = s.chatAttempt(ctx, model, normalized,
-			func(ctx context.Context, model string) (*pool.Lease, error) {
+		up, lease, err = s.chatAttempt(ctx, model, normalized, st,
+			acquireTimed(func(ctx context.Context, model string) (*pool.Lease, error) {
 				return s.pool.AcquireBridge(ctx, tok, model)
-			},
+			}),
 			s.pool.Chat,
 			s.pool.InvalidateBridgeSession,
 			s.pool.InvalidateBridgeRun,
 			func(l *pool.Lease) { s.pool.CooldownBridge(l, runs.DefaultCooldown) },
 			s.pool.CooldownBridgeBan,
 			s.pool.CooldownBridgeRateLimit,
+			s.pool.CooldownBridgeIpCapped,
 			s.pool.CooldownBridgeCountryBlocked,
 		)
 	} else {
-		up, lease, err = s.chatAttempt(ctx, model, normalized,
-			func(ctx context.Context, model string) (*pool.Lease, error) { return s.pool.Acquire(ctx, model) },
+		// Issue #100: bounded queue-time model fallback. When the request's
+		// model has a configured fallback (FALLBACK_MODEL) and the pool
+		// surfaces a waiting-room/queue delay of at least FALLBACK_AFTER_MS,
+		// re-route the SAME token to the fallback model instead of handing
+		// the client a 503 the client would have to wait out. Conservative:
+		// only when a fallback is configured; the switch is surfaced to the
+		// client via the X-FreeBuff-Fallback-Model response header and in
+		// the routing log line.
+		acquire := acquireTimed(func(ctx context.Context, model string) (*pool.Lease, error) { return s.pool.Acquire(ctx, model) })
+		fallbackModel := cfg.FallbackModels[model]
+		if cfg.FallbackAfter > 0 && fallbackModel != "" && fallbackModel != model {
+			wrapped := acquire
+			acquire = func(ctx context.Context, m string) (*pool.Lease, error) {
+				l, err := wrapped(ctx, m)
+				if err == nil || errors.Is(err, registry.ErrModelNotFound) {
+					return l, err
+				}
+				var wr *session.WaitingRoomError
+				if errors.As(err, &wr) && wr.RetryAfter >= cfg.FallbackAfter {
+					s.logger.Info("model fallback: waiting room exceeds FALLBACK_AFTER_MS; switching model",
+						"model", m, "fallback", fallbackModel, "retry_after", wr.RetryAfter.String())
+					// Drop the queued session caches so the fallback-model
+					// acquire can CREATE a fresh session instead of
+					// re-surfacing the same waiting room (issue #100).
+					if cleared := s.pool.ClearQueuedCaches(); cleared > 0 {
+						s.logger.Debug("model fallback: cleared queued session caches", "cleared", cleared)
+					}
+					l2, err2 := wrapped(ctx, fallbackModel)
+					if err2 == nil {
+						fallbackUsed = true
+					}
+					return l2, err2
+				}
+				return l, err
+			}
+		}
+		up, lease, err = s.chatAttempt(ctx, model, normalized, st,
+			acquire,
 			s.pool.Chat,
-			func(l *pool.Lease) { s.pool.InvalidateSession(l.Token) },
+			func(l *pool.Lease) { s.pool.InvalidateSession(l.Token, l.SessionInstanceID) },
 			func(l *pool.Lease, agentID string) { s.pool.InvalidateRun(l.Token, agentID) },
 			func(l *pool.Lease) { s.pool.CooldownToken(l.Token, runs.DefaultCooldown) },
 			func(l *pool.Lease, be *upstream.BanError) { s.pool.CooldownTokenBan(l.Token, be) },
 			func(l *pool.Lease, rle *upstream.RateLimitError) { s.pool.CooldownTokenRateLimit(l.Token, rle) },
+			func(l *pool.Lease, ice *upstream.IpCappedError) { s.pool.CooldownTokenIpCapped(l.Token, ice) },
 			func(l *pool.Lease, cbe *upstream.CountryBlockedError) {
 				s.pool.CooldownTokenCountryBlocked(l.Token, cbe)
 			},
 		)
 	}
 	if err != nil {
-		s.traceChat(lease, model, time.Since(start).Milliseconds(), "error", chatErrClass(err))
-		s.writeError(w, r, err)
+		phases.Since(phasetiming.TotalMS, start)
+		s.traceChat(lease, model, time.Since(start).Milliseconds(), "error", chatErrClass(err), phases.All(), st)
+		// Issue #114: a chat that died on a terminal upstream error must
+		// not leave its run FINISHing as completed — report it honestly
+		// (nil-safe: an acquire failure leaves no lease).
+		s.pool.MarkRunFailed(lease)
+		s.writeError(w, r, err, model, lease)
 		return
 	}
 	defer func() { _ = up.Close() }()
-	defer s.pool.LeaseRelease(lease)
+	// Issue #53: when the downstream client disconnects mid-stream, abandon
+	// the lease instead of a plain release — the run is FINISHed through the
+	// bounded queue (last-in-flight only) so upstream does not keep an
+	// abandoned agent run alive until the 6h rotation. A normal completion
+	// releases the lease as before.
+	released := false
+	release := func() {
+		if released {
+			return
+		}
+		released = true
+		if r.Context().Err() != nil {
+			s.pool.LeaseAbandon(lease)
+			return
+		}
+		s.pool.LeaseRelease(lease)
+	}
+	defer release()
 
 	routingAttrs := []any{
+		"req_id", reqID,
 		"token", tokenLabel(lease),
 		"model", model,
 		"agent", lease.AgentID,
@@ -1459,30 +2306,78 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	if reasoningEffort != "" {
 		routingAttrs = append(routingAttrs, "reasoning_effort", reasoningEffort)
 	}
-	s.logger.Info("chat routing", routingAttrs...)
-
-	if stream {
-		stats := &relayStats{}
-		s.relayStream(ctx, w, up, stats)
-		s.logger.Info("chat done", chatDoneAttrs(model, lease.AgentID, true, time.Since(start).Milliseconds(), stats.chunks, stats.bytes, reasoningEffort)...)
-		s.traceChat(lease, model, time.Since(start).Milliseconds(), "ok", "")
-	} else {
-		stats := &relayStats{}
-		s.relayJSON(ctx, w, up, stats)
-		s.logger.Info("chat done", chatDoneAttrs(model, lease.AgentID, false, time.Since(start).Milliseconds(), 0, stats.bytes, reasoningEffort)...)
-		s.traceChat(lease, model, time.Since(start).Milliseconds(), "ok", "")
+	if fallbackUsed {
+		// Surface the transparent model switch to the client (issue #100):
+		// the streamed response itself is indistinguishable, so the header
+		// is the notice.
+		w.Header().Set("X-FreeBuff-Fallback-Model", cfg.FallbackModels[model])
+		routingAttrs = append(routingAttrs, "fallback", cfg.FallbackModels[model])
 	}
+	s.logger.Info(kind+" routing", routingAttrs...)
+
+	chatStart := time.Now()
+	stats := &relayStats{}
+	relay(ctx, w, up, stats, chatStart)
+	// Issue #114: record the completed chat as a run step — steps are
+	// batched in memory and sent WITH FINISH (the CLI has no /steps
+	// endpoint). The response message id is not extracted from the stream;
+	// the CLI step schema allows a null messageId.
+	s.pool.RecordRunStep(lease, "")
+	// Issue #122: feed the per-token spend ledger once per successful chat
+	// completion with the usage total observed by the relay (0 when the
+	// upstream stream carried none — RecordSpend ignores non-positive).
+	s.pool.RecordSpend(lease, stats.usageTokens)
+	phases.Since(phasetiming.TotalMS, start)
+	ms := time.Since(start).Milliseconds()
+	s.logger.Info(kind+" done", chatDoneAttrs(reqID, model, lease.AgentID, stream, ms, stats.chunks, stats.bytes, reasoningEffort)...)
+	s.traceChat(lease, model, ms, "ok", "", phases.All(), st)
 }
 
 // traceChat records a structured "chat trace" entry for the dashboard
 // traces page (the page filters the shared log ring by msg == "chat trace").
-func (s *Server) traceChat(lease *pool.Lease, model string, ms int64, status, errClass string) {
+// phases carries the per-request latency phases (#89); the map is ordered
+// deterministically for stable log output. st carries the retry-once
+// attempt history (nil-safe: a refusal before any chat attempt passes a
+// zero state).
+func (s *Server) traceChat(lease *pool.Lease, model string, ms int64, status, errClass string, phases map[string]int64, st *chatTraceState) {
 	attrs := []any{"model", model, "status", status, "ms", ms}
+	if st != nil {
+		if st.reqID != "" {
+			attrs = append(attrs, "req_id", st.reqID)
+		}
+		if st.clientRequestID != "" {
+			attrs = append(attrs, "client_request_id", st.clientRequestID)
+		}
+		if st.attempts > 0 {
+			attrs = append(attrs, "attempts", st.attempts)
+		}
+		if seen := st.statusesSeen(); seen != "" {
+			attrs = append(attrs, "statuses_seen", seen)
+		}
+		if st.retried {
+			attrs = append(attrs, "retried", true, "backoff_ms", st.backoffMs)
+		}
+	}
 	if lease != nil {
-		attrs = append(attrs, "token", tokenLabel(lease), "agent", lease.AgentID)
+		attrs = append(attrs,
+			"token", tokenLabel(lease),
+			"agent", lease.AgentID,
+			"trace_session_id", lease.Run.TraceSessionID,
+		)
 	}
 	if errClass != "" {
 		attrs = append(attrs, "error", errClass)
+	}
+	for _, name := range []string{
+		phasetiming.AcquireMS,
+		phasetiming.SessionRefreshMS,
+		phasetiming.RunAcquireMS,
+		phasetiming.UpstreamTTFBMS,
+		phasetiming.TotalMS,
+	} {
+		if v, ok := phases[name]; ok {
+			attrs = append(attrs, name, v)
+		}
 	}
 	s.logger.Info("chat trace", attrs...)
 }
@@ -1494,8 +2389,16 @@ func chatErrClass(err error) string {
 		return "rate_limited"
 	case *upstream.BanError:
 		return "banned"
-	case *upstream.WaitingRoomError, *session.WaitingRoomError:
+	case *upstream.IpCappedError:
+		return "ip_capped"
+	case *upstream.LimitedIpError:
+		return "model_ip_limited"
+	case *upstream.SessionLimitError:
+		return "session_limit_reached"
+	case *upstream.WaitingRoomError, *session.WaitingRoomError, *upstream.WaitingRoomRequiredError:
 		return "waiting_room"
+	case *upstream.SessionSupersededError:
+		return "session_superseded"
 	case *upstream.UpstreamError:
 		return "upstream"
 	default:
@@ -1505,8 +2408,9 @@ func chatErrClass(err error) string {
 
 // chatDoneAttrs builds the structured log attributes for a completed chat,
 // including reasoning effort when the client requested it.
-func chatDoneAttrs(model, agent string, stream bool, ms int64, chunks, bytes int, reasoningEffort string) []any {
+func chatDoneAttrs(reqID, model, agent string, stream bool, ms int64, chunks, bytes int, reasoningEffort string) []any {
 	attrs := []any{
+		"req_id", reqID,
 		"model", model,
 		"agent", agent,
 		"stream", stream,
@@ -1522,19 +2426,81 @@ func chatDoneAttrs(model, agent string, stream bool, ms int64, chunks, bytes int
 	return attrs
 }
 
+// chatTraceState accumulates the per-request attempt history for the chat
+// trace line: how many upstream chat attempts fired, the HTTP statuses
+// observed per attempt (success = 200), whether the retry-once recovery
+// re-acquired a lease, and the measured re-acquire wait before the retry.
+// Created in chatCore (which owns the req_id), filled by chatAttempt's
+// retry loop.
+type chatTraceState struct {
+	reqID           string
+	clientRequestID string
+	attempts        int
+	statuses        []int
+	retried         bool
+	backoffMs       int64
+}
+
+// statusesSeen renders the observed attempt statuses comma-joined
+// ("409,200"), or "" when no attempt status was observed.
+func (st *chatTraceState) statusesSeen() string {
+	if len(st.statuses) == 0 {
+		return ""
+	}
+	parts := make([]string, len(st.statuses))
+	for i, s := range st.statuses {
+		parts[i] = strconv.Itoa(s)
+	}
+	return strings.Join(parts, ",")
+}
+
+// attemptStatus extracts the upstream HTTP status carried by a chat error,
+// or 0 when the error carries none (wrapped sentinels such as
+// ErrSessionInvalid/ErrRunInvalid, and transport-level failures). A 0 is
+// skipped in statuses_seen — only observed statuses are listed.
+func attemptStatus(err error) int {
+	switch e := err.(type) {
+	case *upstream.UpstreamError:
+		return e.Status
+	case *upstream.CreditsError:
+		return e.Status
+	case *upstream.CapacityDeferredError:
+		return e.Status
+	case *upstream.SessionSupersededError:
+		return e.Status
+	case *upstream.SessionLimitError:
+		return e.Status
+	case *upstream.WaitingRoomRequiredError:
+		// The canonical 428 waiting_room_required (#94); the marker can
+		// ride 428/429 alike, 428 is the documented gate. No named
+		// net/http constant exists for 428, so spell it out.
+		return 428
+	case *upstream.RateLimitError:
+		// RateLimitError.Status is the upstream "429" string; parse when
+		// numeric, else the 429 bucket is implicit.
+		if n, perr := strconv.Atoi(e.Status); perr == nil {
+			return n
+		}
+		return http.StatusTooManyRequests
+	}
+	return 0
+}
+
 // chatAttempt runs the retry-once recovery loop for one chat request: chat
 // through the leased token; on session-invalid / run-invalid the lease is
 // released, the cached session/run invalidated, and a fresh lease acquired
-// once; on auth-reject / ban / rate-limit the token is cooled down and the
-// error returned for writeError. The acquire/chat/invalidate/cooldown hooks
-// are closures so the pooled (fixed-token) and bridge paths share the exact
-// same recovery semantics. On success the returned body reader and final
-// lease belong to the caller: close the body and release the lease via
-// Pool.LeaseRelease when done.
+// once; on auth-reject / ban / rate-limit / ip-capped the token is cooled
+// down (ip_capped bounded to its retryAfterMs — never the Pacific-midnight
+// lock) and the error returned for writeError. The acquire/chat/invalidate/
+// cooldown hooks are closures so the pooled (fixed-token) and bridge paths
+// share the exact same recovery semantics. On success the returned body
+// reader and final lease belong to the caller: close the body and release
+// the lease via Pool.LeaseRelease when done.
 func (s *Server) chatAttempt(
 	ctx context.Context,
 	model string,
 	normalized []byte,
+	st *chatTraceState,
 	acquire func(context.Context, string) (*pool.Lease, error),
 	chat func(context.Context, *pool.Lease, upstream.ChatOptions, []byte) (io.ReadCloser, error),
 	invalidateSession func(*pool.Lease),
@@ -1542,6 +2508,7 @@ func (s *Server) chatAttempt(
 	cooldownAuth func(*pool.Lease),
 	cooldownBan func(*pool.Lease, *upstream.BanError),
 	cooldownRate func(*pool.Lease, *upstream.RateLimitError),
+	cooldownIpCapped func(*pool.Lease, *upstream.IpCappedError),
 	cooldownCountry func(*pool.Lease, *upstream.CountryBlockedError),
 ) (io.ReadCloser, *pool.Lease, error) {
 	lease, err := acquire(ctx, model)
@@ -1549,10 +2516,36 @@ func (s *Server) chatAttempt(
 		return nil, nil, err
 	}
 
+	// The lease is the authoritative source for the model its session/run
+	// are bound to: after a #100 fallback the acquire returned a lease for
+	// the FALLBACK model while the caller still holds the requested model.
+	// opts.Model, the body model and x-freebuff-model must all agree with
+	// the lease (review P2 — previously the request went upstream labeled
+	// with the requested model against the fallback session/run).
+	effectiveModel := lease.Model
+	if effectiveModel == "" {
+		effectiveModel = model
+	}
+	if effectiveModel != model {
+		if renormalized, nerr := convert.NormalizeRequest(normalized, effectiveModel); nerr == nil {
+			normalized = renormalized
+		}
+	}
+
 	opts := upstream.ChatOptions{
-		Model:             model,
+		Model:             effectiveModel,
 		RunID:             lease.Run.RunID,
 		SessionInstanceID: lease.SessionInstanceID,
+		TraceSessionID:    lease.Run.TraceSessionID,
+		// D1: the request's correlation id, threaded to the upstream
+		// client so its do()/retry log lines share the server's req_id.
+		RequestID: st.reqID,
+		// Issue #113: stamp the run's 1-based per-chat step counter so
+		// codebuff_metadata["llm_step_number"] matches the CLI (each chat
+		// call is one agent step; run-agent-step.ts increments per step).
+		// Incremented once per chatAttempt — the retry-once loop below
+		// retries the SAME step.
+		StepNumber: int(lease.Run.NextStepNumber()),
 	}
 
 	released := false
@@ -1566,15 +2559,91 @@ func (s *Server) chatAttempt(
 
 	var up io.ReadCloser
 	attempts := 0
+	// failTime pins when the failed chat attempt returned; the measured
+	// re-acquire wait below becomes the trace's backoff_ms.
+	var failTime time.Time
+	// transientErr remembers the default-branch chat error so the retry
+	// announcement can log it AFTER the re-acquire (with a real backoff_ms).
+	var transientErr error
 	for {
+		chatStart := time.Now()
 		up, err = chat(ctx, lease, opts, normalized)
+		attempts++
+		st.attempts = attempts
 		if err == nil {
+			st.statuses = append(st.statuses, http.StatusOK)
+			// Issue #74 P2: a successful chat is egress-level proof the
+			// model is servable again — drop any (egress, model) unfit mark.
+			// Only marks created before THIS lease's acquisition (a retry
+			// re-acquires after the mark, so its success clears it; an
+			// older in-flight chat succeeding must not erase a mark that
+			// landed after its admission — that would reopen the
+			// limited_ip re-admission burn).
+			if !lease.AcquiredAt.IsZero() {
+				s.pool.ClearModelUnfitBefore(effectiveModel, lease.AcquiredAt)
+			}
+			if attempts > 1 {
+				// T13: the retry-once recovery landed — one Debug line that
+				// greps the whole retry chain by req_id (ms = the retry
+				// chat call's duration).
+				s.logger.Debug("chat retry succeeded",
+					"attempts", attempts, "req_id", st.reqID,
+					"ms", time.Since(chatStart).Milliseconds())
+			}
 			released = true // Disarm deferred release: ownership transferred to caller
 			return up, lease, nil
 		}
-		attempts++
+		if s := attemptStatus(err); s != 0 {
+			st.statuses = append(st.statuses, s)
+		}
+		failTime = time.Now()
 		switch {
+		case errors.Is(err, upstream.ErrModelIPLimited):
+			// Issue #74 P2: the egress IP is limited for the requested
+			// model. Mark (egress, model) unfit for ~5 min so new requests
+			// refuse fast instead of re-admitting against a known-limited
+			// gate (each admission burns a daily session slot). Retry once
+			// through a fresh acquire — a different token (full-tier
+			// account) may still serve the model. The session is bound to
+			// its admitted model and is NOT invalidated.
+			var lie *upstream.LimitedIpError
+			if errors.As(err, &lie) {
+				s.pool.MarkModelUnfit(effectiveModel, lie)
+			} else {
+				s.pool.MarkModelUnfit(effectiveModel, nil)
+			}
+			release()
+			if attempts > 1 {
+				return nil, nil, err
+			}
 		case errors.Is(err, upstream.ErrSessionInvalid):
+			release()
+			invalidateSession(lease)
+			if attempts > 1 {
+				return nil, nil, err
+			}
+		case errors.Is(err, upstream.ErrWaitingRoomRequired):
+			// #116: 428 waiting_room_required is session-ENDING
+			// (endsTheSession:true — the seat is gone mid-chat;
+			// reference/freebuff freebuff-session.ts FREEBUFF_GATE_CODES).
+			// Drop the cached session and re-admit ONCE for this request
+			// (mirror the ErrSessionInvalid budget: attempts > 1 surfaces
+			// the error; the WAITING_ROOM_CHAIN fires before the next
+			// create). Never loops — a single reacquire, then surface.
+			release()
+			invalidateSession(lease)
+			if attempts > 1 {
+				return nil, nil, err
+			}
+		case errors.Is(err, upstream.ErrSessionSuperseded):
+			// #119: 409 session_superseded — another instance took over
+			// the account. Drop the cached session and re-admit ONCE
+			// for this request (mirror the ErrSessionInvalid budget:
+			// attempts > 1 surfaces the error). The session is already
+			// invalidated so the next request re-joins fresh; auto-
+			// retry here avoids the 30s model lock9router would apply
+			// on a503 response. Never loops — a single reacquire, then
+			// surface.
 			release()
 			invalidateSession(lease)
 			if attempts > 1 {
@@ -1604,6 +2673,19 @@ func (s *Server) chatAttempt(
 			}
 			release()
 			return nil, nil, err
+		case errors.Is(err, upstream.ErrIpCapped):
+			// ip_capped is admission-only (too many distinct users on the
+			// egress IP), NOT a quota reset: cool the token via
+			// cooldownIpCapped's bounded re-admission (#118) — full
+			// retryAfterMs + jitter, capped per token per day (the 3rd hit
+			// in a rolling window locks until Pacific midnight) — and never
+			// invalidate the session (existing sessions keep running).
+			var ice *upstream.IpCappedError
+			if errors.As(err, &ice) {
+				cooldownIpCapped(lease, ice)
+			}
+			release()
+			return nil, nil, err
 		case errors.Is(err, upstream.ErrCountryBlocked):
 			// A chat-path country block cools the token like the admission
 			// path does: without it the cached session stays "active" and
@@ -1612,6 +2694,15 @@ func (s *Server) chatAttempt(
 			if errors.As(err, &cbe) {
 				cooldownCountry(lease, cbe)
 			}
+			release()
+			return nil, nil, err
+		case errors.Is(err, upstream.ErrCredits):
+			// #117: 402 is NEVER retried — the CLI throws immediately and
+			// 402 is NOT in RETRYABLE_STATUS_CODES (reference/freebuff sdk
+			// error-utils.ts line 16; run-agent-step.ts throws on 402). A
+			// blind retry would burn a fresh lease against the same quota
+			// wall (2 upstream chat POSTs). Surface for writeError, which
+			// maps it to 402 out_of_credits.
 			release()
 			return nil, nil, err
 		default:
@@ -1624,16 +2715,54 @@ func (s *Server) chatAttempt(
 			if errors.As(err, &ue) && ue.Retryable {
 				return nil, nil, err
 			}
-			if attempts > 1 {
+			// T8: a retry cannot succeed on a canceled context (the log
+			// watch showed `transient chat error, retrying once
+			// err="context canceled"`) — surface the original error instead
+			// of re-acquiring into a dead ctx.
+			if attempts > 1 || ctx.Err() != nil {
 				return nil, nil, err
 			}
-			s.logger.Debug("transient chat error, retrying once", "err", err)
+			transientErr = err
 		}
-		lease, err = acquire(ctx, model)
+		lease, err = acquire(ctx, effectiveModel)
 		if err != nil {
 			return nil, nil, err
 		}
 		released = false
+		st.retried = true
+		// The effective backoff before the retry: the re-acquire wait after
+		// the failed attempt (a waiting-room/session gate can stall it).
+		st.backoffMs = time.Since(failTime).Milliseconds()
+		if transientErr != nil {
+			// T13: logged here (not at the failure) so backoff_ms reflects
+			// the real re-acquire wait before the retry attempt.
+			s.logger.Debug("transient chat error, retrying once",
+				"err", transientErr,
+				"reason", chatErrClass(transientErr),
+				"backoff_ms", st.backoffMs,
+				"attempt", attempts,
+				"req_id", st.reqID)
+			transientErr = nil
+		}
+		// A fresh lease may bind a different model (fallback path): refresh
+		// the effective model + body so opts.Model, the body and the
+		// lease's session/run stay consistent.
+		effectiveModel = lease.Model
+		if effectiveModel == "" {
+			effectiveModel = model
+		}
+		if effectiveModel != model {
+			if renormalized, nerr := convert.NormalizeRequest(normalized, effectiveModel); nerr == nil {
+				normalized = renormalized
+			}
+		}
+		opts.Model = effectiveModel
+		if lease.Run.RunID != opts.RunID {
+			// The retry landed on a FRESH run (run-invalid path): the new
+			// run's step counter starts at 1 — stamp its number so
+			// llm_step_number stays per-run like the CLI.
+			opts.StepNumber = int(lease.Run.NextStepNumber())
+		}
 		opts.RunID = lease.Run.RunID
 		opts.SessionInstanceID = lease.SessionInstanceID
 	}
@@ -1652,12 +2781,75 @@ func tokenLabel(lease *pool.Lease) string {
 type relayStats struct {
 	chunks int
 	bytes  int
+	// usageTokens is the upstream usage total of the completed chat (the
+	// final usage block), fed to the pool spend ledger once per successful
+	// completion (#122). 0 when the stream carried no usage.
+	usageTokens int64
+}
+
+// usageTotalTokens extracts the token total from a chat usage object
+// (total_tokens, falling back to prompt+completion). Returns 0 when absent.
+// Feeds the per-token spend ledger (#122).
+func usageTotalTokens(usage any) int64 {
+	u, _ := usage.(map[string]any)
+	if total, ok := intOf(u["total_tokens"]); ok && total > 0 {
+		return total
+	}
+	prompt, _ := intOf(u["prompt_tokens"])
+	completion, _ := intOf(u["completion_tokens"])
+	return prompt + completion
+}
+
+// keepaliveInterval is how long the relay may sit without relaying a data
+// chunk before it emits an SSE comment frame to hold the connection open.
+// Long upstream reasoning pauses produce no chunks, and proxies/clients may
+// treat silence as a dead connection. A var (not const) so tests can shrink
+// it.
+var keepaliveInterval = 15 * time.Second
+
+// lineChunk is one upstream SSE line or the terminal send. done is set only
+// on the clean-EOF send (a real empty line also arrives as line==nil, so the
+// terminal state must be explicit, not inferred from a nil slice).
+type lineChunk struct {
+	line []byte
+	err  error
+	done bool
+}
+
+// relayReadLoop drains r line by line onto ch, stopping when the stream
+// ends or ctx is canceled. The final send carries done (clean EOF) or the
+// terminal read error; on cancellation the goroutine exits without sending
+// (the request context cancellation closes the upstream body read, so Scan
+// returns promptly).
+func relayReadLoop(ctx context.Context, r io.Reader, ch chan<- lineChunk) {
+	scanner := bufio.NewScanner(r)
+	scanner.Buffer(make([]byte, 64*1024), maxStreamLine)
+	for scanner.Scan() {
+		line := append([]byte(nil), scanner.Bytes()...)
+		select {
+		case ch <- lineChunk{line: line}:
+		case <-ctx.Done():
+			return
+		}
+	}
+	var terminal lineChunk
+	if err := scanner.Err(); err != nil {
+		terminal = lineChunk{err: err}
+	} else {
+		terminal = lineChunk{done: true}
+	}
+	select {
+	case ch <- terminal:
+	case <-ctx.Done():
+	}
 }
 
 // relayStream forwards sanitized upstream SSE lines to the client with
-// per-chunk flushing, a [DONE] terminator, and an error chunk (then DONE)
-// when the upstream stream dies while the client context is still live.
-func (s *Server) relayStream(ctx context.Context, w http.ResponseWriter, r io.Reader, stats *relayStats) {
+// per-chunk flushing, a ": connecting" grace-flush comment, a keepalive
+// comment every keepaliveInterval of relay silence, a [DONE] terminator,
+// and an error chunk (then DONE) when the upstream stream dies while the
+// client context is still live.
+func (s *Server) relayStream(ctx context.Context, w http.ResponseWriter, r io.Reader, stats *relayStats, chatStart time.Time) {
 	h := w.Header()
 	h.Set("Content-Type", "text/event-stream")
 	h.Set("Cache-Control", "no-cache")
@@ -1670,49 +2862,103 @@ func (s *Server) relayStream(ctx context.Context, w http.ResponseWriter, r io.Re
 	}
 	w.WriteHeader(http.StatusOK)
 
-	scanner := bufio.NewScanner(r)
-	scanner.Buffer(make([]byte, 64*1024), maxStreamLine)
-	for scanner.Scan() {
-		if ctx.Err() != nil {
+	// The official CLI client treats a ": connecting" comment as the signal
+	// that headers have flushed and the stream is live (grace flush): write
+	// it before relaying anything so a client-side timeout can never fire
+	// during a long upstream admission pause. Comment frames are ignored by
+	// SSE parsers.
+	_, _ = io.WriteString(w, ": connecting\n\n")
+	flusher.Flush()
+
+	keepalive := time.NewTicker(keepaliveInterval)
+	defer keepalive.Stop()
+
+	lines := make(chan lineChunk)
+	go relayReadLoop(ctx, r, lines)
+
+	relayed := time.Now()
+	first := true
+	for {
+		select {
+		case <-ctx.Done():
 			return
-		}
-		clean, drop := convert.SanitizeChunk(scanner.Bytes())
-		if drop {
-			continue
-		}
-		frame := convert.EncodeSSE(clean)
-		if _, err := w.Write(frame); err != nil {
-			s.logger.Debug("stream write failed", "err", err)
-			return
-		}
-		stats.chunks++
-		stats.bytes += len(frame)
-		flusher.Flush()
-	}
-	if err := scanner.Err(); err != nil {
-		if ctx.Err() == nil {
-			s.logger.Warn("upstream stream error", "err", err)
-			_, _ = w.Write(convert.ErrorChunk("upstream_stream_error", ""))
-			_, _ = w.Write(convert.DONE)
+		case <-keepalive.C:
+			if time.Since(relayed) >= keepaliveInterval {
+				_, _ = io.WriteString(w, ": keepalive\n\n")
+				relayed = time.Now()
+				flusher.Flush()
+			}
+		case lc := <-lines:
+			if lc.err != nil {
+				if ctx.Err() == nil {
+					s.logger.Warn("upstream stream error", "err", lc.err)
+					_, _ = w.Write(convert.ErrorChunk("upstream stream interrupted: "+lc.err.Error(), "upstream_stream_error"))
+					_, _ = w.Write(convert.DONE)
+					flusher.Flush()
+				}
+				return
+			}
+			if lc.done {
+				// Clean end of stream (EOF is not a scanner error).
+				_, _ = w.Write(convert.DONE)
+				flusher.Flush()
+				return
+			}
+			clean, drop := convert.SanitizeChunk(lc.line)
+			if drop {
+				// Non-chunk lines (upstream comments) still prove liveness.
+				relayed = time.Now()
+				continue
+			}
+			// The final chunk carries the usage block (or a usage-only
+			// chunk when stream_options.include_usage is set); capture its
+			// total for the spend ledger (#122). Cheap substring probe, so
+			// the per-chunk path only pays for an unmarshal on the usage
+			// chunk itself.
+			if bytes.Contains(clean, []byte(`"usage"`)) {
+				var u struct {
+					Usage any `json:"usage"`
+				}
+				// Only adopt the total when the chunk actually carries a
+				// usage block: a trailing "usage":null or a content chunk
+				// merely mentioning the word must not zero the ledger.
+				if json.Unmarshal(clean, &u) == nil && u.Usage != nil {
+					stats.usageTokens = usageTotalTokens(u.Usage)
+				}
+			}
+			if first {
+				first = false
+				phasetiming.FromContext(ctx).Since(phasetiming.UpstreamTTFBMS, chatStart)
+			}
+			frame := convert.EncodeSSE(clean)
+			if _, err := w.Write(frame); err != nil {
+				s.logger.Debug("stream write failed", "err", err)
+				return
+			}
+			stats.chunks++
+			stats.bytes += len(frame)
+			relayed = time.Now()
 			flusher.Flush()
 		}
-		return
 	}
-	_, _ = w.Write(convert.DONE)
-	flusher.Flush()
 }
 
 // relayJSON drains the upstream SSE stream through the accumulator and
 // writes one chat.completion JSON response. On any decode or stream error
 // nothing is written and a 502 is returned (the client asked for a single
 // response; a partial one would be worse than none).
-func (s *Server) relayJSON(ctx context.Context, w http.ResponseWriter, r io.Reader, stats *relayStats) {
+func (s *Server) relayJSON(ctx context.Context, w http.ResponseWriter, r io.Reader, stats *relayStats, chatStart time.Time) {
 	acc := convert.NewAccumulator()
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 64*1024), maxStreamLine)
+	first := true
 	for scanner.Scan() {
 		if ctx.Err() != nil {
 			return
+		}
+		if first {
+			first = false
+			phasetiming.FromContext(ctx).Since(phasetiming.UpstreamTTFBMS, chatStart)
 		}
 		if err := acc.Add(scanner.Bytes()); err != nil {
 			s.writeJSONError(w, http.StatusBadGateway,
@@ -1730,6 +2976,14 @@ func (s *Server) relayJSON(ctx context.Context, w http.ResponseWriter, r io.Read
 	}
 	out := acc.Finish()
 	stats.bytes = len(out)
+	// Capture the accumulated usage total for the spend ledger (#122);
+	// only adopt when the response actually carries a usage block.
+	var usageObj struct {
+		Usage any `json:"usage"`
+	}
+	if json.Unmarshal(out, &usageObj) == nil && usageObj.Usage != nil {
+		stats.usageTokens = usageTotalTokens(usageObj.Usage)
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(out)
@@ -1746,6 +3000,12 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	created := s.started.Unix()
 	snaps := s.pool.Snapshot()
 	models := s.reg.Models()
+	if len(models) == 0 {
+		// T16: an empty registry is an operational anomaly (the fallback
+		// table should always populate at boot) — surface it when a client
+		// actually asks, not at startup.
+		s.logger.Warn("model list requested with empty registry", "path", r.URL.Path, "remote", remoteHost(r), "model_count", 0)
+	}
 	hideUnavailable := s.cfg.Load().ModelsHideUnavailable
 	data := make([]map[string]any, 0, len(models))
 	for _, id := range models {
@@ -1839,9 +3099,21 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 			"Messages24h":          snap.Messages24h,
 			"DailyLimit":           snap.DailyLimit,
 			"UsagePct":             snap.UsagePct,
-			"RiskLevel":            snap.RiskLevel,
-			"tier":                 snap.TierAccess,
-			"country":              snap.CountryCode,
+			// Spend ledger (issue #87/#122): Pacific-day/week/month buckets
+			// plus the advisory MAX_SPEND_PER_DAY ceiling (SpendLimit/
+			// SpendPct, informational — the upstream $ ceilings are
+			// server-enforced) and the spend_limited refusal counter.
+			"Spend24h":      snap.Spend24h,
+			"SpendDay":      snap.SpendDay,
+			"SpendWeek":     snap.SpendWeek,
+			"SpendMonth":    snap.SpendMonth,
+			"SpendDayStart": snap.SpendDayStart,
+			"SpendLimit":    snap.SpendLimit,
+			"SpendPct":      snap.SpendPct,
+			"SpendLimited":  snap.SpendLimited,
+			"RiskLevel":     snap.RiskLevel,
+			"tier":          snap.TierAccess,
+			"country":       snap.CountryCode,
 		}
 		if len(snap.QuotaByModel) > 0 {
 			quota := make(map[string]any, len(snap.QuotaByModel))
@@ -1919,6 +3191,9 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	sb.WriteString("# TYPE freebuff_proxy_tokens_total gauge\n")
 	fmt.Fprintf(&sb, "freebuff_proxy_tokens_total %d\n\n", len(snaps))
 
+	sb.WriteString("# HELP freebuff_proxy_rate_limit_rejected_total Total client requests rejected by local rate limiter\n")
+	sb.WriteString("# TYPE freebuff_proxy_rate_limit_rejected_total counter\n")
+	fmt.Fprintf(&sb, "freebuff_proxy_rate_limit_rejected_total %d\n\n", s.rateLimitRejections.Load())
 	sb.WriteString("# HELP freebuff_proxy_token_messages_24h Rolling 24h message count per token\n")
 	sb.WriteString("# TYPE freebuff_proxy_token_messages_24h gauge\n")
 	for _, snap := range snaps {
@@ -1990,21 +3265,54 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	}
 	sb.WriteString("\n")
 
+	sb.WriteString("# HELP freebuff_proxy_rate_limit_events_total Upstream rate-limit classifications per token and code\n")
+	sb.WriteString("# TYPE freebuff_proxy_rate_limit_events_total counter\n")
+	for _, snap := range snaps {
+		for code, n := range snap.RateLimitEvents {
+			if n > 0 {
+				fmt.Fprintf(&sb, "freebuff_proxy_rate_limit_events_total{token=\"%d\",code=\"%s\"} %d\n",
+					snap.Token+1, escapeLabelValue(code), n)
+			}
+		}
+	}
+	sb.WriteString("\n")
+
+	if s.logs != nil {
+		// T20: handled-record counters from the dashboard log ring. The key
+		// is logring's "level|msg" (level lowercased). msg is a free-form
+		// operator message, so the label is escaped like every upstream-
+		// derived label.
+		sb.WriteString("# HELP freebuff_proxy_log_events_total Log records handled per level and message\n")
+		sb.WriteString("# TYPE freebuff_proxy_log_events_total counter\n")
+		for key, n := range s.logs.Counts() {
+			level, msg, ok := strings.Cut(key, "|")
+			if !ok {
+				continue
+			}
+			fmt.Fprintf(&sb, "freebuff_proxy_log_events_total{level=\"%s\",msg=\"%s\"} %d\n",
+				escapeLabelValue(level), escapeLabelValue(msg), n)
+		}
+		sb.WriteString("\n")
+	}
+
 	_, _ = w.Write([]byte(sb.String()))
 }
 
 // handleReload handles POST /admin/reload for hot configuration reloads (#26).
 func (s *Server) handleReload(w http.ResponseWriter, r *http.Request) {
-	s.logger.Info("admin reload requested")
+	s.logger.Info("admin reload requested", "remote", remoteHost(r), "path", r.URL.Path)
 	newCfg, err := config.Load(s.configPath)
 	if err != nil {
+		s.logger.Warn("admin reload failed", "remote", remoteHost(r), "path", r.URL.Path, "err", err)
 		s.writeJSONError(w, http.StatusInternalServerError, "failed to reload config: "+err.Error(), "internal_error", "reload_failed", 0)
 		return
 	}
 	s.cfg.Store(&newCfg)
 	s.reg.SetConfig(&newCfg)
 	s.pool.SetConfig(&newCfg)
-	s.logger.Info("config reloaded successfully", "auth_tokens", len(newCfg.AuthTokens), "safe_mode", newCfg.SafeMode)
+	s.rateLimiter.SetRate(newCfg.RateLimitPerIP, newCfg.RateLimitBurst)
+	s.logger.Info("config reloaded successfully", "remote", remoteHost(r), "path", r.URL.Path,
+		"auth_tokens", len(newCfg.AuthTokens), "safe_mode", newCfg.SafeMode)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"status":      "ok",
@@ -2053,13 +3361,13 @@ func defaultHintForCode(code, message string) string {
 	case code == "account_banned" || strings.Contains(lowerMsg, "banned"):
 		return "Account suspended upstream. Token is dead; create a fresh account with an established GitHub login."
 	case code == "country_blocked" || strings.Contains(lowerMsg, "country blocked") || strings.Contains(lowerMsg, "country_blocked"):
-		return "Your egress IP is in an unsupported region. Route traffic through an allowed country (e.g. US/EU/ID/SG) or configure SOCKS5_PROXY in .env."
+		return "Your egress IP is in an unsupported region. Route traffic through an allowed country (e.g. US/EU/ID/SG)."
 	case code == "out_of_credits" || strings.Contains(lowerMsg, "out of credits"):
 		return "Upstream free-tier credits exhausted. Check COST_MODE=free in .env — a typo routes requests as PAID and fresh free accounts get 402."
 	case code == "upstream_timeout":
 		return "The upstream request exceeded its deadline. Retry, or raise REQUEST_TIMEOUT/SESSION_CALL_TIMEOUT in .env."
 	case code == "upstream_auth_rejected" || code == "invalid_api_key" || strings.Contains(lowerMsg, "invalid api key"):
-		return "Token invalid or expired. Get a fresh token by running freebuff or scripts/get-freebuff-token.sh"
+		return "Token invalid or expired. Get a fresh token by running scripts/gen-token.cmd (Windows) or scripts/gen-token.sh (Linux/macOS)"
 	case code == "rate_limited":
 		return "Daily message cap or rate limit reached. Wait for quota reset or add another token."
 	case code == "missing_bearer_token":
@@ -2071,10 +3379,42 @@ func defaultHintForCode(code, message string) string {
 	}
 }
 
+// rateLimitWarnDedupe gates identical (token, code, window) `request failed`
+// WARNs (D6): the first + every 50th occurrence fire; the per-key counter
+// always increments so a silent burst stays countable, and the client
+// response is always written. Package-level = per-process, shared by every
+// server instance.
+var rateLimitWarnDedupe = struct {
+	mu sync.Mutex
+	m  map[string]int64
+}{}
+
+// resetRateLimitWarnDedupe clears the dedupe ledger (test hook).
+func resetRateLimitWarnDedupe() {
+	rateLimitWarnDedupe.mu.Lock()
+	defer rateLimitWarnDedupe.mu.Unlock()
+	rateLimitWarnDedupe.m = make(map[string]int64)
+}
+
+// rateLimitWarnShouldLog reports whether the (token, code, window) WARN
+// should fire for this occurrence, always incrementing the occurrence count.
+func rateLimitWarnShouldLog(key string) bool {
+	rateLimitWarnDedupe.mu.Lock()
+	defer rateLimitWarnDedupe.mu.Unlock()
+	if rateLimitWarnDedupe.m == nil {
+		rateLimitWarnDedupe.m = make(map[string]int64)
+	}
+	rateLimitWarnDedupe.m[key]++
+	n := rateLimitWarnDedupe.m[key]
+	return n == 1 || n%50 == 0
+}
+
 // writeError maps any error from the pool/upstream to the PRD §6 matrix and
 // logs it once. Canceled client contexts are logged at debug and dropped (no
-// response written).
-func (s *Server) writeError(w http.ResponseWriter, r *http.Request, err error) {
+// response written). model and lease come from the call site: model is the
+// request's effective model, lease the acquired token lease (nil when the
+// error fired before acquisition — e.g. an unfit-egress refusal).
+func (s *Server) writeError(w http.ResponseWriter, r *http.Request, err error, model string, lease *pool.Lease) {
 	if errors.Is(err, context.Canceled) {
 		s.logger.Debug("request canceled by client", "err", err)
 		return
@@ -2088,36 +3428,127 @@ func (s *Server) writeError(w http.ResponseWriter, r *http.Request, err error) {
 	code := "upstream_unavailable"
 	message := err.Error()
 	var retryAfter time.Duration
+	var resetAt time.Time
+	window := "" // T7 ledger window; set for rate-limit errors (dedupe key)
 
 	var wr *session.WaitingRoomError
 	var uwr *upstream.WaitingRoomError
+	var wrr *upstream.WaitingRoomRequiredError
+	var sse *upstream.SessionSupersededError
 	var ue *upstream.UpstreamError
 	var rle *upstream.RateLimitError
+	var ice *upstream.IpCappedError
+	var sle *upstream.SessionLimitError
+	var lie *upstream.LimitedIpError
 	var be *upstream.BanError
 	var cbe *upstream.CountryBlockedError
 	var ce *upstream.CreditsError
+	var cde *upstream.CapacityDeferredError
 	switch {
 	case errors.As(err, &be):
 		status, code = http.StatusForbidden, "account_banned"
 		message, retryAfter = be.Error(), time.Until(be.ResumesAt)
+		resetAt = be.ResumesAt
 		if retryAfter < 0 {
 			retryAfter = 0
 		}
 	case errors.As(err, &rle):
 		status, code = http.StatusTooManyRequests, "rate_limited"
+		switch rle.Status {
+		case "load_shedding":
+			// #133: upstream load saturation — minutes-scale transient with
+			// a bounded cooldown; surfaced honestly instead of the daily-cap
+			// "rate_limited" hint.
+			code = "load_shedding"
+		case "peak_hours":
+			// #133: upstream peak-hours pricing window — bounded cooldown,
+			// not a quota lock.
+			code = "peak_hours"
+		}
 		message, retryAfter = rle.Error(), rle.RetryAfter
+		resetAt, window = rle.ResetAt, rle.Window
 		if !rle.ResetAt.IsZero() && rle.ResetAt.After(time.Now()) {
 			retryAfter = time.Until(rle.ResetAt)
 		}
 		if retryAfter < 0 {
 			retryAfter = 0
 		}
+	case errors.As(err, &ice):
+		// ip_capped: admission-only (too many distinct users on the egress
+		// IP) — 429, not the quota 429, with the body's retryAfterMs only.
+		status, code = http.StatusTooManyRequests, "ip_capped"
+		message, retryAfter = ice.Error(), ice.RetryAfter
+		if retryAfter < 0 {
+			retryAfter = 0
+		}
+	case errors.As(err, &sle):
+		// session_limit_reached (409): the ACCOUNT is over its concurrent-tab
+		// budget; this session's row is fine. Never session-invalid.
+		status, code = http.StatusConflict, "session_limit_reached"
+		message = sle.Body
+		if message == "" {
+			message = "session limit reached"
+		}
+	case errors.As(err, &lie):
+		// Issue #74 P2: the egress IP cannot serve the requested model.
+		// 409 (not a quota lock): a different egress or a full-tier token
+		// may still serve the model. The body's retryAfterMs is surfaced
+		// as Retry-After but does not set the unfit window.
+		status, code = http.StatusConflict, "model_ip_limited"
+		message, retryAfter = lie.Error(), lie.RetryAfter
+		if retryAfter < 0 {
+			retryAfter = 0
+		}
+	case errors.Is(err, upstream.ErrModelIPLimited):
+		// Bare sentinel (registry entry stored without refusal detail):
+		// same 409 contract, no Retry-After to surface.
+		status, code = http.StatusConflict, "model_ip_limited"
+		message = err.Error()
+		retryAfter = 0
 	case errors.As(err, &wr):
 		status, code = http.StatusServiceUnavailable, "waiting_room_queued"
 		message, retryAfter = wr.Error(), wr.RetryAfter
 	case errors.As(err, &uwr):
 		status, code = http.StatusServiceUnavailable, "waiting_room_queued"
 		message, retryAfter = uwr.Error(), uwr.RetryAfter
+	case errors.As(err, &wrr):
+		// #116: 428 waiting_room_required (endsTheSession:true — the seat
+		// is gone; chatAttempt already dropped the cached session and
+		// re-admitted once). 503 + the refusal's Retry-After — NEVER a bare
+		// 502. MUST precede the generic UpstreamError branch.
+		status, code = http.StatusServiceUnavailable, "waiting_room_required"
+		message, retryAfter = wrr.Error(), wrr.RetryAfter
+		if retryAfter < 0 {
+			retryAfter = 0
+		}
+	case errors.As(err, &sse):
+		// #119: 503 session_superseded — another instance took over the
+		// account. Return 503 + Retry-After (not 409) so 9router retries
+		// immediately instead of locking the model for 30s. The session is
+		// already invalidated in chatAttempt so the next request re-joins fresh.
+		status, code = http.StatusServiceUnavailable, "session_superseded"
+		message = sse.Body
+		if message == "" {
+			message = "session superseded"
+		}
+		retryAfter = 1 // retry in 1s
+	case errors.As(err, &cde):
+		// #105 (server half): the client's capacity-deferred retry budget
+		// (TRANSIENT_RETRIES) is exhausted, so the free tier's transient
+		// capacity queue is surfaced to downstream clients as 429 +
+		// Retry-After — they must honor the window, not hammer a 502/503.
+		// MUST precede the generic errors.As(err, &ue) branch: the error
+		// unwraps to a Retryable UpstreamError, which would otherwise be
+		// swallowed as 503 upstream_retryable.
+		status, code = http.StatusTooManyRequests, "free_mode_capacity_deferred"
+		message = cde.Body
+		if message == "" {
+			message = cde.Error()
+		}
+		retryAfter = cde.RetryAfter
+		if retryAfter <= 0 {
+			retryAfter = 10 * time.Second
+		}
 	case errors.As(err, &ue):
 		if ue.Retryable {
 			// deployment_outside_hours etc.: temporarily unavailable, worth
@@ -2163,6 +3594,35 @@ func (s *Server) writeError(w http.ResponseWriter, r *http.Request, err error) {
 		message = "upstream request timed out: " + err.Error()
 	}
 
-	s.logger.Warn("request failed", "status", status, "code", code, "err", err)
+	attrs := []any{"status", status, "code", code, "err", err}
+	if r != nil {
+		if reqID := reqIDFrom(r.Context()); reqID != "" {
+			attrs = append(attrs, "req_id", reqID)
+		}
+	}
+	if retryAfter > 0 {
+		attrs = append(attrs, "retry_after", int(retryAfter.Seconds()))
+	}
+	if !resetAt.IsZero() {
+		attrs = append(attrs, "reset_at", resetAt.UTC().Format(time.RFC3339))
+	}
+	if lease != nil {
+		attrs = append(attrs, "token", tokenLabel(lease))
+	}
+	if model != "" {
+		attrs = append(attrs, "model", model)
+	}
+
+	if code == "rate_limited" {
+		// D6 dedupe: identical (token, code, window) WARNs fire on the 1st +
+		// every 50th; the counter always increments and the response is
+		// always written.
+		key := tokenLabel(lease) + "|" + code + "|" + window
+		if !rateLimitWarnShouldLog(key) {
+			s.writeJSONError(w, status, message, "upstream_error", code, retryAfter)
+			return
+		}
+	}
+	s.logger.Warn("request failed", attrs...)
 	s.writeJSONError(w, status, message, "upstream_error", code, retryAfter)
 }

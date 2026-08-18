@@ -10,12 +10,14 @@
 //
 // It is a mirror of the upstream entrypoint: config loading, the model
 // registry (fallback + background refresh), the per-token upstream clients /
-// session managers / run managers bound into the token pool, egress probing,
-// the in-memory log ring that backs the admin dashboard, and the
-// OpenAI-compatible HTTP surface over it, with graceful SIGINT/SIGTERM
-// shutdown. The interactive subcommands (-doctor, -update, -setup,
-// -test-token) and the interactive console banner are deliberately omitted —
-// they have no meaning on a serverless container.
+// session managers / run managers bound into the token pool, the in-memory
+// log ring that backs the admin dashboard, and the OpenAI-compatible HTTP
+// surface over it, with graceful SIGINT/SIGTERM shutdown. The interactive
+// subcommands (-doctor, -update, -setup, -test-token, -install-service, …)
+// and the interactive console banner are deliberately omitted — they have no
+// meaning on a serverless container. The dashboard login wizard and the
+// release-update badge are likewise omitted (both write/poll state that is
+// meaningless on Vercel's read-only, ephemeral filesystem).
 //
 // Keep the runtime behavior in sync with cmd/freebuff-proxy/main.go when
 // upstream changes the startup sequence.
@@ -41,8 +43,8 @@ import (
 	_ "time/tzdata"
 
 	"freebuff-proxy/internal/config"
-	"freebuff-proxy/internal/egress"
 	"freebuff-proxy/internal/logring"
+	"freebuff-proxy/internal/notify"
 	"freebuff-proxy/internal/pool"
 	"freebuff-proxy/internal/registry"
 	"freebuff-proxy/internal/server"
@@ -83,18 +85,11 @@ func main() {
 	}
 
 	// Effective log level: LOG_LEVEL config wins, else -v → debug, else info.
-	level, _ := telemetry.ParseLevel(cfg.LogLevel)
-	if cfg.LogLevel == "" {
-		if *verbose {
-			level = slog.LevelDebug
-		} else {
-			level = slog.LevelInfo
-		}
-	}
-	logger := telemetry.New(level, cfg.LogFile)
+	level := resolveLogLevel(cfg.LogLevel, *verbose)
+	logger := telemetry.New(level, cfg.LogFile, cfg.LogFormat)
 	// The dashboard log viewer reads from an in-memory ring that mirrors
 	// every record the process logger emits (no log file or docker needed).
-	logringHandler := logring.NewHandler(logger.Handler(), 500)
+	logringHandler := logring.NewHandler(logger.Handler(), cfg.LogRingSize)
 	logger = slog.New(logringHandler)
 	// The pool/upstream/session/runs log through slog.Default(); route it
 	// through our logger so the configured level and log file cover them too.
@@ -140,19 +135,22 @@ func main() {
 	}
 	p.SetSessionStore(store)
 
+	// Best-effort webhook alerts (WEBHOOK_URL) for pool exhaustion / token
+	// bans — fire-and-forget, throttled, never blocking. This works on
+	// Vercel (a plain outbound HTTPS POST), so it is kept in the mirror.
+	if cfg.WebhookURL != "" {
+		p.SetNotifier(notify.New(cfg.WebhookURL, nil))
+		logger.Info("webhook alerts enabled", "url", cfg.WebhookURL)
+	}
+
 	// Prewarm + the maintain loop run until ctx is canceled (shutdown).
 	p.Start(ctx)
 
-	// Egress probing: report the country/IP each outbound path appears to
-	// come from (ban-avoidance diagnostics). The direct path is always
-	// probed; SOCKS5_PROXIES entries are probed through their own dialer.
-	// Results are cached and refreshed every 10 minutes; failures are
-	// logged and cached with Err set (fail-open).
-	egressCache := egress.NewCache()
-	if paths := egressPaths(&cfg, logger); len(paths) > 0 {
-		go egress.RunLoop(ctx, logger, egressCache, paths, egress.ProbeTimeout, egress.DefaultTTL)
-		logger.Info("egress probes started", "paths", len(paths))
-	}
+	// Egress probing is intentionally NOT wired into startup (mirrors
+	// upstream #123): the official CLI never probes cloudflare.com, and the
+	// background loop's risk-engine feed has no consumer. The probe still
+	// runs on demand via `-doctor`, which is omitted here (no interactive
+	// subcommands on a container).
 
 	srv := server.New(&cfg, p, reg, logger, logringHandler, *configPath)
 	httpServer := &http.Server{
@@ -181,7 +179,7 @@ func main() {
 		"registry_refresh", cfg.RegistryRefresh.String(),
 		"registry_agents", len(reg.AgentIDs()),
 		"registry_models", reg.ModelCount(),
-		"log_level", level.String(),
+		"log_level", logLevelDisplay(level),
 		"verbose", *verbose,
 	)
 	// /admin/reload and the admin dashboard are open in default deployments
@@ -232,21 +230,29 @@ func main() {
 	}
 }
 
-// egressPaths returns the probe paths for the configured outbound routes:
-// index 0 is always the direct connection; each SOCKS5_PROXIES entry is
-// probed through its own SOCKS5 dialer. Unparseable proxy addresses are
-// skipped with a warning (fail-open); the direct probe always survives.
-func egressPaths(cfg *config.Config, logger *slog.Logger) []egress.Path {
-	paths := []egress.Path{{Key: "direct", Dialer: egress.DirectDialer(egress.ProbeTimeout)}}
-	for i, raw := range cfg.SOCKS5Proxies {
-		dialer, err := egress.Socks5Dialer(raw)
-		if err != nil {
-			logger.Warn("egress probe: skipping invalid SOCKS5 proxy", "index", i, "err", err)
-			continue
+// resolveLogLevel applies the effective log-level precedence: a set
+// LOG_LEVEL config wins, -v → debug, else info. An unparseable LOG_LEVEL
+// silently falls back to info (ParseLevel returns ok=false).
+func resolveLogLevel(cfgLogLevel string, verbose bool) slog.Level {
+	if cfgLogLevel != "" {
+		if lv, ok := telemetry.ParseLevel(cfgLogLevel); ok {
+			return lv
 		}
-		paths = append(paths, egress.Path{Key: fmt.Sprintf("proxy-%d", i), Dialer: dialer})
+		return slog.LevelInfo
 	}
-	return paths
+	if verbose {
+		return slog.LevelDebug
+	}
+	return slog.LevelInfo
+}
+
+// logLevelDisplay renders the configured level for the startup summary.
+// LevelTrace prints as TRACE instead of slog's "DEBUG-4".
+func logLevelDisplay(level slog.Level) string {
+	if level == telemetry.LevelTrace {
+		return "TRACE"
+	}
+	return level.String()
 }
 
 // refreshLoop refreshes the registry immediately, then every interval.
@@ -270,7 +276,5 @@ func refreshLoop(ctx context.Context, logger *slog.Logger, reg *registry.Registr
 func logRegistryRefresh(ctx context.Context, logger *slog.Logger, reg *registry.Registry) {
 	if err := reg.Refresh(ctx); err != nil {
 		logger.Warn("registry refresh failed; keeping previous state", "err", err)
-		return
 	}
-	logger.Info("registry refreshed", "agents", len(reg.AgentIDs()), "models", reg.ModelCount())
 }

@@ -2,7 +2,7 @@ package pool
 
 // Edge-case and E2E tests for the pool: live failover matrix, bridge daily
 // cap, idle handling in bridge mode, RemoveLastToken drain + race, maintain
-// queued-advance/heartbeat, runtime token actions, and exact daily-cap
+// queued-advance/session-poll, runtime token actions, and exact daily-cap
 // accounting. Regression guards for the audit's pool bugs (AcquireBridge
 // idle tracking, RemoveLastToken drain/TOCTOU, Cooldown ban memory, idle
 // bridge sweep).
@@ -233,7 +233,7 @@ func TestBridgeDailyMessageCap(t *testing.T) {
 // TestBridgeIdlePause is the regression guard for the P1 bridge idle bug:
 // AcquireBridge never updated p.lastActive, so IDLE_ROTATION_TIMEOUT was
 // dead config in bridge mode — lastActive stayed zero, the pool never
-// idle-paused, and bridge entries were heartbeated/queued-advanced every
+// idle-paused, and bridge entries were polled/queued-advanced every
 // maintain pass indefinitely. Bridge traffic must mark the pool active, and
 // once idle a maintain pass must not touch the upstream at all. Fails
 // before the fix (lastActive stays zero → every pass maintains the entry).
@@ -272,7 +272,7 @@ func TestBridgeIdlePause(t *testing.T) {
 	p.lastActive = time.Now().Add(-time.Second)
 	p.lastActiveMu.Unlock()
 
-	// Idle passes must not touch the upstream (no heartbeat / queued
+	// Idle passes must not touch the upstream (no session poll / queued
 	// advance / rotation) and must not evict the recently-used entry.
 	reqs := mock.Requests
 	p.maintainTick(context.Background())
@@ -290,7 +290,7 @@ func TestBridgeIdlePause(t *testing.T) {
 // in mixed mode bridge entries idle past bridgeIdleEvict were never swept
 // while the pool stayed idle — their sessions stayed admitted upstream until
 // expiry. An idle pass must still run the bridge sweep (only the per-token
-// heartbeat/queued-advance pauses). Fails before the fix (the idle branch
+// session-poll/queued-advance pauses). Fails before the fix (the idle branch
 // returns before the sweep).
 func TestBridgeMaintainRunsOnIdlePass(t *testing.T) {
 	mock := testutil.NewMock()
@@ -367,7 +367,7 @@ func TestBridgeIdleSweepSkipsBusy(t *testing.T) {
 	if p.bridgeToken("busy-tok") == nil {
 		t.Error("busy bridge entry evicted while its lease is outstanding")
 	}
-	if got := mock.FinishedRunsSnapshot(); len(got) != 0 {
+	if got := parentFinished(mock); len(got) != 0 {
 		t.Errorf("finished runs = %d, want 0 (busy run must not be finished)", len(got))
 	}
 }
@@ -375,10 +375,13 @@ func TestBridgeIdleSweepSkipsBusy(t *testing.T) {
 // TestBridgeEvictionAllBusyKeepsCap pins the all-busy eviction behavior:
 // when every cached entry holds an outstanding lease, a new distinct token
 // cannot evict any of them (FINISHing a busy entry would kill the in-flight
-// chat). The new entry is itself unleased at creation time, so LRU eviction
-// picks it as the victim and the cache stays at maxBridgeEntries — the
-// audit's "grows past the cap" claim does not hold (documented discrepancy:
-// the new entry is always evictable, so the cap is never exceeded).
+// chat). The new entry is itself unleased at creation time, but it must
+// ALSO never be evicted: bridgeEntryFor hands it back for immediate use —
+// admitting a session and starting a run on an entry that was dropped from
+// the cache would leave that run and session invisible to bridgeMaintain
+// and Pool.Shutdown (leaked upstream + a daily session slot burned per new
+// client under saturation). The cache may sit one over the cap until an
+// older entry's lease drains and the idle sweep reclaims it.
 func TestBridgeEvictionAllBusyKeepsCap(t *testing.T) {
 	mock := testutil.NewMock()
 	defer mock.Close()
@@ -399,24 +402,28 @@ func TestBridgeEvictionAllBusyKeepsCap(t *testing.T) {
 		held = append(held, lease)
 	}
 
-	// A 33rd distinct token: the existing entries are all busy, so the new
-	// (still unleased) entry is the only evictable victim and the cache
-	// stays at the cap.
+	// A 33rd distinct token: the existing entries are all busy, and the new
+	// (still unleased) entry cannot be its own eviction victim either — no
+	// eviction happens this pass and the cache sits at cap+1.
 	lease33, err := p.AcquireBridge(context.Background(), "client-tok-new", modelA)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := p.bridgeLen(); got != maxBridgeEntries {
-		t.Errorf("bridge entries = %d, want %d (cap maintained; new entry self-evicted)", got, maxBridgeEntries)
+	if got := p.bridgeLen(); got != maxBridgeEntries+1 {
+		t.Errorf("bridge entries = %d, want %d (new entry kept; cap briefly exceeded until a lease drains)", got, maxBridgeEntries+1)
 	}
-	if e := p.bridgeToken("client-tok-new"); e != nil {
-		t.Error("new entry still cached after all-busy eviction, want evicted")
+	if e := p.bridgeToken("client-tok-new"); e == nil {
+		t.Error("new entry not cached after all-busy creation, want kept (its run would otherwise leak)")
 	}
 	// The busy entries all survived.
 	for i := 0; i < maxBridgeEntries; i++ {
 		if e := p.bridgeToken(fmt.Sprintf("client-tok-%02d", i)); e == nil {
 			t.Errorf("busy entry client-tok-%02d evicted", i)
 		}
+	}
+	// No runs were FINISHed: nothing was evictable this pass.
+	if got := parentFinished(mock); len(got) != 0 {
+		t.Errorf("finished runs = %d, want 0 (nothing evictable while all entries busy)", len(got))
 	}
 	for _, l := range held {
 		p.LeaseRelease(l)
@@ -454,7 +461,7 @@ func TestRemoveLastTokenDrainsRun(t *testing.T) {
 
 	// The removed token's run was FINISHed and its admitted session ended
 	// (both synchronous inside RemoveLastToken).
-	if got := mock.FinishedRunsSnapshot(); len(got) != 1 || got[0].Status != "completed" {
+	if got := parentFinished(mock); len(got) != 1 || got[0].Status != "completed" {
 		t.Errorf("finished runs = %v, want 1 completed", got)
 	}
 	if mock.SessionEnds != 1 {
@@ -589,11 +596,12 @@ func TestRemoveLastTokenRaceHammer(t *testing.T) {
 	}
 }
 
-// TestMaintainTickAdvancesQueuedAndHeartbeatsActive is the first E2E
-// coverage of the maintain pass's session work: a queued session is advanced
+// TestMaintainTickAdvancesQueuedAndPollsActive is the first E2E coverage of
+// the maintain pass's session work: a queued session is advanced
 // (EnsureSession polls upstream) once its pollAt passes, and an active
-// session is heartbeated. Both are observable via mock.SessionPolls.
-func TestMaintainTickAdvancesQueuedAndHeartbeatsActive(t *testing.T) {
+// session is liveness-polled on the jittered sessionPollTick schedule. Both
+// are observable via mock.SessionPolls.
+func TestMaintainTickAdvancesQueuedAndPollsActive(t *testing.T) {
 	mock := testutil.NewMock()
 	defer mock.Close()
 	mock.SessionSequence = []string{"queued", "active"}
@@ -623,11 +631,12 @@ func TestMaintainTickAdvancesQueuedAndHeartbeatsActive(t *testing.T) {
 		t.Errorf("session status = %q, want active after queued advance", got)
 	}
 
-	// Once active, a maintain pass heartbeats (another poll).
+	// Once active, a sessionPollTick pass with a due schedule polls again
+	// (the plain compact poll — no heartbeat header; gap #2).
 	polls := mock.SessionPolls
-	p.maintainTick(context.Background())
+	p.sessionPollTick(context.Background())
 	if got := mock.SessionPolls; got <= polls {
-		t.Errorf("session polls = %d, want > %d (heartbeat on active)", got, polls)
+		t.Errorf("session polls = %d, want > %d (poll on active)", got, polls)
 	}
 }
 
@@ -651,31 +660,33 @@ func TestEmptyPoolAcquire(t *testing.T) {
 	}
 }
 
-// TestTestToken pins the dashboard test action: TestToken runs a real
-// session handshake (create + end) against the token's upstream client and
-// returns the created instance id.
-func TestTestToken(t *testing.T) {
+// TestProbeToken pins the dashboard test action: ProbeToken runs a
+// zero-cost GET session probe (no session claimed) against the token's
+// upstream client and returns the live session state with quota.
+func TestProbeToken(t *testing.T) {
 	mock := testutil.NewMock()
 	defer mock.Close()
 	p := newTestPool(t, mock)
 
-	id, err := p.TestToken(context.Background(), 0, modelA)
+	st, err := p.ProbeToken(context.Background(), 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if id != "inst-abc-123" {
-		t.Errorf("instance id = %q, want inst-abc-123", id)
+	if st == nil {
+		t.Fatal("ProbeToken returned nil state, want live session state")
 	}
-	if mock.SessionCreates != 1 {
-		t.Errorf("session creates = %d, want 1", mock.SessionCreates)
+	// The probe is a GET with no instance header: it claims no session slot.
+	if mock.SessionCreates != 0 {
+		t.Errorf("session creates = %d, want 0 (probe must not claim a session)", mock.SessionCreates)
 	}
-	if mock.SessionEnds != 1 {
-		t.Errorf("session ends = %d, want 1 (test session ended)", mock.SessionEnds)
+	// The probe surfaces the live quota from rateLimitsByModel.
+	if len(st.RateLimitsByModel) == 0 {
+		t.Errorf("RateLimitsByModel = %v, want quota from the probe response", st.RateLimitsByModel)
 	}
 
 	// Out-of-range tokens error without panicking.
-	if _, err := p.TestToken(context.Background(), 99, modelA); err == nil {
-		t.Error("TestToken(99) succeeded, want out-of-range error")
+	if _, err := p.ProbeToken(context.Background(), 99); err == nil {
+		t.Error("ProbeToken(99) succeeded, want out-of-range error")
 	}
 }
 
@@ -699,8 +710,18 @@ func TestFinishTokenRuns(t *testing.T) {
 		t.Errorf("ActiveRuns = %d, want 0 after FinishTokenRuns", got)
 	}
 	finished := mock.FinishedRunsSnapshot()
-	if len(finished) != 1 || finished[0].Status != "completed" {
-		t.Errorf("finished runs = %v, want 1 completed", finished)
+	// Issue #91: each run START also creates+FINISHes a context-pruner child
+	// run (best-effort, async), so the raw finished count includes the
+	// child. Assert the PARENT run was FINISHed with status completed
+	// (race-stable — the child may or may not have landed yet).
+	parentFinished := false
+	for _, f := range finished {
+		if f.RunID == "run-0001" && f.Status == "completed" {
+			parentFinished = true
+		}
+	}
+	if !parentFinished {
+		t.Errorf("finished runs = %v, want run-0001 completed", finished)
 	}
 
 	// Out-of-range tokens error without panicking.

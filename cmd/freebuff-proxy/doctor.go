@@ -3,11 +3,13 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -32,27 +34,6 @@ func egressRegionRow(cache *egress.Cache) (line string, warn bool) {
 	return fmt.Sprintf("Egress region: %s (%s)", r.Country, r.IP), false
 }
 
-// runTokenTest probes the first configured token with a real session
-// handshake (the same path the pool uses) and exits 0 on success, 1 on
-// failure. Exposed as -test-token for installers and scripts.
-// probeModel returns the safest model to probe a token with: the fallback
-// default (deepseek-v4-flash — the model every account gets, incl. limited
-// tier) when in the catalog, else the first catalog model. The alphabetical
-// first model (anthropic/claude-fable-5) is a capacity-gated offer model
-// that makes token tests fail on most accounts.
-func probeModel(reg *registry.Registry) string {
-	models := reg.Models()
-	if len(models) == 0 {
-		return ""
-	}
-	for _, id := range models {
-		if id == "deepseek/deepseek-v4-flash" {
-			return id
-		}
-	}
-	return models[0]
-}
-
 // doctorTargetHost derives the host the doctor's DNS/TLS reachability
 // checks probe, from the upstream base URL. An explicit port on the URL is
 // stripped: LookupHost and tls.Dial take a bare host, and "host:8443" would
@@ -67,6 +48,21 @@ func doctorTargetHost(upstreamBaseURL string) string {
 		return u.Host
 	}
 	return "www.codebuff.com"
+}
+
+// doctorTargetPort returns the TCP port the doctor's TLS check probes, from
+// the upstream base URL. It defaults to "443" when the URL carries no
+// explicit port (or is unparseable/hostless), keeping the default
+// codebuff.com behavior identical. A self-hosted UPSTREAM_BASE_URL with an
+// explicit port (e.g. https://host:8443) must probe that port, not 443 —
+// otherwise the TLS diagnostic fails falsely against a healthy config.
+func doctorTargetPort(upstreamBaseURL string) string {
+	if u, err := url.Parse(upstreamBaseURL); err == nil && u.Host != "" {
+		if _, port, err := net.SplitHostPort(u.Host); err == nil && port != "" {
+			return port
+		}
+	}
+	return "443"
 }
 
 // tokenFormatWarn returns the doctor's warning for a configured token, or
@@ -93,6 +89,10 @@ func doctorSummary(passed, warnings, failed int) string {
 	return fmt.Sprintf("\nSummary: %d passed, %d warnings, %d failed", passed, warnings, failed)
 }
 
+// runTokenTest probes the first configured token with a zero-cost GET
+// /api/v1/freebuff/session probe (no session claimed, no daily slot
+// consumed) and exits 0 on success, 1 on failure. Exposed as -test-token
+// for installers and scripts.
 func runTokenTest(configPath string) {
 	cfg, err := config.Load(configPath)
 	if err != nil {
@@ -103,13 +103,6 @@ func runTokenTest(configPath string) {
 		fmt.Fprintln(os.Stderr, "freebuff-proxy: -test-token: no AUTH_TOKENS configured (bridge mode); nothing to probe")
 		os.Exit(1)
 	}
-	reg := registry.New(&cfg, &http.Client{Timeout: 10 * time.Second})
-	reg.LoadFallback()
-	model := probeModel(reg)
-	if model == "" {
-		fmt.Fprintln(os.Stderr, "freebuff-proxy: -test-token: registry has no models to probe against")
-		os.Exit(1)
-	}
 	clientCfg := cfg
 	client, err := upstream.New(cfg.AuthTokens[0], &clientCfg)
 	if err != nil {
@@ -118,16 +111,46 @@ func runTokenTest(configPath string) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
-	st, err := client.CreateSessionForModel(ctx, model)
+	st, err := client.ProbeAccount(ctx)
 	if err != nil {
+		if errors.Is(err, upstream.ErrNoActiveSession) {
+			fmt.Println("freebuff-proxy: token OK (no active session)")
+			os.Exit(0)
+		}
 		fmt.Fprintf(os.Stderr, "freebuff-proxy: -test-token: token rejected upstream: %v\n", err)
 		os.Exit(1)
 	}
-	endCtx, endCancel := context.WithTimeout(context.Background(), 5*time.Second)
-	_ = client.EndSession(endCtx, st.InstanceID)
-	endCancel()
-	fmt.Printf("freebuff-proxy: token OK (%s, session %s)\n", model, st.InstanceID)
+	fmt.Printf("freebuff-proxy: token OK%s\n", quotaSuffix(st))
 	os.Exit(0)
+}
+
+// quotaSuffix renders the live session quota read back by a successful
+// account probe: " — quota: 4/5 pacific_day, resets 2026-08-16T07:00:00Z"
+// (the account's own model when present in rateLimitsByModel, else the
+// first entry by sorted model id). Returns "" when the probe response
+// carried no quota — compact responses omit rateLimitsByModel, so the line
+// degrades to a plain "token OK".
+func quotaSuffix(st *upstream.SessionState) string {
+	if st == nil || len(st.RateLimitsByModel) == 0 {
+		return ""
+	}
+	q, ok := st.RateLimitsByModel[st.Model]
+	if !ok {
+		ids := make([]string, 0, len(st.RateLimitsByModel))
+		for id := range st.RateLimitsByModel {
+			ids = append(ids, id)
+		}
+		sort.Strings(ids)
+		q = st.RateLimitsByModel[ids[0]]
+	}
+	s := fmt.Sprintf(" — quota: %g/%g", q.RecentCount, q.Limit)
+	if q.Period != "" {
+		s += " " + q.Period
+	}
+	if !q.ResetAt.IsZero() {
+		s += fmt.Sprintf(", resets %s", q.ResetAt.Format(time.RFC3339))
+	}
+	return s
 }
 
 func runDoctor(configPath string) {
@@ -183,6 +206,7 @@ func runDoctor(configPath string) {
 
 	// DNS & TLS reachability check
 	targetHost := doctorTargetHost(cfg.UpstreamBaseURL)
+	targetPort := doctorTargetPort(cfg.UpstreamBaseURL)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
@@ -194,18 +218,19 @@ func runDoctor(configPath string) {
 	}
 
 	dialer := &net.Dialer{Timeout: 5 * time.Second}
-	tlsConn, err := tls.DialWithDialer(dialer, "tcp", targetHost+":443", &tls.Config{ServerName: targetHost})
+	tlsConn, err := tls.DialWithDialer(dialer, "tcp", net.JoinHostPort(targetHost, targetPort), &tls.Config{ServerName: targetHost})
 	if err != nil {
-		fail(fmt.Sprintf("TLS connection to %s:443 failed: %v", targetHost, err))
+		fail(fmt.Sprintf("TLS connection to %s:%s failed: %v", targetHost, targetPort, err))
 	} else {
 		_ = tlsConn.Close()
-		ok(fmt.Sprintf("TLS connection to %s:443 succeeded", targetHost))
+		ok(fmt.Sprintf("TLS connection to %s:%s succeeded", targetHost, targetPort))
 	}
 
 	// Egress region check: one live probe of the direct outbound path
-	// through a plain dialer, read back from the cache the doctor shares
-	// with the runtime. A failed probe is a warning, not a doctor failure —
-	// the proxy keeps working, only the region readout is missing.
+	// through a plain dialer. The probe result lands in a doctor-local
+	// cache (the runtime no longer probes — #123); a failed probe is a
+	// warning, not a doctor failure — the proxy keeps working, only the
+	// region readout is missing.
 	egressCache := egress.NewCache()
 	probeCtx, probeCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	res := egress.Probe(probeCtx, egress.DirectDialer(5*time.Second), 5*time.Second)
@@ -228,33 +253,33 @@ func runDoctor(configPath string) {
 		ok(fmt.Sprintf("Registry live refresh succeeded (%d models)", reg.ModelCount()))
 	}
 
-	// Token validity probe: one real session handshake per configured token,
-	// through the same client path the pool uses. This is the check that
-	// catches expired/revoked tokens before the first chat 401s.
+	// Token validity probe: one zero-cost GET /api/v1/freebuff/session probe
+	// per configured token (no session claimed, no daily slot consumed). This
+	// is the check that catches expired/revoked tokens before the first chat
+	// 401s. Probes always run: unlike the old session-handshake probes they
+	// never touch the session create API, so there is no allowance cost to
+	// opt out of.
 	if !cfg.BridgeMode() {
-		probe := probeModel(reg)
-		if probe == "" {
-			warn("Cannot probe tokens: registry has no models")
-		} else {
-			for i, tok := range cfg.AuthTokens {
-				clientCfg := cfg
-				client, err := upstream.New(tok, &clientCfg)
-				if err != nil {
-					fail(fmt.Sprintf("Token #%d: cannot build client: %v", i+1, err))
-					continue
-				}
-				probeCtx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
-				st, err := client.CreateSessionForModel(probeCtx, probe)
-				cancel()
-				if err != nil {
-					fail(fmt.Sprintf("Token #%d validity probe failed: %v (re-run the upstream CLI to refresh the token)", i+1, err))
-					continue
-				}
-				endCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-				_ = client.EndSession(endCtx, st.InstanceID)
-				cancel()
-				ok(fmt.Sprintf("Token #%d validity probe succeeded (session handshake)", i+1))
+		warn(fmt.Sprintf("Probing %d token(s) (zero-cost GET probes)", len(cfg.AuthTokens)))
+		for i, tok := range cfg.AuthTokens {
+			clientCfg := cfg
+			client, err := upstream.New(tok, &clientCfg)
+			if err != nil {
+				fail(fmt.Sprintf("Token #%d: cannot build client: %v", i+1, err))
+				continue
 			}
+			probeCtx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+			_, err = client.ProbeAccount(probeCtx)
+			cancel()
+			if err != nil {
+				if errors.Is(err, upstream.ErrNoActiveSession) {
+					ok(fmt.Sprintf("Token #%d validity probe succeeded (no active session)", i+1))
+					continue
+				}
+				fail(fmt.Sprintf("Token #%d validity probe failed: %v (re-run the upstream CLI to refresh the token)", i+1, err))
+				continue
+			}
+			ok(fmt.Sprintf("Token #%d validity probe succeeded", i+1))
 		}
 	}
 

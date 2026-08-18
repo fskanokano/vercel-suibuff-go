@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -18,9 +19,32 @@ import (
 
 // FinishedRun records an agent-run FINISH payload received by the mock.
 type FinishedRun struct {
-	RunID      string `json:"runId"`
-	Status     string `json:"status"`
-	TotalSteps int    `json:"totalSteps"`
+	RunID        string `json:"runId"`
+	Status       string `json:"status"`
+	TotalSteps   int    `json:"totalSteps"`
+	ErrorMessage string `json:"errorMessage,omitempty"`
+	// Steps mirrors the CLI step wire shape, captured from the FINISH
+	// payload (issue #114): steps are batched and sent WITH FINISH.
+	Steps []RecordedStep `json:"steps,omitempty"`
+}
+
+// StartRequest records one agent-runs START payload (issue #91).
+type StartRequest struct {
+	AgentID        string   `json:"agentId"`
+	AncestorRunIDs []string `json:"ancestorRunIds"`
+}
+
+// RecordedStep mirrors one agent-run step as received in a FINISH payload
+// (issue #114): steps are batched and sent WITH FINISH — the CLI has no
+// /steps endpoint.
+type RecordedStep struct {
+	ID          string   `json:"id"`
+	StepNumber  int      `json:"stepNumber"`
+	Credits     int      `json:"credits,omitempty"`
+	ChildRunIDs []string `json:"childRunIds,omitempty"`
+	MessageID   *string  `json:"messageId"`
+	Status      string   `json:"status,omitempty"`
+	StartTime   string   `json:"startTime"`
 }
 
 // MockUpstream is a scriptable codebuff.com stand-in.
@@ -54,9 +78,25 @@ type MockUpstream struct {
 	CountryCode        string
 	CountryBlockReason string
 
+	// Standing, when non-empty, is embedded in the session create/poll
+	// response body's "standing" key (issue #96) so dashboard e2e tests can
+	// exercise the account-standing data chain end-to-end.
+	Standing map[string]any
+
 	// RunIDs is the queue of run ids returned by agent-runs START.
 	RunIDs []string
 	runIdx int
+
+	// ChildRunIDs is the queue of run ids returned by context-pruner START
+	// (issue #91); defaults to child-run-NNNN when empty.
+	ChildRunIDs []string
+	childRunIdx int
+	// ChildRunsStarted records the parent run ids of context-pruner STARTs
+	// (issue #91, locked accessor ChildRunsStartedSnapshot).
+	ChildRunsStarted []string
+	// StartRequests records every agent-runs START payload (agentId +
+	// ancestorRunIds) so tests can assert the run-tree wiring.
+	StartRequests []StartRequest
 
 	ChatStatus    int    // 200 by default
 	ChatBody      string // SSE body served on 200
@@ -99,6 +139,7 @@ type MockUpstream struct {
 	RecordedChatBodies  []string
 	SessionCreates      int
 	SessionPolls        int
+	SessionProbes       int // token-level probes: GET session without x-freebuff-instance-id
 	SessionEnds         int
 	StartedRuns         []string
 	FinishedRuns        []FinishedRun
@@ -106,6 +147,22 @@ type MockUpstream struct {
 	// (any route). Tests assert it stays unchanged when a pass must not
 	// touch the upstream at all.
 	Requests int
+
+	// AuthCLICodeStatus is the status served by POST /api/auth/cli/code
+	// (issue #62/#66); 200 by default. AuthCLICodeBody overrides the JSON
+	// body served; the default is a valid code response with LoginURL.
+	AuthCLICodeStatus int
+	AuthCLICodeBody   string
+	// AuthCLICodeRequests counts POST /api/auth/cli/code hits.
+	AuthCLICodeRequests int
+	// AuthCLIStatusBody is the JSON body served by GET
+	// /api/auth/cli/status. When empty, the response is 401 (pending).
+	// AuthCLIStatusRequests counts status polls.
+	AuthCLIStatusBody     string
+	AuthCLIStatusRequests int
+	// AuthCLIHandler fully overrides both /api/auth/cli/* routes when set
+	// (route dispatch falls through to it after the request counters).
+	AuthCLIHandler func(w http.ResponseWriter, r *http.Request)
 }
 
 // NewMock starts the mock server. Call Close when done.
@@ -170,6 +227,16 @@ func (m *MockUpstream) handle(w http.ResponseWriter, r *http.Request) {
 			m.mu.Unlock()
 			m.handleSession(w, r)
 		case http.MethodGet:
+			if r.Header.Get("x-freebuff-instance-id") == "" {
+				// Token-level probe: a GET with no instance header claims no
+				// session slot. Serve a zero-cost account state (status +
+				// rateLimitsByModel) instead of the session poll body.
+				m.mu.Lock()
+				m.SessionProbes++
+				m.mu.Unlock()
+				m.handleProbe(w)
+				return
+			}
 			m.mu.Lock()
 			m.SessionPolls++
 			m.mu.Unlock()
@@ -187,6 +254,38 @@ func (m *MockUpstream) handle(w http.ResponseWriter, r *http.Request) {
 		m.handleAgentRuns(w, r)
 	case r.URL.Path == "/api/v1/chat/completions" && r.Method == http.MethodPost:
 		m.handleChat(w, r)
+	case r.URL.Path == "/api/auth/cli/code" && r.Method == http.MethodPost:
+		m.mu.Lock()
+		m.AuthCLICodeRequests++
+		status, body := m.AuthCLICodeStatus, m.AuthCLICodeBody
+		handler := m.AuthCLIHandler
+		m.mu.Unlock()
+		if handler != nil {
+			handler(w, r)
+			return
+		}
+		if status == 0 {
+			status = http.StatusOK
+		}
+		if body == "" {
+			body = `{"fingerprintId":"enhanced-test","fingerprintHash":"fp-hash-1","loginUrl":"https://github.com/login/oauth/authorize?auth_code=abc","expiresAt":` + strconv.FormatInt(time.Now().Add(5*time.Minute).UnixMilli(), 10) + `}`
+		}
+		writeRaw(w, status, body)
+	case r.URL.Path == "/api/auth/cli/status" && r.Method == http.MethodGet:
+		m.mu.Lock()
+		m.AuthCLIStatusRequests++
+		statusBody := m.AuthCLIStatusBody
+		handler := m.AuthCLIHandler
+		m.mu.Unlock()
+		if handler != nil {
+			handler(w, r)
+			return
+		}
+		if statusBody == "" {
+			w.WriteHeader(401)
+			return
+		}
+		writeRaw(w, 200, statusBody)
 	default:
 		writeJSON(w, 404, `{"error":"not found"}`)
 	}
@@ -227,6 +326,7 @@ func (m *MockUpstream) handleSession(w http.ResponseWriter, r *http.Request) {
 	instanceID, expiresIn := m.InstanceID, m.ExpiresIn
 	limits := m.RateLimitsByModel
 	tier, countryCode, countryBlockReason := m.AccessTier, m.CountryCode, m.CountryBlockReason
+	standing := m.Standing
 	m.mu.Unlock()
 
 	switch mode {
@@ -250,6 +350,9 @@ func (m *MockUpstream) handleSession(w http.ResponseWriter, r *http.Request) {
 		}
 		if countryBlockReason != "" {
 			body["countryBlockReason"] = countryBlockReason
+		}
+		if len(standing) > 0 {
+			body["standing"] = standing
 		}
 		writeJSON(w, 200, body)
 	case "queued":
@@ -289,29 +392,86 @@ func (m *MockUpstream) handleSession(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// defaultProbeQuota is the rateLimitsByModel map served on a token-level
+// probe (GET /api/v1/freebuff/session without x-freebuff-instance-id) when
+// the test configured none. Small, realistic pacific_day quota so probe
+// flows can assert parsed quota without wiring their own map.
+var defaultProbeQuota = map[string]any{
+	"deepseek/deepseek-v4-flash": map[string]any{
+		"model":         "deepseek/deepseek-v4-flash",
+		"limit":         6,
+		"recentCount":   2,
+		"period":        "pacific_day",
+		"resetTimeZone": "America/Los_Angeles",
+		"resetAt":       "2026-08-17T07:00:00.000Z",
+	},
+}
+
+// handleProbe serves a token-level probe: 200 with an active account state,
+// an instanceId, and the configured (or default) rateLimitsByModel. The
+// probe is zero-cost — no session slot is claimed — so a valid token always
+// succeeds regardless of SessionMode; tests needing a different probe
+// response install a custom SessionHandler.
+func (m *MockUpstream) handleProbe(w http.ResponseWriter) {
+	m.mu.Lock()
+	instanceID := m.InstanceID
+	limits := m.RateLimitsByModel
+	m.mu.Unlock()
+	if len(limits) == 0 {
+		limits = defaultProbeQuota
+	}
+	writeJSON(w, 200, map[string]any{
+		"status":            "active",
+		"instanceId":        instanceID,
+		"rateLimitsByModel": limits,
+	})
+}
+
 func (m *MockUpstream) handleAgentRuns(w http.ResponseWriter, r *http.Request) {
 	body, _ := io.ReadAll(r.Body)
 	var payload struct {
-		Action  string `json:"action"`
-		AgentID string `json:"agentId"`
-		RunID   string `json:"runId"`
-		Status  string `json:"status"`
-		Steps   int    `json:"totalSteps"`
+		Action         string         `json:"action"`
+		AgentID        string         `json:"agentId"`
+		RunID          string         `json:"runId"`
+		Status         string         `json:"status"`
+		TotalSteps     int            `json:"totalSteps"`
+		ErrorMessage   string         `json:"errorMessage"`
+		StepList       []RecordedStep `json:"steps"`
+		AncestorRunIDs []string       `json:"ancestorRunIds"`
 	}
 	_ = json.Unmarshal(body, &payload)
 
 	switch payload.Action {
 	case "START":
 		m.mu.Lock()
-		idx := m.runIdx
-		if idx >= len(m.RunIDs) {
-			m.mu.Unlock()
-			writeJSON(w, 500, map[string]any{"error": "no mock run ids left"})
-			return
+		m.StartRequests = append(m.StartRequests, StartRequest{
+			AgentID:        payload.AgentID,
+			AncestorRunIDs: append([]string(nil), payload.AncestorRunIDs...),
+		})
+		var runID string
+		if payload.AgentID == "context-pruner" {
+			// Issue #91: the context-pruner child of a parent run gets its
+			// own id queue (parent + child ids must not alias).
+			idx := m.childRunIdx
+			m.childRunIdx++
+			m.ChildRunsStarted = append(m.ChildRunsStarted, firstOf(payload.AncestorRunIDs))
+			if idx >= len(m.ChildRunIDs) {
+				m.mu.Unlock()
+				writeJSON(w, 200, map[string]any{"runId": fmt.Sprintf("child-run-%04d", idx+1)})
+				return
+			}
+			runID = m.ChildRunIDs[idx]
+		} else {
+			idx := m.runIdx
+			if idx >= len(m.RunIDs) {
+				m.mu.Unlock()
+				writeJSON(w, 500, map[string]any{"error": "no mock run ids left"})
+				return
+			}
+			m.runIdx++
+			runID = m.RunIDs[idx]
+			m.StartedRuns = append(m.StartedRuns, payload.AgentID)
 		}
-		m.runIdx++
-		runID := m.RunIDs[idx]
-		m.StartedRuns = append(m.StartedRuns, payload.AgentID)
 		m.mu.Unlock()
 		writeJSON(w, 200, map[string]any{"runId": runID})
 	case "FINISH":
@@ -336,15 +496,40 @@ func (m *MockUpstream) handleAgentRuns(w http.ResponseWriter, r *http.Request) {
 		}
 		m.mu.Lock()
 		m.FinishedRuns = append(m.FinishedRuns, FinishedRun{
-			RunID:      payload.RunID,
-			Status:     payload.Status,
-			TotalSteps: payload.Steps,
+			RunID:        payload.RunID,
+			Status:       payload.Status,
+			TotalSteps:   payload.TotalSteps,
+			ErrorMessage: payload.ErrorMessage,
+			Steps:        append([]RecordedStep(nil), payload.StepList...),
 		})
 		m.mu.Unlock()
 		writeJSON(w, 200, map[string]any{"ok": true})
 	default:
 		writeJSON(w, 400, map[string]any{"error": "unknown action " + payload.Action})
 	}
+}
+
+// firstOf returns the first element, or "" for an empty slice.
+func firstOf(s []string) string {
+	if len(s) == 0 {
+		return ""
+	}
+	return s[0]
+}
+
+// StartRequestsSnapshot returns a locked copy of the START payloads.
+func (m *MockUpstream) StartRequestsSnapshot() []StartRequest {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]StartRequest(nil), m.StartRequests...)
+}
+
+// ChildRunsStartedSnapshot returns a locked copy of the context-pruner
+// parent ids.
+func (m *MockUpstream) ChildRunsStartedSnapshot() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]string(nil), m.ChildRunsStarted...)
 }
 
 func (m *MockUpstream) handleChat(w http.ResponseWriter, r *http.Request) {
@@ -450,6 +635,33 @@ func (m *MockUpstream) FinishesStartedSnapshot() int {
 	return m.FinishesStarted
 }
 
+// RequestsSnapshot returns a locked copy of the total-request counter (see
+// StartedRunsSnapshot). Tests assert it stays unchanged while a pass must
+// not touch the upstream at all.
+func (m *MockUpstream) RequestsSnapshot() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.Requests
+}
+
+// SetFinishDelay sets FinishDelay under the mock's lock. Tests must use it
+// instead of a plain field write: the agent-runs handler reads FinishDelay
+// under the lock while a FINISH may already be in flight, so an unlocked
+// write races under -race.
+func (m *MockUpstream) SetFinishDelay(d time.Duration) {
+	m.mu.Lock()
+	m.FinishDelay = d
+	m.mu.Unlock()
+}
+
+// SetFinishFailures sets FinishFailures under the mock's lock (see
+// SetFinishDelay).
+func (m *MockUpstream) SetFinishFailures(n int) {
+	m.mu.Lock()
+	m.FinishFailures = n
+	m.mu.Unlock()
+}
+
 // SessionCreatesSnapshot returns a locked copy of the session-create
 // counter (see StartedRunsSnapshot). Tests poll it while an admission is in
 // flight without racing the mock server goroutine.
@@ -457,4 +669,12 @@ func (m *MockUpstream) SessionCreatesSnapshot() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.SessionCreates
+}
+
+// SessionProbesSnapshot returns a locked copy of the token-probe (GET
+// session without x-freebuff-instance-id) counter (see StartedRunsSnapshot).
+func (m *MockUpstream) SessionProbesSnapshot() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.SessionProbes
 }

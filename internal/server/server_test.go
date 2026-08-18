@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -46,6 +47,7 @@ func newTestServerCfg(t *testing.T, apiKeys []string, mut func(*config.Config), 
 		RegistryRefresh:    6 * time.Hour,
 		UpstreamBaseURL:    "https://www.codebuff.com",
 		APIKeys:            apiKeys,
+		LogAccess:          true,
 	}
 	if mut != nil {
 		mut(cfg)
@@ -164,17 +166,32 @@ func TestChatStream(t *testing.T) {
 		t.Fatalf("upstream chat calls = %d, want 1", len(mock.RecordedChatHeaders))
 	}
 	h := mock.RecordedChatHeaders[0]
-	if got := h.Get("x-freebuff-model"); got != modelA {
-		t.Errorf("x-freebuff-model = %q, want %q", got, modelA)
+	// #106: the chat POST carries no model/instance headers — they ride in
+	// the body metadata only.
+	if got := h.Get("x-freebuff-model"); got != "" {
+		t.Errorf("x-freebuff-model = %q on the chat POST, want absent (#106)", got)
 	}
-	if got := h.Get("x-freebuff-instance-id"); got != "inst-abc-123" {
-		t.Errorf("x-freebuff-instance-id = %q, want inst-abc-123", got)
+	if got := h.Get("x-freebuff-instance-id"); got != "" {
+		t.Errorf("x-freebuff-instance-id = %q on the chat POST, want absent (#106)", got)
 	}
 	recorded := mock.RecordedChatBodies[0]
 	for _, want := range []string{`"codebuff_metadata"`, `"data_collection":"deny"`, `"stream":true`, `"stop":["cb_easp"]`, `"run_id":"run-0001"`} {
 		if !strings.Contains(recorded, want) {
 			t.Errorf("upstream body missing %s: %s", want, recorded)
 		}
+	}
+	// #80+#103: trace_session_id is minted once per run and threaded through
+	// the envelope; client_id is a FRESH random 13-char base36 draw per chat
+	// call — never the sess:/run:-prefixed shapes the server fingerprints as
+	// a proxy.
+	if !strings.Contains(recorded, `"trace_session_id":"`) {
+		t.Errorf("upstream body missing trace_session_id: %s", recorded)
+	}
+	if strings.Contains(recorded, `"client_id":"sess:`) || strings.Contains(recorded, `"client_id":"run:`) {
+		t.Errorf("upstream body carries a prefixed client_id: %s", recorded)
+	}
+	if !regexp.MustCompile(`"client_id":"[a-z0-9]{13}"`).MatchString(recorded) {
+		t.Errorf("upstream body missing a 13-char base36 client_id: %s", recorded)
 	}
 }
 
@@ -256,6 +273,96 @@ func TestChatNonStream(t *testing.T) {
 	}
 	if out.Usage.TotalTokens != 30 || out.Usage.PromptTokens != 10 || out.Usage.CompletionTokens != 20 {
 		t.Errorf("usage = %+v, want 10/20/30", out.Usage)
+	}
+}
+
+// TestChatFeedsSpendLedger pins the #122 spend feeder: every successful chat
+// completion records the upstream usage total into the token's spend ledger
+// (streaming and non-stream paths), so SpendDay/Spend24h reflect real usage
+// instead of the pre-wiring zeros.
+func TestChatFeedsSpendLedger(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mock.ChatBody = testutil.SSEEvent(chunk("chatcmpl-s1", 1, `"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]`)) +
+		testutil.SSEEvent(chunk("chatcmpl-s1", 1, `"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":11,"completion_tokens":2,"total_tokens":13}`))
+	ts, pool := newTestServer(t, nil, mock)
+
+	req := `{"model":"` + modelA + `","messages":[{"role":"user","content":"hi"}],"stream":true}`
+	resp, data := doJSON(t, http.MethodPost, ts.URL+"/v1/chat/completions", []byte(req), nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("stream status = %d, want 200: %s", resp.StatusCode, data)
+	}
+
+	snaps := pool.Snapshot()
+	if len(snaps) != 1 {
+		t.Fatalf("pool tokens = %d, want 1", len(snaps))
+	}
+	if snaps[0].SpendDay != 13 || snaps[0].Spend24h != 13 {
+		t.Errorf("spend after stream chat = %d/%d, want 13/13 (usage 11+2)", snaps[0].SpendDay, snaps[0].Spend24h)
+	}
+
+	// The non-stream path feeds the same ledger: a second completion
+	// accumulates on top.
+	mock.ChatBody = testutil.SSEEvent(chunk("chatcmpl-s2", 2, `"choices":[{"index":0,"delta":{"content":"yo"},"finish_reason":null}]`)) +
+		testutil.SSEEvent(chunk("chatcmpl-s2", 2, `"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":7,"total_tokens":12}`))
+	req2 := `{"model":"` + modelA + `","messages":[{"role":"user","content":"hi"}],"stream":false}`
+	resp2, _ := doJSON(t, http.MethodPost, ts.URL+"/v1/chat/completions", []byte(req2), nil)
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("non-stream status = %d, want 200", resp2.StatusCode)
+	}
+	snaps = pool.Snapshot()
+	if snaps[0].SpendDay != 25 || snaps[0].Spend24h != 25 {
+		t.Errorf("spend after two chats = %d/%d, want 25/25 (13+12)", snaps[0].SpendDay, snaps[0].Spend24h)
+	}
+}
+
+// TestHealthzSpend pins the /healthz spend surface (issue #122): the ledger
+// buckets fed by the chat feeder, the advisory MAX_SPEND_PER_DAY ceiling
+// (SpendLimit), the capped SpendPct, and the SpendLimited refusal counter.
+func TestHealthzSpend(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mock.ChatBody = testutil.SSEEvent(chunk("chatcmpl-s1", 1, `"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]`)) +
+		testutil.SSEEvent(chunk("chatcmpl-s1", 1, `"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":11,"completion_tokens":2,"total_tokens":13}`))
+	ts, _ := newTestServerCfg(t, nil, func(c *config.Config) { c.MaxSpendPerDay = 100 }, mock)
+
+	req := `{"model":"` + modelA + `","messages":[{"role":"user","content":"hi"}],"stream":true}`
+	resp, data := doJSON(t, http.MethodPost, ts.URL+"/v1/chat/completions", []byte(req), nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("stream status = %d, want 200: %s", resp.StatusCode, data)
+	}
+
+	resp, data = doJSON(t, http.MethodGet, ts.URL+"/healthz", nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("healthz status = %d, want 200: %s", resp.StatusCode, data)
+	}
+	var out struct {
+		Tokens []struct {
+			Spend24h     int64 `json:"Spend24h"`
+			SpendDay     int64 `json:"SpendDay"`
+			SpendLimit   int64 `json:"SpendLimit"`
+			SpendPct     int   `json:"SpendPct"`
+			SpendLimited int   `json:"SpendLimited"`
+		} `json:"tokens"`
+	}
+	if err := json.Unmarshal(data, &out); err != nil {
+		t.Fatalf("healthz is not JSON: %v: %s", err, data)
+	}
+	if len(out.Tokens) != 1 {
+		t.Fatalf("tokens = %d, want 1", len(out.Tokens))
+	}
+	tok := out.Tokens[0]
+	if tok.Spend24h != 13 || tok.SpendDay != 13 {
+		t.Errorf("healthz spend = %d/%d, want 13/13 (usage 11+2)", tok.Spend24h, tok.SpendDay)
+	}
+	if tok.SpendLimit != 100 {
+		t.Errorf("SpendLimit = %d, want 100 (MAX_SPEND_PER_DAY)", tok.SpendLimit)
+	}
+	if tok.SpendPct != 13 {
+		t.Errorf("SpendPct = %d, want 13 (13 of 100)", tok.SpendPct)
+	}
+	if tok.SpendLimited != 0 {
+		t.Errorf("SpendLimited = %d, want 0 (no upstream spend_limited refusals)", tok.SpendLimited)
 	}
 }
 
@@ -377,12 +484,29 @@ func TestRunInvalidRecovers(t *testing.T) {
 	if !strings.Contains(string(data), "recovered") {
 		t.Errorf("retry stream missing content: %s", data)
 	}
-	if got := len(mock.StartedRuns); got != 2 {
+	if got := len(mock.StartedRunsSnapshot()); got != 2 {
 		t.Errorf("started runs = %d, want 2 (re-START after run-invalid)", got)
 	}
-	if got := len(mock.FinishedRuns); got != 0 {
-		t.Errorf("finished runs = %d, want 0 (invalidated run is not FINISHed)", got)
-	}
+	// Issue #91: every new parent run creates a context-pruner child run that
+	// is started and immediately FINISHed as a best-effort side effect
+	// through the bounded queue. The invalidated run-0001 contributes its
+	// child's FINISH, and the re-STARTed run-0002 contributes its child's
+	// FINISH — so exactly 2 upstream FINISH calls (child-run ids only, never
+	// a FINISH of the invalidated parent). The queue is async: poll.
+	// FinishedRunsSnapshot() is the race-safe accessor (the mock's server
+	// goroutine appends to FinishedRuns).
+	eventually(t, "both context-pruner children FINISHed", func() bool {
+		finished := mock.FinishedRunsSnapshot()
+		if len(finished) != 2 {
+			return false
+		}
+		for _, f := range finished {
+			if !strings.HasPrefix(f.RunID, "child-run-") {
+				return false
+			}
+		}
+		return true
+	})
 }
 
 func TestChatSessionInvalidBoundedRetry(t *testing.T) {
@@ -391,8 +515,11 @@ func TestChatSessionInvalidBoundedRetry(t *testing.T) {
 	// Every chat returns a session-invalid error. Without a retry budget the
 	// recovery loop re-creates the session and re-chats forever, hanging the
 	// client; the budget must cap it at one retry (2 chat attempts total).
+	// session_superseded is its OWN terminal sentinel (see
+	// TestChatSessionSupersededTerminal) — this test uses session_expired to
+	// pin the invalidate+reacquire-once budget for ErrSessionInvalid.
 	mock.ChatStatus = http.StatusBadRequest
-	mock.ChatErrorBody = `{"error":{"message":"session_superseded"}}`
+	mock.ChatErrorBody = `{"error":{"message":"session_expired"}}`
 	ts, _ := newTestServer(t, nil, mock)
 
 	// A client timeout makes a regression (unbounded loop) fail fast instead
@@ -416,6 +543,73 @@ func TestChatSessionInvalidBoundedRetry(t *testing.T) {
 	}
 	if got := mock.SessionCreates; got != 2 {
 		t.Errorf("upstream session creates = %d, want exactly 2 (bounded retry)", got)
+	}
+}
+
+// TestChatSessionSupersededRetries pins #119: 409 session_superseded (another
+// instance took over the account, endsTheSession:true) retries once — the
+// cached session is dropped and a fresh session is acquired for the retry.
+// This avoids the 30s model lock 9router applies on a 503 response. Two chat
+// attempts, two session creates, success on the retry.
+func TestChatSessionSupersededRetries(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	// First chat attempt returns session_superseded, second succeeds.
+	callCount := 0
+	originalHandler := mock.ChatHandler
+	mock.ChatHandler = func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		if callCount == 1 {
+			// First call: session_superseded
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":{"message":"session_superseded"}}`))
+			return
+		}
+		// Second call: success
+		if originalHandler != nil {
+			originalHandler(w, r)
+		} else {
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte("data: " + chunk("cmpl-test", 1234567890, `"choices":[{"delta":{"content":"ok"},"index":0}]`) + "\n\n"))
+			_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		}
+	}
+	ts, _ := newTestServer(t, nil, mock)
+
+	resp, data := doJSON(t, http.MethodPost, ts.URL+"/v1/chat/completions", chatBody(modelA), nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", resp.StatusCode, data)
+	}
+	if got := len(mock.RecordedChatHeaders); got != 2 {
+		t.Errorf("upstream chat attempts = %d, want exactly 2 (retry on superseded)", got)
+	}
+	if got := mock.SessionCreates; got != 2 {
+		t.Errorf("session creates = %d, want exactly 2 (invalidated + re-acquired)", got)
+	}
+}
+
+// TestChatSessionSupersededBoundedRetry pins #119: when the retry ALSO fails
+// on session_superseded, the attempt budget caps at 2 attempts and surfaces
+// 503 session_superseded with Retry-After: 1.
+func TestChatSessionSupersededBoundedRetry(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mock.ChatStatus = http.StatusBadRequest
+	mock.ChatErrorBody = `{"error":{"message":"session_superseded"}}`
+	ts, _ := newTestServer(t, nil, mock)
+
+	resp, data := doJSON(t, http.MethodPost, ts.URL+"/v1/chat/completions", chatBody(modelA), nil)
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503: %s", resp.StatusCode, data)
+	}
+	if !strings.Contains(string(data), "session_superseded") {
+		t.Errorf("body missing session_superseded: %s", data)
+	}
+	if got := len(mock.RecordedChatHeaders); got != 2 {
+		t.Errorf("upstream chat attempts = %d, want exactly 2 (bounded retry on superseded)", got)
+	}
+	if got := mock.SessionCreates; got != 2 {
+		t.Errorf("session creates = %d, want exactly 2 (invalidated + re-acquired once)", got)
 	}
 }
 
@@ -577,8 +771,10 @@ func TestModelsEndpoint(t *testing.T) {
 	if out.Object != "list" {
 		t.Errorf("object = %q, want list", out.Object)
 	}
-	if len(out.Data) < 15 {
-		t.Errorf("models = %d, want >= 15", len(out.Data))
+	// #121: the offline fallback pruned 5 dead model ids (laguna/ling/greg),
+	// 15 -> 10 rows (registry fallbackAgents, free-agents.ts-verified).
+	if len(out.Data) < 10 {
+		t.Errorf("models = %d, want >= 10", len(out.Data))
 	}
 	for i, m := range out.Data {
 		if m.ID == "" || m.Object != "model" || m.OwnedBy == "" {
@@ -623,8 +819,9 @@ func TestHealthz(t *testing.T) {
 	if out.UptimeSeconds < 0 {
 		t.Errorf("uptime_seconds = %v, want >= 0", out.UptimeSeconds)
 	}
-	if out.Models < 15 {
-		t.Errorf("models = %d, want >= 15", out.Models)
+	// #121: fallback registry 15 -> 10 rows after pruning dead model ids.
+	if out.Models < 10 {
+		t.Errorf("models = %d, want >= 10", out.Models)
 	}
 	if len(out.Tokens) != 2 {
 		t.Errorf("tokens = %d, want 2", len(out.Tokens))
@@ -774,7 +971,7 @@ func TestModelsAnnotationWithQuota(t *testing.T) {
 // TestModelsRegionLimited verifies the tier-aware annotation: with a token in
 // the 'limited' tier (region/privacy demotion), a model outside the limited
 // allowlist with no admission signal is marked available=false +
-// status=region_limited, while an allowlisted model (deepseek-v4-flash) stays
+// status=region_limited, while an allowlisted model (mimo-v2.5) stays
 // available. An admitted model keeps its available status (admission is
 // ground truth).
 func TestModelsRegionLimited(t *testing.T) {
@@ -815,9 +1012,18 @@ func TestModelsRegionLimited(t *testing.T) {
 			Status    string
 		}{m.Available, m.Status}
 	}
-	// deepseek-v4-flash is on the limited allowlist -> available.
-	if m, ok := byID["deepseek/deepseek-v4-flash"]; !ok || !m.Available {
-		t.Errorf("deepseek-v4-flash = %+v, want available:true on limited tier", m)
+	// mimo/mimo-v2.5 is on the limited allowlist -> available.
+	if m, ok := byID["mimo/mimo-v2.5"]; !ok || !m.Available {
+		t.Errorf("mimo/mimo-v2.5 = %+v, want available:true on limited tier", m)
+	}
+	// deepseek-v4-flash is NOT on the limited allowlist anymore (disabled upstream)
+	// and was never admitted -> available:false + region_limited.
+	if m, ok := byID["deepseek/deepseek-v4-flash"]; !ok {
+		t.Errorf("deepseek-v4-flash missing from /v1/models")
+	} else if m.Available {
+		t.Errorf("deepseek-v4-flash available = true, want false on limited tier")
+	} else if m.Status != "region_limited" {
+		t.Errorf("deepseek-v4-flash status = %q, want region_limited", m.Status)
 	}
 	// anthropic/claude-fable-5 is NOT on the limited allowlist and was never
 	// admitted -> available:false + region_limited.
@@ -863,16 +1069,19 @@ func TestModelsHideUnavailable(t *testing.T) {
 		if m.ID == "anthropic/claude-fable-5" {
 			t.Errorf("fable-5 present in /v1/models with MODELS_HIDE_UNAVAILABLE=true")
 		}
+		if m.ID == "deepseek/deepseek-v4-flash" {
+			t.Errorf("deepseek-v4-flash present in /v1/models with MODELS_HIDE_UNAVAILABLE=true (disabled on limited tier)")
+		}
 	}
 	found := false
 	for _, m := range out.Data {
-		if m.ID == "deepseek/deepseek-v4-flash" {
+		if m.ID == "mimo/mimo-v2.5" {
 			found = true
 			break
 		}
 	}
 	if !found {
-		t.Errorf("deepseek-v4-flash pruned, want kept (limited allowlist)")
+		t.Errorf("mimo/mimo-v2.5 pruned, want kept (limited allowlist)")
 	}
 }
 
@@ -893,8 +1102,16 @@ func TestSmokeDefaultsToFallbackModel(t *testing.T) {
 	if len(mock.RecordedChatHeaders) == 0 {
 		t.Fatal("no upstream chat recorded")
 	}
-	if got := mock.RecordedChatHeaders[0].Get("x-freebuff-model"); got != "deepseek/deepseek-v4-flash" {
-		t.Errorf("smoke probe model = %q, want deepseek/deepseek-v4-flash", got)
+	// #106: the smoke probe is a chat POST — the model rides in the body,
+	// not an x-freebuff-model header.
+	if got := mock.RecordedChatHeaders[0].Get("x-freebuff-model"); got != "" {
+		t.Errorf("smoke probe chat POST carries x-freebuff-model %q, want absent (#106)", got)
+	}
+	if len(mock.RecordedChatBodies) == 0 {
+		t.Fatal("no upstream chat body recorded")
+	}
+	if !strings.Contains(mock.RecordedChatBodies[0], `"model":"deepseek/deepseek-v4-flash"`) {
+		t.Errorf("smoke probe body missing model deepseek/deepseek-v4-flash: %s", mock.RecordedChatBodies[0])
 	}
 }
 
@@ -1552,6 +1769,70 @@ func TestUpstreamRetryableNotBlindRetried(t *testing.T) {
 	}
 }
 
+// TestChatCapacityDeferredSurfaced429 verifies #105 (server half): once the
+// client-side capacity-deferred budget is exhausted, the gateway surfaces the
+// free tier's transient capacity queue as 429 free_mode_capacity_deferred +
+// Retry-After (the upstream window) — never the old bare 502 upstream_
+// unavailable or a generic 503 upstream_retryable — so downstream clients
+// honor the window instead of re-POSTing immediately. The mock sees exactly
+// one chat call: the typed error unwraps to a Retryable UpstreamError, so
+// chatAttempt must not blind-retry it a second time.
+func TestChatCapacityDeferredSurfaced429(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	var chatCalls atomic.Int32
+	mock.ChatHandler = func(w http.ResponseWriter, r *http.Request) {
+		chatCalls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Retry-After", "7")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = io.WriteString(w, `{"error":{"code":"free_mode_capacity_deferred","message":"Free mode is at capacity; your request will be retried automatically","retryAfterMs":7000}}`)
+	}
+	// TRANSIENT_RETRIES=0 = exhausted budget: the client surfaces the typed
+	// CapacityDeferredError immediately (no in-place retry, no retry-after
+	// sleep), so the server mapping is exercised on the first call.
+	ts, _ := newTestServerCfg(t, nil, func(cfg *config.Config) { cfg.TransientRetries = 0 }, mock)
+
+	resp, data := doJSON(t, http.MethodPost, ts.URL+"/v1/chat/completions", chatBody(modelA), nil)
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429: %s", resp.StatusCode, data)
+	}
+	if ra := resp.Header.Get("Retry-After"); ra != "7" {
+		t.Errorf("Retry-After = %q, want 7 (the upstream window, ceil seconds)", ra)
+	}
+	if !strings.Contains(string(data), `"code":"free_mode_capacity_deferred"`) {
+		t.Errorf("body missing free_mode_capacity_deferred code: %s", data)
+	}
+	if got := chatCalls.Load(); got != 1 {
+		t.Errorf("upstream chat calls = %d, want 1 (no blind retry after budget exhaustion)", got)
+	}
+}
+
+// TestChatCapacityDeferredDefaultRetryAfter verifies the 10s Retry-After
+// fallback when the upstream free_mode_capacity_deferred response carries no
+// retry-after window (the AI SDK's default honor window).
+func TestChatCapacityDeferredDefaultRetryAfter(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mock.ChatHandler = func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = io.WriteString(w, `{"error":{"code":"free_mode_capacity_deferred","message":"Free mode is at capacity; your request will be retried automatically"}}`)
+	}
+	ts, _ := newTestServerCfg(t, nil, func(cfg *config.Config) { cfg.TransientRetries = 0 }, mock)
+
+	resp, data := doJSON(t, http.MethodPost, ts.URL+"/v1/chat/completions", chatBody(modelA), nil)
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429: %s", resp.StatusCode, data)
+	}
+	if ra := resp.Header.Get("Retry-After"); ra != "10" {
+		t.Errorf("Retry-After = %q, want 10 (default window)", ra)
+	}
+	if !strings.Contains(string(data), `"code":"free_mode_capacity_deferred"`) {
+		t.Errorf("body missing free_mode_capacity_deferred code: %s", data)
+	}
+}
+
 // TestBridgeModeHealthzReportsMode pins the healthz "mode" field in pure
 // bridge mode.
 func TestBridgeModeHealthzReportsMode(t *testing.T) {
@@ -1714,5 +1995,386 @@ func TestBridgeRequestsServedCounter(t *testing.T) {
 	}
 	if got := p.PoolSnapshot().RequestsServed; got != 3 {
 		t.Fatalf("RequestsServed = %d, want 3 (bridge chats must count)", got)
+	}
+}
+
+// TestBearerCaseInsensitiveVariants verifies lowercase bearer and mixed-case BEARER
+// work for API authentication, admin endpoints, and bridge token extraction.
+func TestBearerCaseInsensitiveVariants(t *testing.T) {
+	t.Run("API auth accepts case variations", func(t *testing.T) {
+		mock := testutil.NewMock()
+		defer mock.Close()
+		ts, _ := newTestServer(t, []string{"sk-test"}, mock)
+		chatURL := ts.URL + "/v1/chat/completions"
+
+		for _, auth := range []string{
+			"Bearer sk-test",
+			"bearer sk-test",
+			"BEARER sk-test",
+			"bEaReR sk-test",
+		} {
+			resp, data := doJSON(t, http.MethodPost, chatURL, chatBody(modelA), map[string]string{"Authorization": auth})
+			if resp.StatusCode != http.StatusOK {
+				t.Errorf("auth %q status = %d, want 200: %s", auth, resp.StatusCode, data)
+			}
+		}
+	})
+
+	t.Run("admin reload accepts case variations", func(t *testing.T) {
+		for _, auth := range []string{
+			"bearer admin-secret",
+			"BEARER admin-secret",
+		} {
+			mock := testutil.NewMock()
+			ts, _ := newTestServerCfg(t, nil, func(cfg *config.Config) { cfg.AdminToken = "admin-secret" }, mock)
+			resp, data := doJSON(t, http.MethodPost, ts.URL+"/admin/reload", nil, map[string]string{"Authorization": auth})
+			mock.Close()
+			if resp.StatusCode != http.StatusOK {
+				t.Errorf("admin auth %q status = %d, want 200: %s", auth, resp.StatusCode, data)
+			}
+		}
+	})
+
+	t.Run("bridge mode token extraction accepts case variations", func(t *testing.T) {
+		mock := testutil.NewMock()
+		defer mock.Close()
+		mock.ChatBody = testutil.SSEEvent(chunk("chatcmpl-b3", 1, `"choices":[{"index":0,"delta":{"content":"bridged"},"finish_reason":null}]`))
+		ts, _ := newBridgeTestServer(t, mock)
+		chatURL := ts.URL + "/v1/chat/completions"
+
+		for _, auth := range []string{
+			"bearer client-tok-lower",
+			"BEARER client-tok-upper",
+		} {
+			resp, data := doJSON(t, http.MethodPost, chatURL, chatBody(modelA), map[string]string{"Authorization": auth})
+			if resp.StatusCode != http.StatusOK {
+				t.Errorf("bridge auth %q status = %d, want 200: %s", auth, resp.StatusCode, data)
+			}
+		}
+	})
+}
+
+// --- Issue #74 P2: per-(egress, model) unfit registry ---
+
+// limitedChatBody renders the upstream 409 body classifyError maps to
+// upstream.LimitedIpError (session_model_mismatch + "limited" marker).
+func limitedChatBody() string {
+	return `{"status":"session_model_mismatch","message":"model ` + modelA + ` is limited on this IP"}`
+}
+
+// errorCode extracts the OpenAI error.code from a response body.
+func errorCode(t *testing.T, data []byte) string {
+	t.Helper()
+	var body struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(data, &body); err != nil {
+		t.Fatalf("body is not the OpenAI error shape: %v: %s", err, data)
+	}
+	return body.Error.Code
+}
+
+// writeRawJSON writes a pre-formatted JSON body (the mock's writeJSON helper
+// is unexported; scripted ChatHandler/SessionHandler tests write raw bodies).
+func writeRawJSON(w http.ResponseWriter, status int, raw string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_, _ = io.WriteString(w, raw)
+}
+
+// TestChatModelIPLimitedMarked pins the chat-level limited_ip flow: a 409
+// session_model_mismatch+limited chat error surfaces as 409 model_ip_limited
+// (never session-invalid, never a session invalidation) and marks the
+// (egress, model) pairing unfit.
+func TestChatModelIPLimitedMarked(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mock.ChatStatus = http.StatusConflict
+	mock.ChatErrorBody = limitedChatBody()
+	ts, p := newTestServer(t, nil, mock)
+	chatURL := ts.URL + "/v1/chat/completions"
+
+	resp, data := doJSON(t, http.MethodPost, chatURL, chatBody(modelA), nil)
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("status = %d, want 409: %s", resp.StatusCode, data)
+	}
+	if got := errorCode(t, data); got != "model_ip_limited" {
+		t.Errorf("code = %q, want model_ip_limited", got)
+	}
+	until, _ := p.ModelUnfit(modelA)
+	if until.IsZero() {
+		t.Error("pool unfit not set after limited chat")
+	}
+}
+
+// TestChatModelIPLimitedFastRefusal pins the fast-refusal guard: while
+// (egress, model) is marked unfit, a new request is refused at the entry
+// guard with 409 model_ip_limited and NO new upstream chat call. The first
+// (marking) request retries once inside chatAttempt, so it hits upstream
+// twice.
+func TestChatModelIPLimitedFastRefusal(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	var chatCalls atomic.Int32
+	mock.ChatHandler = func(w http.ResponseWriter, r *http.Request) {
+		chatCalls.Add(1)
+		writeRawJSON(w, http.StatusConflict, limitedChatBody())
+	}
+	ts, p := newTestServer(t, nil, mock)
+	chatURL := ts.URL + "/v1/chat/completions"
+
+	// First request: the limited error marks unfit and chatAttempt retries
+	// once through a fresh acquire (a different token may still serve the
+	// model) before surfacing the 409 — exactly two upstream chat calls.
+	resp, data := doJSON(t, http.MethodPost, chatURL, chatBody(modelA), nil)
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("first request status = %d, want 409: %s", resp.StatusCode, data)
+	}
+	if got := chatCalls.Load(); got != 2 {
+		t.Errorf("first request upstream chat calls = %d, want 2 (retry-once)", got)
+	}
+	if until, _ := p.ModelUnfit(modelA); until.IsZero() {
+		t.Fatal("unfit not marked after first request")
+	}
+
+	// Second request: refused at the entry guard — no upstream chat hit.
+	resp2, data2 := doJSON(t, http.MethodPost, chatURL, chatBody(modelA), nil)
+	if resp2.StatusCode != http.StatusConflict {
+		t.Fatalf("second request status = %d, want 409: %s", resp2.StatusCode, data2)
+	}
+	if got := errorCode(t, data2); got != "model_ip_limited" {
+		t.Errorf("second request code = %q, want model_ip_limited", got)
+	}
+	if got := chatCalls.Load(); got != 2 {
+		t.Errorf("second request upstream chat calls = %d, want 2 (fast-refused, no new chat)", got)
+	}
+}
+
+// TestChatModelIPLimitedSuccessClears pins the success-side clear: a
+// successful chat is egress-level proof the model is servable again, so the
+// unfit mark is dropped. The mark is cleared between requests (simulating
+// the window lapsing) so the second request passes the entry guard and
+// reaches chatAttempt, where its retry lands on the 200.
+func TestChatModelIPLimitedSuccessClears(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	var chatCalls atomic.Int32
+	mock.ChatHandler = func(w http.ResponseWriter, r *http.Request) {
+		// Calls 1-2: request 1's two chatAttempt attempts both see the
+		// limited 409 (marking the pair unfit). Call 3: request 2's first
+		// attempt (re-marks). Call 4+: the upstream serves the model again,
+		// so request 2's retry lands on the 200 and clears the mark.
+		if chatCalls.Add(1) <= 3 {
+			writeRawJSON(w, http.StatusConflict, limitedChatBody())
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, testutil.SSEEvent(chunk("chatcmpl-u1", 1, `"choices":[{"index":0,"delta":{"content":"recovered"},"finish_reason":null}]`)))
+	}
+	ts, p := newTestServer(t, nil, mock)
+	chatURL := ts.URL + "/v1/chat/completions"
+
+	// First request: limited 409 (both retry attempts limited).
+	resp, data := doJSON(t, http.MethodPost, chatURL, chatBody(modelA), nil)
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("first request status = %d, want 409: %s", resp.StatusCode, data)
+	}
+	if until, _ := p.ModelUnfit(modelA); until.IsZero() {
+		t.Fatal("unfit not marked after limited response")
+	}
+
+	// Simulate the unfit window lapsing so the second request is not
+	// fast-refused at the entry guard — it must reach chatAttempt, where
+	// the retry lands on the 200 and the success path clears the mark.
+	p.ClearModelUnfit(modelA)
+
+	resp2, data2 := doJSON(t, http.MethodPost, chatURL, chatBody(modelA), nil)
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("second request status = %d, want 200: %s", resp2.StatusCode, data2)
+	}
+	if !strings.Contains(string(data2), "recovered") {
+		t.Errorf("stream missing recovered content: %s", data2)
+	}
+	if until, _ := p.ModelUnfit(modelA); !until.IsZero() {
+		t.Errorf("unfit not cleared after successful chat (until = %v)", until)
+	}
+}
+
+// TestBridgeModelUnfitNotGated pins the bridge exemption: bridge clients
+// relay their own token (their account may serve the model on this egress
+// and their session slots are theirs to spend), so the registry never gates
+// them even when (egress, model) is marked unfit.
+func TestBridgeModelUnfitNotGated(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mock.ChatBody = testutil.SSEEvent(chunk("chatcmpl-bg1", 1, `"choices":[{"index":0,"delta":{"content":"bridged"},"finish_reason":null}]`))
+	ts, p := newBridgeTestServer(t, mock)
+	chatURL := ts.URL + "/v1/chat/completions"
+
+	p.MarkModelUnfit(modelA, &upstream.LimitedIpError{Body: "pre-marked unfit"})
+	if until, _ := p.ModelUnfit(modelA); until.IsZero() {
+		t.Fatal("pre-mark not set")
+	}
+
+	resp, data := doJSON(t, http.MethodPost, chatURL, chatBody(modelA), map[string]string{"Authorization": "Bearer client-tok-abc"})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("bridge status = %d, want 200 (bridge never gated): %s", resp.StatusCode, data)
+	}
+	if !strings.Contains(string(data), "bridged") {
+		t.Errorf("stream missing bridged content: %s", data)
+	}
+	if got := len(mock.RecordedChatHeaders); got != 1 {
+		t.Errorf("upstream chat calls = %d, want 1 (bridge ignored the unfit mark)", got)
+	}
+}
+
+// TestChatModelIPLimitedAdmissionPath covers the admission-path end-to-end:
+// the session create itself returns 409 limited, the pool marks (egress,
+// model) unfit and surfaces the LimitedIpError, and the chat surfaces 409
+// model_ip_limited. The session is never admitted, so no chat call fires.
+func TestChatModelIPLimitedAdmissionPath(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mock.SessionHandler = func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			writeRawJSON(w, http.StatusConflict, limitedChatBody())
+			return
+		}
+		writeRawJSON(w, http.StatusNotFound, `{"error":"not found"}`)
+	}
+	ts, p := newTestServer(t, nil, mock)
+	chatURL := ts.URL + "/v1/chat/completions"
+
+	resp, data := doJSON(t, http.MethodPost, chatURL, chatBody(modelA), nil)
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("status = %d, want 409: %s", resp.StatusCode, data)
+	}
+	if got := errorCode(t, data); got != "model_ip_limited" {
+		t.Errorf("code = %q, want model_ip_limited", got)
+	}
+	until, _ := p.ModelUnfit(modelA)
+	if until.IsZero() {
+		t.Error("pool unfit not set after admission-path limited refusal")
+	}
+}
+
+// TestChatModelIPLimitedConcurrentRefusals pins the unfit-guard race fix
+// (SEC-1): concurrent requests to an unfit model are all fast-refused at the
+// entry guard with 409 and never reach the upstream. CI runs the suite with
+// -race, which the pre-fix in-place RetryAfter mutation of the shared
+// registry error would flag.
+func TestChatModelIPLimitedConcurrentRefusals(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mock.ChatHandler = func(w http.ResponseWriter, r *http.Request) {
+		writeRawJSON(w, http.StatusConflict, limitedChatBody())
+	}
+	ts, p := newTestServer(t, nil, mock)
+	chatURL := ts.URL + "/v1/chat/completions"
+	body := chatBody(modelA)
+
+	// Prime the unfit mark with one limited response.
+	resp, _ := doJSON(t, http.MethodPost, chatURL, body, nil)
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("prime status = %d, want 409", resp.StatusCode)
+	}
+	if until, _ := p.ModelUnfit(modelA); until.IsZero() {
+		t.Fatal("unfit not marked after prime")
+	}
+	// Let any tail-end upstream activity from the prime's retry flow settle,
+	// then baseline: the entry-guard refusals must add ZERO upstream calls.
+	time.Sleep(300 * time.Millisecond)
+	before := mock.RequestsSnapshot()
+
+	// Now the entry guard fast-refuses; hammer it concurrently. Every
+	// refusal must be 409 and the upstream must see no new calls.
+	const n = 16
+	var wg sync.WaitGroup
+	codes := make([]int, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			r, err := http.Post(chatURL, "application/json", bytes.NewReader(body))
+			if err != nil {
+				codes[i] = -1
+				return
+			}
+			defer func() { _ = r.Body.Close() }()
+			_, _ = io.Copy(io.Discard, r.Body)
+			codes[i] = r.StatusCode
+		}(i)
+	}
+	wg.Wait()
+	for i, c := range codes {
+		if c != http.StatusConflict {
+			t.Errorf("request %d status = %d, want 409", i, c)
+		}
+	}
+	if got := mock.RequestsSnapshot(); got != before {
+		t.Errorf("upstream requests = %d, want %d (prime baseline; guard refusals never reach upstream)", got, before)
+	}
+}
+
+// TestChatSpendLedgerIgnoresUsageNull pins the relayStream usage guard: a
+// trailing chunk carrying "usage":null must not zero the spend ledger — only
+// chunks that actually carry a usage block may update it.
+func TestChatSpendLedgerIgnoresUsageNull(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mock.ChatBody = testutil.SSEEvent(chunk("chatcmpl-u1", 1, `"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]`)) +
+		testutil.SSEEvent(chunk("chatcmpl-u1", 1, `"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":11,"completion_tokens":2,"total_tokens":13}`)) +
+		testutil.SSEEvent(chunk("chatcmpl-u1", 1, `"choices":[{"index":0,"delta":{},"finish_reason":null}],"usage":null`))
+	ts, pool := newTestServer(t, nil, mock)
+	req := `{"model":"` + modelA + `","messages":[{"role":"user","content":"hi"}],"stream":true}`
+	resp, data := doJSON(t, http.MethodPost, ts.URL+"/v1/chat/completions", []byte(req), nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("stream status = %d, want 200: %s", resp.StatusCode, data)
+	}
+	snaps := pool.Snapshot()
+	if len(snaps) != 1 {
+		t.Fatalf("pool tokens = %d, want 1", len(snaps))
+	}
+	if snaps[0].SpendDay != 13 || snaps[0].Spend24h != 13 {
+		t.Errorf("spend after usage-null trailing chunk = %d/%d, want 13/13 (not zeroed)", snaps[0].SpendDay, snaps[0].Spend24h)
+	}
+}
+
+// TestAdminSensitiveLoopbackHostGate pins the SEC-2 rebinding guard: in open
+// mode (ADMIN_TOKEN unset) a loopback-remote request with a non-loopback
+// Host header is refused on secret-bearing routes, while a loopback Host is
+// served.
+func TestAdminSensitiveLoopbackHostGate(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	ts, _ := newTestServer(t, nil, mock)
+
+	// Loopback remote + loopback Host (127.0.0.1): served.
+	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/admin/config", nil)
+	req.Host = "127.0.0.1:3457"
+	resp, err := ts.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode == http.StatusForbidden {
+		t.Fatal("loopback Host was restricted")
+	}
+
+	// Loopback remote + attacker Host (DNS rebinding): restricted 403.
+	req2, _ := http.NewRequest(http.MethodGet, ts.URL+"/admin/config", nil)
+	req2.Host = "attacker.example:3457"
+	resp2, err := ts.Client().Do(req2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.Copy(io.Discard, resp2.Body)
+	_ = resp2.Body.Close()
+	if resp2.StatusCode != http.StatusForbidden {
+		t.Errorf("non-loopback Host status = %d, want 403 (restricted)", resp2.StatusCode)
 	}
 }

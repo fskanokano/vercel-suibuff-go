@@ -35,9 +35,24 @@ type persistedState struct {
 	CountryBlockReason string    `json:"country_block_reason"`
 }
 
+// PersistedRun is the on-disk shape of one token's active agent run
+// (issue #40): a restart resumes the run id without re-START. Keyed per
+// token (hash) and agent, alongside the session state.
+type PersistedRun struct {
+	RunID          string    `json:"run_id"`
+	AgentID        string    `json:"agent_id"`
+	TraceSessionID string    `json:"trace_session_id"`
+	StartedAt      time.Time `json:"started_at"`
+	Requests       int       `json:"requests"`
+}
+
 type storeFile struct {
 	Version  int                       `json:"version"`
 	Sessions map[string]persistedState `json:"sessions"`
+	// Runs maps token key → agent id → persisted run (issue #40). Additive
+	// since version 1: old files parse with an empty runs map, and old
+	// binaries ignore the extra field.
+	Runs map[string]map[string]PersistedRun `json:"runs,omitempty"`
 }
 
 // Store persists cached session state to a single JSON file so a proxy
@@ -50,6 +65,7 @@ type Store struct {
 
 	mu     sync.Mutex
 	data   map[string]persistedState
+	runs   map[string]map[string]PersistedRun // token key → agent id → run (issue #40)
 	loaded bool
 	// readFailed is set when a read of the on-disk file failed with a
 	// non-NotExist error (chmod 000, transient EIO). While set, Save/Remove
@@ -58,33 +74,35 @@ type Store struct {
 	// flag is cleared once a load succeeds (the on-disk content is then
 	// established and a flush is safe again).
 	readFailed bool
+	// pending records mutations that could not be flushed while readFailed
+	// was set (key → state written, nil for a removal). loadLocked merges
+	// them back over the disk content on the next successful reload so the
+	// in-window updates survive instead of being silently discarded by the
+	// rebuild (a lost update would leave a restart unable to resume the
+	// session, burning a daily slot). Guarded by mu.
+	pending map[string]*persistedState
 }
 
 // NewStore builds a store backed by path. The file is read lazily on the
 // first Load; NewStore never fails (a missing/unreadable file is treated as
 // empty and a later Save overwrites it).
 func NewStore(path string) *Store {
-	return &Store{path: path}
+	return &Store{path: path, pending: make(map[string]*persistedState), runs: make(map[string]map[string]PersistedRun)}
 }
 
 func (s *Store) loadLocked() {
 	if s.loaded {
 		return
 	}
-	// Initialize the map only once. On a retry after a failed read the map
-	// may already hold entries buffered by Save/Remove while the file was
-	// unreadable; resetting it here would silently drop those in-memory
-	// updates before they can ever be flushed (see the readFailed handling
-	// below and flushLockedUnlessReadFailed).
-	if s.data == nil {
-		s.data = make(map[string]persistedState)
-	}
+	s.data = make(map[string]persistedState)
+	s.runs = make(map[string]map[string]PersistedRun)
 
 	// Reject oversized files before reading them into memory.
 	if fi, err := os.Stat(s.path); err == nil && fi.Size() > maxStoreFileSize {
 		slog.Warn("session store: file too large, ignoring", "path", s.path, "bytes", fi.Size())
 		s.loaded = true
 		s.readFailed = false
+		s.applyPendingLocked()
 		return
 	}
 
@@ -94,6 +112,7 @@ func (s *Store) loadLocked() {
 			// First run: a missing file is a valid empty store.
 			s.loaded = true
 			s.readFailed = false
+			s.applyPendingLocked()
 		} else {
 			// Leave loaded=false so the next Load (or Save) retries the
 			// read instead of permanently freezing an empty view that a
@@ -112,12 +131,14 @@ func (s *Store) loadLocked() {
 		slog.Warn("session store: parse failed, ignoring", "path", s.path, "err", err)
 		s.loaded = true
 		s.readFailed = false
+		s.applyPendingLocked()
 		return
 	}
 	if file.Version != storeVersion {
 		slog.Warn("session store: version mismatch, ignoring", "path", s.path, "version", file.Version)
 		s.loaded = true
 		s.readFailed = false
+		s.applyPendingLocked()
 		return
 	}
 	if file.Sessions != nil {
@@ -128,18 +149,30 @@ func (s *Store) loadLocked() {
 				slog.Warn("session store: dropping active entry with empty instance id", "path", s.path, "key", key)
 				continue
 			}
-			// A key already buffered in memory reflects a Save/Remove that
-			// happened while the file was unreadable, i.e. newer runtime state
-			// than the on-disk copy. Keep it instead of clobbering it with the
-			// stale disk value.
-			if _, ok := s.data[key]; ok {
+			s.data[key] = ps
+		}
+	}
+	if file.Runs != nil {
+		for key, agents := range file.Runs {
+			if len(agents) == 0 {
 				continue
 			}
-			s.data[key] = ps
+			runMap := make(map[string]PersistedRun, len(agents))
+			for agentID, pr := range agents {
+				// A run entry without an id cannot be resumed; drop it.
+				if pr.RunID == "" {
+					continue
+				}
+				runMap[agentID] = pr
+			}
+			if len(runMap) > 0 {
+				s.runs[key] = runMap
+			}
 		}
 	}
 	s.loaded = true
 	s.readFailed = false
+	s.applyPendingLocked()
 }
 
 // Load returns the persisted cached state for key, or nil when absent or
@@ -157,6 +190,9 @@ func (s *Store) Load(key string) *cachedState {
 	// impossible and keeping them only delays the inevitable re-create.
 	if !ps.GracePeriodEndsAt.IsZero() && time.Now().After(ps.GracePeriodEndsAt) {
 		delete(s.data, key)
+		if s.flushLockedUnlessReadFailed() {
+			s.recordPendingLocked(key, nil)
+		}
 		return nil
 	}
 	return &cachedState{
@@ -186,7 +222,9 @@ func (s *Store) Save(key string, cs *cachedState) {
 
 	if cs == nil || (cs.instanceID == "" && cs.status != "queued") {
 		delete(s.data, key)
-		s.flushLockedUnlessReadFailed()
+		if s.flushLockedUnlessReadFailed() {
+			s.recordPendingLocked(key, nil)
+		}
 		return
 	}
 	s.data[key] = persistedState{
@@ -202,7 +240,10 @@ func (s *Store) Save(key string, cs *cachedState) {
 		CountryCode:        cs.countryCode,
 		CountryBlockReason: cs.countryBlockReason,
 	}
-	s.flushLockedUnlessReadFailed()
+	if s.flushLockedUnlessReadFailed() {
+		ps := s.data[key]
+		s.recordPendingLocked(key, &ps)
+	}
 }
 
 // Remove drops key from the store (session invalidated/ended at runtime).
@@ -225,6 +266,68 @@ func (s *Store) Remove(key, expectedInstanceID string) {
 		return
 	}
 	delete(s.data, key)
+	if s.flushLockedUnlessReadFailed() {
+		s.recordPendingLocked(key, nil)
+	}
+}
+
+// SaveRun persists one active run for token key under agentID (issue #40).
+// A run with an empty id is dropped. Best-effort: a skipped flush (file
+// unreadable) is tolerated — the run is simply re-STARTed after a restart.
+func (s *Store) SaveRun(key, agentID string, pr PersistedRun) {
+	if key == "" || agentID == "" || pr.RunID == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.loadLocked()
+	agents := s.runs[key]
+	if agents == nil {
+		agents = make(map[string]PersistedRun)
+		s.runs[key] = agents
+	}
+	agents[agentID] = pr
+	s.flushLockedUnlessReadFailed()
+}
+
+// LoadRun returns the persisted run for token key + agentID, or nil when
+// absent. The caller (runs manager) decides whether the run is fresh enough
+// to adopt; LoadRun never performs upstream calls.
+func (s *Store) LoadRun(key, agentID string) *PersistedRun {
+	if key == "" || agentID == "" {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.loadLocked()
+	pr, ok := s.runs[key][agentID]
+	if !ok {
+		return nil
+	}
+	copy := pr
+	return &copy
+}
+
+// RemoveRun drops the persisted run for token key + agentID (FINISHed
+// upstream or superseded by a fresh START).
+func (s *Store) RemoveRun(key, agentID string) {
+	if key == "" || agentID == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.loadLocked()
+	agents, ok := s.runs[key]
+	if !ok {
+		return
+	}
+	if _, ok := agents[agentID]; !ok {
+		return
+	}
+	delete(agents, agentID)
+	if len(agents) == 0 {
+		delete(s.runs, key)
+	}
 	s.flushLockedUnlessReadFailed()
 }
 
@@ -233,18 +336,59 @@ func (s *Store) Remove(key, expectedInstanceID string) {
 // over an unreadable file would destroy every other token's persisted entry.
 // The in-memory update is kept so the store stays consistent once the file
 // becomes readable again; a warn log is the only signal that persistence was
-// skipped.
-func (s *Store) flushLockedUnlessReadFailed() {
+// skipped. Returns true when the flush was skipped (file unreadable) so the
+// caller records the mutation into pending — otherwise a later successful
+// reload would rebuild s.data from disk and silently drop the update.
+func (s *Store) flushLockedUnlessReadFailed() bool {
 	if s.readFailed {
 		slog.Warn("session store: file unreadable, skipping persist (in-memory update kept)", "path", s.path)
+		return true
+	}
+	s.flushLocked()
+	return false
+}
+
+// recordPendingLocked remembers a mutation that could not be flushed because
+// the file was unreadable (readFailed): the key with the state that was
+// written, or nil for a removal. A later successful loadLocked merges
+// pending back over the disk content so the in-window update survives the
+// reload instead of being lost. Caller holds s.mu.
+func (s *Store) recordPendingLocked(key string, ps *persistedState) {
+	if s.pending == nil {
+		s.pending = make(map[string]*persistedState)
+	}
+	s.pending[key] = ps
+}
+
+// applyPendingLocked merges mutations recorded while the file was unreadable
+// back over the freshly-loaded disk view and persists the result: a nil
+// value removes the key, a non-nil value restores the in-memory update that
+// was never flushed. Without this, a Save/Remove made during the failure
+// window would be silently discarded by the reload, and the following flush
+// would persist WITHOUT it — a restart then fails to resume that session
+// and burns a daily slot. The merged map is flushed immediately so the disk
+// catches up. Caller holds s.mu.
+func (s *Store) applyPendingLocked() {
+	if len(s.pending) == 0 {
 		return
 	}
+	for key, ps := range s.pending {
+		if ps == nil {
+			delete(s.data, key)
+		} else {
+			s.data[key] = *ps
+		}
+	}
+	clear(s.pending)
 	s.flushLocked()
 }
 
 // flushLocked writes the current map atomically. Caller holds s.mu.
 func (s *Store) flushLocked() {
 	file := storeFile{Version: storeVersion, Sessions: s.data}
+	if len(s.runs) > 0 {
+		file.Runs = s.runs
+	}
 	data, err := json.MarshalIndent(file, "", "  ")
 	if err != nil {
 		slog.Warn("session store: marshal failed", "path", s.path, "err", err)

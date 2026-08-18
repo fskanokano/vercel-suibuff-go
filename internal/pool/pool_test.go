@@ -23,14 +23,14 @@ import (
 
 // Test models must map to agents with EXCLUSIVE ownership in the registry
 // FALLBACK map (see internal/registry/registry_test.go expectedFallback):
-// the five base2-free models are first-seen-assigned to the generic
-// base2-free agent, while glm-5.2 and laguna-s-2.1 are owned by their
-// dedicated one-model agents. Tests pin the offline (fallback) state.
+// the five base2-free models are root-mapped to their per-model agents, while
+// glm-5.2 and claude-fable-5 are owned by their dedicated one-model agents.
+// Tests pin the offline (fallback) state.
 const (
 	modelA = "z-ai/glm-5.2"
-	modelB = "poolside/laguna-s-2.1"
+	modelB = "anthropic/claude-fable-5"
 	agentA = "base2-free-glm"
-	agentB = "base2-free-laguna-s-2-1"
+	agentB = "base2-free-fable"
 )
 
 // newTestPool wires one mock upstream per token through real clients and
@@ -98,8 +98,11 @@ func TestRoundRobinDistribution(t *testing.T) {
 	const n = 6
 	got := make([]int, n)
 	for i := 0; i < n; i++ {
-		p.InvalidateSession(0)
-		p.InvalidateSession(1)
+		// Unconditional invalidation (test intent: force the cold path) —
+		// the pool's InvalidateSession is now instance-guarded (#132).
+		toks := p.toks.Load()
+		(*toks)[0].session.Invalidate()
+		(*toks)[1].session.Invalidate()
 		lease, err := p.Acquire(context.Background(), modelA)
 		if err != nil {
 			t.Fatal(err)
@@ -118,11 +121,12 @@ func TestRoundRobinDistribution(t *testing.T) {
 	// Both tokens created the run for the agent exactly once (runs survive
 	// session invalidation).
 	for i, mock := range []*testutil.MockUpstream{mock0, mock1} {
-		if len(mock.StartedRuns) != 1 || mock.StartedRuns[0] != agentA {
-			t.Errorf("mock%d started runs = %v, want [%s]", i, mock.StartedRuns, agentA)
+		started := mock.StartedRunsSnapshot()
+		if len(started) != 1 || started[0] != agentA {
+			t.Errorf("mock%d started runs = %v, want [%s]", i, started, agentA)
 		}
-		if len(mock.FinishedRuns) != 0 {
-			t.Errorf("mock%d finished runs = %v, want none", i, mock.FinishedRuns)
+		if len(parentFinished(mock)) != 0 {
+			t.Errorf("mock%d finished runs = %v, want none", i, parentFinished(mock))
 		}
 	}
 
@@ -461,7 +465,7 @@ func TestInvalidateSessionRecreates(t *testing.T) {
 		t.Fatalf("session creates = %d, want 1", mock.SessionCreates)
 	}
 
-	p.InvalidateSession(lease.Token)
+	p.InvalidateSession(lease.Token, lease.SessionInstanceID)
 	lease2, err := p.Acquire(context.Background(), modelA)
 	if err != nil {
 		t.Fatal(err)
@@ -475,8 +479,8 @@ func TestInvalidateSessionRecreates(t *testing.T) {
 	}
 
 	// Out-of-range tokens are ignored without panicking.
-	p.InvalidateSession(-1)
-	p.InvalidateSession(99)
+	p.InvalidateSession(-1, "")
+	p.InvalidateSession(99, "")
 }
 
 func TestInvalidateRunRestarts(t *testing.T) {
@@ -489,8 +493,8 @@ func TestInvalidateRunRestarts(t *testing.T) {
 		t.Fatal(err)
 	}
 	p.LeaseRelease(lease)
-	if len(mock.StartedRuns) != 1 {
-		t.Fatalf("started runs = %v, want 1", mock.StartedRuns)
+	if started := mock.StartedRunsSnapshot(); len(started) != 1 {
+		t.Fatalf("started runs = %v, want 1", started)
 	}
 
 	p.InvalidateRun(lease.Token, lease.AgentID)
@@ -499,11 +503,20 @@ func TestInvalidateRunRestarts(t *testing.T) {
 		t.Fatal(err)
 	}
 	p.LeaseRelease(lease2)
-	if len(mock.StartedRuns) != 2 {
-		t.Errorf("started runs = %d, want 2 (restart after invalidate)", len(mock.StartedRuns))
+	if started := mock.StartedRunsSnapshot(); len(started) != 2 {
+		t.Errorf("started runs = %d, want 2 (restart after invalidate)", len(started))
 	}
-	if len(mock.FinishedRuns) != 0 {
-		t.Errorf("finished runs = %v, want none (invalidated run is not FINISHed)", mock.FinishedRuns)
+	// Issue #91: run STARTs create+FINISH a context-pruner child run
+	// (best-effort, async), so FinishedRuns may contain child-run FINISHes.
+	// The assertion that matters: the INVALIDATED parent run must NOT be
+	// FINISHed (Invalidate deletes it without an upstream FINISH) — filter
+	// out child-run entries for a race-stable check.
+	for _, f := range mock.FinishedRunsSnapshot() {
+		if strings.HasPrefix(f.RunID, "child-run-") {
+			continue
+		}
+		t.Errorf("finished runs = %v, want no parent FINISH (invalidated run is not FINISHed)", mock.FinishedRunsSnapshot())
+		break
 	}
 
 	// Out-of-range tokens are ignored without panicking.
@@ -572,10 +585,8 @@ func TestAcquireRateLimitCooldowns(t *testing.T) {
 
 func TestAcquireRateLimitBestWindow(t *testing.T) {
 	// Both tokens rate-limited with DIFFERENT windows (per-mock
-	// retryAfterMs): the pool surfaces the longest one — the token that
-	// unblocks last bounds the wait. The previous version served the same
-	// fixed body to both tokens, so the assertion never exercised the
-	// bestRateLimit comparison.
+	// retryAfterMs): the pool surfaces the shortest one — the token that
+	// unblocks earliest bounds the wait.
 	mock0 := testutil.NewMock()
 	defer mock0.Close()
 	mock0.RateLimit = true
@@ -591,11 +602,22 @@ func TestAcquireRateLimitBestWindow(t *testing.T) {
 	if !errors.As(err, &rle) {
 		t.Fatalf("want *upstream.RateLimitError, got %v", err)
 	}
-	if rle.RetryAfter != 5*time.Minute {
-		t.Errorf("RetryAfter = %s, want 5m (longest window wins)", rle.RetryAfter)
+	if rle.RetryAfter != 1*time.Minute {
+		t.Errorf("RetryAfter = %s, want 1m (shortest window wins)", rle.RetryAfter)
 	}
 	if err.Error() == "" || !strings.Contains(err.Error(), "upstream rate limited") {
 		t.Errorf("error = %q, want rate-limit message", err)
+	}
+}
+
+func TestBestRateLimitMinSelection(t *testing.T) {
+	e1 := &upstream.RateLimitError{RetryAfter: 10 * time.Second}
+	e2 := &upstream.RateLimitError{RetryAfter: 2 * time.Second}
+	e3 := &upstream.RateLimitError{RetryAfter: 5 * time.Second}
+
+	best := bestRateLimit([]*upstream.RateLimitError{e1, e2, e3})
+	if best != e2 {
+		t.Errorf("bestRateLimit = %v (RetryAfter: %s), want e2 (RetryAfter: %s)", best, best.RetryAfter, e2.RetryAfter)
 	}
 }
 
@@ -671,11 +693,16 @@ func TestPoolChat(t *testing.T) {
 		t.Errorf("upstream body missing the leased run id: %s", recorded)
 	}
 	h := mock.RecordedChatHeaders[0]
-	if got := h.Get("x-freebuff-model"); got != modelA {
-		t.Errorf("x-freebuff-model = %q, want %q", got, modelA)
+	// #106: the chat POST carries no model/instance headers — they ride in
+	// the body metadata only.
+	if got := h.Get("x-freebuff-model"); got != "" {
+		t.Errorf("x-freebuff-model = %q on the chat POST, want absent (#106)", got)
 	}
-	if got := h.Get("x-freebuff-instance-id"); got != "inst-abc-123" {
-		t.Errorf("x-freebuff-instance-id = %q, want inst-abc-123", got)
+	if got := h.Get("x-freebuff-instance-id"); got != "" {
+		t.Errorf("x-freebuff-instance-id = %q on the chat POST, want absent (#106)", got)
+	}
+	if !strings.Contains(recorded, `"freebuff_instance_id":"inst-abc-123"`) {
+		t.Errorf("upstream body missing freebuff_instance_id in codebuff_metadata: %s", recorded)
 	}
 
 	// Invalid leases fail without panicking.
@@ -684,6 +711,63 @@ func TestPoolChat(t *testing.T) {
 	}
 	if _, err := p.Chat(context.Background(), &Lease{Token: 99}, opts, body); err == nil {
 		t.Error("want error for out-of-range lease token")
+	}
+}
+
+// TestChatDispatchesThroughLeaseEntry is the regression guard for the P2
+// chat dispatch bug: Chat used the lease's Token index against a FRESH
+// token snapshot, so a concurrent RemoveAllTokens+AddToken left the index
+// pointing at a DIFFERENT token — the chat went through the wrong account's
+// client and its usage/error path charged the wrong token (or the index was
+// out of range and the chat failed outright). The lease's backing entry is
+// the authoritative owner pinned at Acquire: Chat must dispatch through it
+// and skip usage recording once the entry is no longer in the pool.
+func TestChatDispatchesThroughLeaseEntry(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mock.ChatBody = testutil.SSEEvent(`{"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"` + modelA + `","choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":"stop"}]}`)
+	p := newTestPool(t, mock)
+
+	lease, err := p.Acquire(context.Background(), modelA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	origEntry := lease.entry
+	if origEntry == nil {
+		t.Fatal("acquired lease has no backing entry")
+	}
+	opts := upstream.ChatOptions{Model: modelA, RunID: lease.Run.RunID, SessionInstanceID: lease.SessionInstanceID}
+	body := []byte(`{"model":"` + modelA + `","messages":[{"role":"user","content":"ping"}]}`)
+
+	// Rebuild the token list under the in-flight lease: the lease's Token
+	// index (0) now belongs to a DIFFERENT token's entry.
+	p.RemoveAllTokens(context.Background())
+	if _, err := p.AddToken("new-token"); err != nil {
+		t.Fatal(err)
+	}
+	if (*p.toks.Load())[0] == origEntry {
+		t.Fatal("test setup: index 0 still the original entry")
+	}
+
+	rc, err := p.Chat(context.Background(), lease, opts, body)
+	if err != nil {
+		t.Fatalf("chat through stale lease failed: %v", err)
+	}
+	_ = rc.Close()
+	p.LeaseRelease(lease)
+
+	// The chat went out on the ORIGINAL token's client, not the new token
+	// that reused its index.
+	if len(mock.RecordedChatHeaders) != 1 {
+		t.Fatalf("upstream chat calls = %d, want 1", len(mock.RecordedChatHeaders))
+	}
+	if got := mock.RecordedChatHeaders[0].Get("Authorization"); got != "Bearer tok-0" {
+		t.Errorf("upstream Authorization = %q, want %q (chat went through the wrong token)", got, "Bearer tok-0")
+	}
+
+	// The removed entry's usage must NOT be charged to the new index-0 token.
+	if got := p.usageCount(0); got != 0 {
+		t.Errorf("usage on reused index = %d, want 0 (removed entry's chat must not charge the new token)", got)
 	}
 }
 
@@ -1045,9 +1129,11 @@ func TestIdleRotationFinishesRuns(t *testing.T) {
 		t.Fatalf("started runs = %v, want 1", got)
 	}
 
-	// Not idle yet: a maintain pass runs normally (no FINISH).
+	// Not idle yet: a maintain pass runs normally (no FINISH). Filter the
+	// context-pruner child runs (issue #91) — their async FINISH may land
+	// at any point and must not count as a parent-run finish.
 	p.maintainTick(context.Background())
-	if got := mock.FinishedRunsSnapshot(); len(got) != 0 {
+	if got := parentFinished(mock); len(got) != 0 {
 		t.Fatalf("finished runs = %v before idle, want none", got)
 	}
 
@@ -1058,7 +1144,7 @@ func TestIdleRotationFinishesRuns(t *testing.T) {
 	p.lastActive = time.Now().Add(-time.Second)
 	p.lastActiveMu.Unlock()
 	p.maintainTick(context.Background())
-	finished := mock.FinishedRunsSnapshot()
+	finished := parentFinished(mock)
 	if len(finished) != 1 || finished[0].Status != "completed" {
 		t.Fatalf("finished runs after idle = %v, want 1 completed", finished)
 	}
@@ -1067,8 +1153,8 @@ func TestIdleRotationFinishesRuns(t *testing.T) {
 	for i := 0; i < 2; i++ {
 		p.maintainTick(context.Background())
 	}
-	if got := mock.FinishedRunsSnapshot(); len(got) != 1 {
-		t.Errorf("finished runs = %v, want still 1 (dormant while idle)", got)
+	if got := parentFinished(mock); len(got) != 1 {
+		t.Errorf("finished runs = %v, want still 1 parent (dormant while idle)", got)
 	}
 	if got := mock.StartedRunsSnapshot(); len(got) != 1 {
 		t.Errorf("started runs = %v, want still 1", got)
@@ -1137,7 +1223,9 @@ func TestIdleRotationDisabled(t *testing.T) {
 	p.LeaseRelease(lease)
 
 	p.maintainTick(context.Background())
-	if got := mock.FinishedRunsSnapshot(); len(got) != 0 {
+	// Issue #91: STARTs create+FINISH context-pruner child runs async; the
+	// assertion is that no PARENT run was finished with idle rotation off.
+	if got := parentFinished(mock); len(got) != 0 {
 		t.Fatalf("finished runs = %v with idle rotation disabled, want none", got)
 	}
 }
@@ -1147,9 +1235,10 @@ func TestMaintainTickSkipsCooldownToken(t *testing.T) {
 	defer mock.Close()
 	p := newTestPool(t, mock)
 
-	// An active session + run: a normal maintain pass would heartbeat the
-	// session (GET) and may rotate the run. With the token cooling down the
-	// pass must not touch the upstream at all.
+	// An active session + run: a normal maintain pass would poll the
+	// session (GET) and may rotate the run. With the token cooling down
+	// neither the maintain pass nor the session-poll pass may touch the
+	// upstream at all.
 	lease, err := p.Acquire(context.Background(), modelA)
 	if err != nil {
 		t.Fatal(err)
@@ -1160,8 +1249,9 @@ func TestMaintainTickSkipsCooldownToken(t *testing.T) {
 
 	before := mock.Requests
 	p.maintainTick(context.Background())
+	p.sessionPollTick(context.Background())
 	if got := mock.Requests; got != before {
-		t.Errorf("upstream requests during cooldown maintain = %d, want %d (no heartbeat/rotate)", got, before)
+		t.Errorf("upstream requests during cooldown maintain = %d, want %d (no poll/rotate)", got, before)
 	}
 }
 func TestBridgeLRUEviction(t *testing.T) {
@@ -1245,8 +1335,8 @@ func TestPoolInvalidateToken(t *testing.T) {
 	defer mock.Close()
 	p := newTestPool(t, mock)
 
-	p.InvalidateSession(0)
-	p.InvalidateSession(999) // out of range safe
+	p.InvalidateSession(0, "")
+	p.InvalidateSession(999, "") // out of range safe
 	p.InvalidateRun(0, "base2-free")
 	p.InvalidateRun(999, "base2-free") // out of range safe
 	p.CooldownToken(0, 5*time.Minute)
@@ -1617,7 +1707,7 @@ func TestBridgeEvictionFinishOutsideLock(t *testing.T) {
 	// Slow FINISH responses hold the eviction's upstream call in flight long
 	// enough to probe the lock: with the old code BridgeCount would block
 	// for the full delay; with the fix it returns in microseconds.
-	mock.FinishDelay = 300 * time.Millisecond
+	mock.SetFinishDelay(300 * time.Millisecond)
 	p := newBridgePool(t, mock)
 
 	// Fill the cache to the cap.
@@ -1851,7 +1941,7 @@ func TestIdleFinishAllRunsHonorsMaintainCtx(t *testing.T) {
 	p.lastActiveMu.Unlock()
 
 	// Hold every FINISH upstream: only ctx cancellation can end it.
-	mock.FinishDelay = time.Hour
+	mock.SetFinishDelay(time.Hour)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
@@ -1893,7 +1983,7 @@ func TestBridgeMaintainEvictHonorsCtx(t *testing.T) {
 	}
 	entry.lastUsed = time.Now().Add(-bridgeIdleEvict - time.Minute)
 
-	mock.FinishDelay = time.Hour
+	mock.SetFinishDelay(time.Hour)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
@@ -1954,7 +2044,7 @@ func TestBridgeEvictionSkipsBusyEntry(t *testing.T) {
 	if e := p.bridgeToken("client-tok-00"); e == nil {
 		t.Fatal("busy bridge entry was evicted while its lease is outstanding")
 	}
-	finished := mock.FinishedRunsSnapshot()
+	finished := parentFinished(mock)
 	if len(finished) != 1 {
 		t.Errorf("finished runs = %d, want 1 (only the idle evicted entry)", len(finished))
 	}
@@ -1992,7 +2082,7 @@ func TestShutdownDrainsBridgeEntries(t *testing.T) {
 	p.Shutdown(context.Background())
 
 	// Both bridge entries' runs were FINISHed and sessions ended.
-	finished := mock.FinishedRunsSnapshot()
+	finished := parentFinished(mock)
 	if len(finished) != 2 {
 		t.Errorf("finished runs = %d, want 2 (bridge runs drained on shutdown)", len(finished))
 	}
@@ -2305,4 +2395,244 @@ func TestUsageAccountingConcurrentTokenMutation(t *testing.T) {
 		t.Fatalf("attempts=%d but success=%d failure=%d", attempts, success, failure)
 	}
 	t.Logf("hammer: attempts=%d success=%d failure=%d capped429=%d", attempts, success, failure, capped429)
+}
+
+// ── Wave 1 issue tests (#81, #77) ────────────────────────────────────────
+
+// TestAcquireIpCappedCooldownBounded verifies #81: an ip_capped admission
+// refusal surfaces the distinct IpCappedError and cools the token ONLY until
+// the body's retryAfterMs — never the Pacific-midnight quota lock — and the
+// remembered error keeps surfacing 429 ip_capped during the window.
+func TestAcquireIpCappedCooldownBounded(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mock.SessionHandler = func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = io.WriteString(w, `{"status":"ip_capped","activeUsersForIp":7,"limit":4,"retryAfterMs":45000}`)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"status":"ended"}`)
+	}
+	p := newTestPool(t, mock)
+
+	_, err := p.Acquire(context.Background(), modelA)
+	if errors.Is(err, upstream.ErrRateLimited) {
+		t.Fatal("ip_capped surfaced as ErrRateLimited, want distinct ErrIpCapped")
+	}
+	var ice *upstream.IpCappedError
+	if !errors.As(err, &ice) {
+		t.Fatalf("want *upstream.IpCappedError, got %v", err)
+	}
+	if !errors.Is(err, upstream.ErrIpCapped) {
+		t.Error("not unwrap-able to ErrIpCapped")
+	}
+	if ice.ActiveUsersForIP != 7 || ice.Limit != 4 {
+		t.Errorf("IpCappedError = %+v, want ActiveUsersForIP 7 limit 4", ice)
+	}
+	if ice.RetryAfter != 45*time.Second {
+		t.Errorf("RetryAfter = %s, want 45s (bounded to retryAfterMs)", ice.RetryAfter)
+	}
+
+	// Cooldown is bounded to the retry window ±20% jitter (#118), NOT the
+	// Pacific midnight quota lock (which would be many hours away).
+	snap := p.Snapshot()[0]
+	if snap.CooldownUntil.IsZero() {
+		t.Fatal("CooldownUntil zero, want bounded window")
+	}
+	want := time.Now().Add(45 * time.Second)
+	diff := snap.CooldownUntil.Sub(want)
+	if diff < -11*time.Second || diff > 11*time.Second {
+		t.Errorf("CooldownUntil = %v, want ≈ now+45s ±20%% jitter (bounded), not Pacific midnight", snap.CooldownUntil)
+	}
+
+	// While the window is active, a second acquire surfaces the remembered
+	// ip_capped error (not a generic cooldown 502).
+	_, err = p.Acquire(context.Background(), modelA)
+	var ice2 *upstream.IpCappedError
+	if !errors.As(err, &ice2) {
+		t.Fatalf("second acquire: want *upstream.IpCappedError, got %v", err)
+	}
+}
+
+// TestPoolCooldownTokenIpCappedBounded verifies the pool-level cooldown
+// entry point (used by the server's chat-path recovery) bounds the window
+// to the error's RetryAfter only.
+func TestPoolCooldownTokenIpCappedBounded(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	p := newTestPool(t, mock)
+
+	p.CooldownTokenIpCapped(0, &upstream.IpCappedError{RetryAfter: 30 * time.Second, ActiveUsersForIP: 5, Limit: 4})
+	snap := p.Snapshot()[0]
+	if snap.CooldownUntil.IsZero() {
+		t.Fatal("CooldownUntil zero, want bounded window")
+	}
+	want := time.Now().Add(30 * time.Second)
+	diff := snap.CooldownUntil.Sub(want)
+	if diff < -8*time.Second || diff > 8*time.Second {
+		t.Errorf("CooldownUntil = %v, want ≈ now+30s ±20%% jitter (bounded), not Pacific midnight", snap.CooldownUntil)
+	}
+
+	// Out-of-range tokens are ignored without panicking.
+	p.CooldownTokenIpCapped(99, &upstream.IpCappedError{RetryAfter: time.Second})
+	p.CooldownTokenIpCapped(-1, &upstream.IpCappedError{RetryAfter: time.Second})
+	p.CooldownTokenIpCapped(0, nil)
+}
+
+// TestSessionPollSkipsWhileChatInFlight verifies #77: the session-liveness
+// poll is skipped while any run holds an in-flight lease (a poll landing
+// mid-chat can kick the active session with 428), and resumes once the lease
+// drains.
+func TestSessionPollSkipsWhileChatInFlight(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	p := newTestPool(t, mock)
+
+	// Admit an active session; the lease holds InflightCount() > 0.
+	lease, err := p.Acquire(context.Background(), modelA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lease == nil || lease.Run == nil {
+		t.Fatal("nil lease/run")
+	}
+
+	before := mock.SessionPolls
+	p.sessionPollTick(context.Background())
+	if got := mock.SessionPolls; got != before {
+		t.Errorf("session polls during in-flight chat = %d, want %d (poll skipped)", got, before)
+	}
+
+	// Release the lease: the next poll pass polls again.
+	p.LeaseRelease(lease)
+	p.sessionPollTick(context.Background())
+	if got := mock.SessionPolls; got <= before {
+		t.Errorf("session polls after release = %d, want > %d (poll resumed)", got, before)
+	}
+}
+
+// TestSessionPollSchedule pins the liveness-poll cadence helpers (gap #2;
+// reference/freebuff sdk polling-backoff.ts): the success interval is ~30s
+// ±20% jitter capped to remaining+1s near expiry, and the failure backoff
+// grows 20s→300s while never scheduling a retry before the server's
+// Retry-After floor.
+func TestSessionPollSchedule(t *testing.T) {
+	t.Run("success interval jittered around 30s", func(t *testing.T) {
+		for i := 0; i < 50; i++ {
+			d := sessionPollSuccessDelay(session.SessionSnapshot{})
+			if d < 24*time.Second || d > 36*time.Second {
+				t.Fatalf("success delay = %s, want 30s ±20%%", d)
+			}
+		}
+	})
+
+	t.Run("success interval capped near expiry", func(t *testing.T) {
+		rem := 10 * time.Second
+		d := sessionPollSuccessDelay(session.SessionSnapshot{ExpiresAt: time.Now().Add(rem)})
+		// remaining+1s (clock-drift tolerant: allow a few ms either side of
+		// the two time.Now() samples).
+		if d < rem || d > rem+2*time.Second {
+			t.Errorf("success delay near expiry = %s, want ≈ %s (remaining+1s)", d, rem+time.Second)
+		}
+	})
+
+	t.Run("failure backoff doubles and caps at 300s", func(t *testing.T) {
+		cases := []struct {
+			failures int
+			min      time.Duration
+			max      time.Duration
+		}{
+			{1, 10 * time.Second, 20 * time.Second},   // 20s, lower-half jitter
+			{2, 20 * time.Second, 40 * time.Second},   // 40s
+			{3, 40 * time.Second, 80 * time.Second},   // 80s
+			{6, 150 * time.Second, 300 * time.Second}, // capped at 300s
+		}
+		for _, tc := range cases {
+			d := sessionPollBackoffDelay(tc.failures, 0)
+			if d < tc.min || d > tc.max {
+				t.Errorf("backoff(%d) = %s, want [%s, %s]", tc.failures, d, tc.min, tc.max)
+			}
+		}
+	})
+
+	t.Run("failure backoff honors Retry-After floor", func(t *testing.T) {
+		for i := 0; i < 50; i++ {
+			d := sessionPollBackoffDelay(1, 60*time.Second)
+			// retryAfter × (1 ± 0.2) jitter: [48s, 72s], max'd with the 20s
+			// base backoff — never before the floor.
+			if d < 48*time.Second || d > 300*time.Second {
+				t.Errorf("backoff with Retry-After 60s = %s, want ≥ 48s (never before the floor)", d)
+			}
+		}
+	})
+
+	t.Run("retry-after extracted from classified errors", func(t *testing.T) {
+		if got := sessionPollRetryAfter(&upstream.UpstreamError{Status: 503, RetryAfter: 45 * time.Second}); got != 45*time.Second {
+			t.Errorf("UpstreamError RetryAfter = %s, want 45s", got)
+		}
+		if got := sessionPollRetryAfter(&upstream.RateLimitError{RetryAfter: 90 * time.Second}); got != 90*time.Second {
+			t.Errorf("RateLimitError RetryAfter = %s, want 90s", got)
+		}
+		if got := sessionPollRetryAfter(errors.New("plain")); got != 0 {
+			t.Errorf("plain error RetryAfter = %s, want 0", got)
+		}
+	})
+}
+
+// TestAcquireSyncsAdmittedModel pins the upstream model coercion fix: when the
+// client requests model A (e.g. deepseek/deepseek-v4-flash) but upstream
+// admits the session for model B (e.g. mimo/mimo-v2.5 due to limited tier on
+// that IP/country), Acquire must return a lease with Model=B and AgentID for B
+// so downstream chat and runs stay consistent with the upstream session row.
+func TestAcquireSyncsAdmittedModel(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mock.SessionHandler = func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"status":"active","instanceId":"inst-coerced","model":"`+modelB+`"}`)
+	}
+	p := newTestPool(t, mock)
+
+	lease, err := p.Acquire(context.Background(), modelA)
+	if err != nil {
+		t.Fatalf("Acquire failed: %v", err)
+	}
+	defer p.LeaseRelease(lease)
+
+	if lease.Model != modelB {
+		t.Errorf("lease.Model = %q, want coerced model %q", lease.Model, modelB)
+	}
+	wantAgent := agentB
+	if lease.AgentID != wantAgent {
+		t.Errorf("lease.AgentID = %q, want %q", lease.AgentID, wantAgent)
+	}
+}
+
+func TestBridgeAcquireSyncsAdmittedModel(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mock.SessionHandler = func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"status":"active","instanceId":"inst-coerced-bridge","model":"`+modelB+`"}`)
+	}
+	p := newBridgePool(t, mock)
+
+	lease, err := p.AcquireBridge(context.Background(), "test-token", modelA)
+	if err != nil {
+		t.Fatalf("AcquireBridge failed: %v", err)
+	}
+	defer p.LeaseRelease(lease)
+
+	if lease.Model != modelB {
+		t.Errorf("lease.Model = %q, want coerced model %q", lease.Model, modelB)
+	}
+	wantAgent := agentB
+	if lease.AgentID != wantAgent {
+		t.Errorf("lease.AgentID = %q, want %q", lease.AgentID, wantAgent)
+	}
 }

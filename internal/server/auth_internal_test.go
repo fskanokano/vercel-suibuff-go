@@ -11,6 +11,8 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -22,6 +24,34 @@ import (
 // Internal (package server) auth tests: these exercise adminAuth with the
 // real constants, so the lockout bound and map cap cannot drift from the
 // public behavior the dashboard_test.go rate-limit test depends on.
+
+func TestExtractBearerToken(t *testing.T) {
+	tests := []struct {
+		input     string
+		wantToken string
+		wantOK    bool
+	}{
+		{"Bearer test-tok", "test-tok", true},
+		{"bearer test-tok", "test-tok", true},
+		{"BEARER test-tok", "test-tok", true},
+		{"bEaReR test-tok", "test-tok", true},
+		{"  bearer  test-tok  ", "test-tok", true},
+		{"Bearer ", "", false},
+		{"bearer   ", "", false},
+		{"Bearer", "", false},
+		{"bearer", "", false},
+		{"Basic test-tok", "", false},
+		{"", "", false},
+		{"x-api-key test-tok", "", false},
+	}
+	for _, tt := range tests {
+		gotToken, gotOK := extractBearerToken(tt.input)
+		if gotToken != tt.wantToken || gotOK != tt.wantOK {
+			t.Errorf("extractBearerToken(%q) = (%q, %v), want (%q, %v)",
+				tt.input, gotToken, gotOK, tt.wantToken, tt.wantOK)
+		}
+	}
+}
 
 func TestAdminAuthLockoutBound(t *testing.T) {
 	a := newAdminAuth()
@@ -127,7 +157,7 @@ func assertNoTmpFiles(t *testing.T, dir, base string) {
 }
 
 // errorResponse decodes the OpenAI error shape writeError produces.
-func errorResponse(t *testing.T, err error) (status int, body struct {
+func errorResponse(t *testing.T, err error) (status int, hdr http.Header, body struct {
 	Error struct {
 		Message string `json:"message"`
 		Type    string `json:"type"`
@@ -139,11 +169,11 @@ func errorResponse(t *testing.T, err error) (status int, body struct {
 	s := &Server{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
-	s.writeError(w, r, err)
+	s.writeError(w, r, err, "", nil)
 	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
 		t.Fatalf("writeError response is not JSON: %v: %s", err, w.Body.Bytes())
 	}
-	return w.Code, body
+	return w.Code, w.Header(), body
 }
 
 // TestWriteErrorNewMappings pins the self-healing error matrix additions:
@@ -152,21 +182,21 @@ func errorResponse(t *testing.T, err error) (status int, body struct {
 func TestWriteErrorNewMappings(t *testing.T) {
 	t.Run("country blocked 403", func(t *testing.T) {
 		err := &upstream.CountryBlockedError{CountryCode: "CN", CountryBlockReason: "region_restricted", IpPrivacySignals: []string{"vpn"}}
-		status, body := errorResponse(t, err)
+		status, _, body := errorResponse(t, err)
 		if status != http.StatusForbidden {
 			t.Errorf("status = %d, want 403", status)
 		}
 		if body.Error.Code != "country_blocked" {
 			t.Errorf("code = %q, want country_blocked", body.Error.Code)
 		}
-		if body.Error.Hint == "" || !strings.Contains(body.Error.Hint, "SOCKS5") {
+		if body.Error.Hint == "" || !strings.Contains(body.Error.Hint, "Route traffic through an allowed country") {
 			t.Errorf("hint = %q, want actionable egress hint", body.Error.Hint)
 		}
 	})
 
 	t.Run("free mode cli required 403", func(t *testing.T) {
 		err := fmt.Errorf("free tier gate: %w", upstream.ErrFreeModeCLIRequired)
-		status, body := errorResponse(t, err)
+		status, _, body := errorResponse(t, err)
 		if status != http.StatusForbidden {
 			t.Errorf("status = %d, want 403", status)
 		}
@@ -181,7 +211,7 @@ func TestWriteErrorNewMappings(t *testing.T) {
 	t.Run("credits 402 with body passthrough", func(t *testing.T) {
 		const upstreamBody = `{"error":"out of credits","model":"deepseek/deepseek-v4-flash"}`
 		err := &upstream.CreditsError{Status: http.StatusPaymentRequired, Body: upstreamBody}
-		status, body := errorResponse(t, err)
+		status, _, body := errorResponse(t, err)
 		if status != http.StatusPaymentRequired {
 			t.Errorf("status = %d, want 402", status)
 		}
@@ -196,9 +226,45 @@ func TestWriteErrorNewMappings(t *testing.T) {
 		}
 	})
 
+	t.Run("waiting room required 503 with retry-after", func(t *testing.T) {
+		// #116: 428 waiting_room_required surfaces as 503 waiting_room_required
+		// + Retry-After — NEVER a bare 502.
+		err := &upstream.WaitingRoomRequiredError{RetryAfter: 45 * time.Second, Detail: `{"error":"waiting_room_required"}`}
+		status, hdr, body := errorResponse(t, err)
+		if status != http.StatusServiceUnavailable {
+			t.Errorf("status = %d, want 503", status)
+		}
+		if body.Error.Code != "waiting_room_required" {
+			t.Errorf("code = %q, want waiting_room_required", body.Error.Code)
+		}
+		if got := hdr.Get("Retry-After"); got != "45" {
+			t.Errorf("Retry-After = %q, want 45 (the refusal's retryAfter, ceil seconds)", got)
+		}
+	})
+
+	t.Run("session superseded 503", func(t *testing.T) {
+		// #119: 503 session_superseded — returns 503 + Retry-After so 9router
+		// retries immediately instead of locking the model for 30s.
+		const upstreamBody = `{"error":"session_superseded","message":"another CLI took over"}`
+		err := &upstream.SessionSupersededError{Status: http.StatusConflict, Body: upstreamBody}
+		status, hdr, body := errorResponse(t, err)
+		if status != http.StatusServiceUnavailable {
+			t.Errorf("status = %d, want 503", status)
+		}
+		if body.Error.Code != "session_superseded" {
+			t.Errorf("code = %q, want session_superseded", body.Error.Code)
+		}
+		if body.Error.Message != upstreamBody {
+			t.Errorf("message = %q, want upstream body verbatim", body.Error.Message)
+		}
+		if got := hdr.Get("Retry-After"); got != "1" {
+			t.Errorf("Retry-After = %q, want 1", got)
+		}
+	})
+
 	t.Run("upstream deadline 504", func(t *testing.T) {
 		err := fmt.Errorf("chat: %w", context.DeadlineExceeded)
-		status, body := errorResponse(t, err)
+		status, _, body := errorResponse(t, err)
 		if status != http.StatusGatewayTimeout {
 			t.Errorf("status = %d, want 504", status)
 		}
@@ -215,19 +281,53 @@ func TestWriteErrorNewMappings(t *testing.T) {
 // 403 account_banned, rate limit 429, waiting room 503 — the new mappings
 // must not shadow them.
 func TestWriteErrorExistingMappingsUnchanged(t *testing.T) {
-	status, body := errorResponse(t, &upstream.BanError{ResumesAt: time.Now().Add(time.Hour), Body: `{"status":"banned"}`})
+	status, _, body := errorResponse(t, &upstream.BanError{ResumesAt: time.Now().Add(time.Hour), Body: `{"status":"banned"}`})
 	if status != http.StatusForbidden || body.Error.Code != "account_banned" {
 		t.Errorf("ban: status=%d code=%q, want 403 account_banned", status, body.Error.Code)
 	}
 
-	status, body = errorResponse(t, &upstream.RateLimitError{RetryAfter: time.Minute})
+	status, _, body = errorResponse(t, &upstream.RateLimitError{RetryAfter: time.Minute})
 	if status != http.StatusTooManyRequests || body.Error.Code != "rate_limited" {
 		t.Errorf("rate limit: status=%d code=%q, want 429 rate_limited", status, body.Error.Code)
 	}
 
-	status, body = errorResponse(t, &upstream.WaitingRoomError{RetryAfter: time.Minute})
+	status, _, body = errorResponse(t, &upstream.WaitingRoomError{RetryAfter: time.Minute})
 	if status != http.StatusServiceUnavailable || body.Error.Code != "waiting_room_queued" {
 		t.Errorf("waiting room: status=%d code=%q, want 503 waiting_room_queued", status, body.Error.Code)
+	}
+}
+
+// TestRestoreEnvFileUnreadable pins the mode-switch rollback guard: when the
+// previous .env existed but was unreadable (oldErr not os.ErrNotExist), the
+// rollback must NOT delete the file — removing it would destroy an operator's
+// present-but-unreadable .env (regression for the P3 finding). POSIX-only:
+// chmod 000 does not block reads on Windows.
+func TestRestoreEnvFileUnreadable(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("chmod 000 does not make a file unreadable on Windows")
+	}
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses permission bits")
+	}
+	t.Chdir(t.TempDir())
+	if err := os.WriteFile(".env", []byte("SAFE_MODE=true\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(".env", 0o000); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := os.Chmod(".env", 0o644); err != nil {
+			t.Errorf("restoring .env perms: %v", err)
+		}
+	}()
+	_, readErr := os.ReadFile(".env")
+	if readErr == nil || errors.Is(readErr, os.ErrNotExist) {
+		t.Fatalf("setup: ReadFile = %v, want a non-NotExist error", readErr)
+	}
+	restoreEnvFile(nil, readErr)
+	if _, statErr := os.Stat(".env"); statErr != nil {
+		t.Errorf("restoreEnvFile removed a present-but-unreadable .env: %v", statErr)
 	}
 }
 
@@ -312,4 +412,199 @@ func TestWriteFileAtomicFailurePreservesTarget(t *testing.T) {
 		t.Errorf("target content lost after failed write: %v", err)
 	}
 	assertNoTmpFiles(t, dir, ".env")
+}
+
+// ── Wave 1 issue tests (#81, #82, #76) ───────────────────────────────────
+
+// TestWriteErrorIpCappedAndSessionLimit verifies the writeError mappings for
+// the wave-1 typed errors: ip_capped surfaces 429 with code "ip_capped"
+// (never the quota "rate_limited"), and session_limit_reached surfaces 409
+// with its code (never session-invalid).
+func TestWriteErrorIpCappedAndSessionLimit(t *testing.T) {
+	t.Run("ip capped 429", func(t *testing.T) {
+		err := &upstream.IpCappedError{ActiveUsersForIP: 5, Limit: 4, RetryAfter: 45 * time.Second, Body: `{"status":"ip_capped"}`}
+		status, _, body := errorResponse(t, err)
+		if status != http.StatusTooManyRequests {
+			t.Errorf("status = %d, want 429", status)
+		}
+		if body.Error.Code != "ip_capped" {
+			t.Errorf("code = %q, want ip_capped (not rate_limited)", body.Error.Code)
+		}
+		if !strings.Contains(body.Error.Message, "retry after 45s") {
+			t.Errorf("message = %q, want bounded Retry-After detail", body.Error.Message)
+		}
+	})
+	t.Run("session limit reached 409", func(t *testing.T) {
+		err := &upstream.SessionLimitError{Status: http.StatusConflict, Body: `{"error":{"code":"session_limit_reached"}}`}
+		status, _, body := errorResponse(t, err)
+		if status != http.StatusConflict {
+			t.Errorf("status = %d, want 409", status)
+		}
+		if body.Error.Code != "session_limit_reached" {
+			t.Errorf("code = %q, want session_limit_reached", body.Error.Code)
+		}
+		if body.Error.Message != `{"error":{"code":"session_limit_reached"}}` {
+			t.Errorf("message = %q, want upstream body verbatim", body.Error.Message)
+		}
+	})
+}
+
+// TestQuotaSummaryTierAndGlmPromo verifies #76: quotaSummary surfaces the
+// account tier and glmPromo from a probe response carrying the unused rate
+// limits, and still returns "" when the response has no quota data.
+func TestQuotaSummaryTierAndGlmPromo(t *testing.T) {
+	if got := quotaSummary(nil); got != "" {
+		t.Errorf("quotaSummary(nil) = %q, want empty", got)
+	}
+	if got := quotaSummary(&upstream.SessionState{}); got != "" {
+		t.Errorf("quotaSummary(no data) = %q, want empty", got)
+	}
+	st := &upstream.SessionState{
+		AccessTier: "limited",
+		GlmPromo:   `{"dailySessions":2,"endsAt":"2026-08-20T07:00:00.000Z"}`,
+		RateLimitsByModel: map[string]upstream.ModelQuota{
+			"deepseek/deepseek-v4-flash": {Model: "deepseek/deepseek-v4-flash", Limit: 6, RecentCount: 2, Period: "pacific_day", ResetAt: time.Date(2026, 8, 18, 7, 0, 0, 0, time.UTC)},
+		},
+	}
+	got := quotaSummary(st)
+	for _, want := range []string{"tier limited", "deepseek/deepseek-v4-flash 6/2 pacific_day", "glmPromo", "dailySessions"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("quotaSummary = %q, missing %q", got, want)
+		}
+	}
+}
+
+// TestWriteErrorModelIPLimited pins the Issue #74 P2 writeError mapping:
+// *upstream.LimitedIpError → 409, code model_ip_limited, Retry-After = ceil
+// seconds of lie.RetryAfter (only when > 0 — the body window is surfaced but
+// never sets the unfit registry TTL).
+func TestWriteErrorModelIPLimited(t *testing.T) {
+	err := &upstream.LimitedIpError{
+		RetryAfter: 5 * time.Minute,
+		Body:       `{"status":"session_model_mismatch","message":"model z-ai/glm-5.2 is limited on this IP"}`,
+	}
+	status, _, body := errorResponse(t, err)
+	if status != http.StatusConflict {
+		t.Errorf("status = %d, want 409", status)
+	}
+	if body.Error.Code != "model_ip_limited" {
+		t.Errorf("code = %q, want model_ip_limited", body.Error.Code)
+	}
+	if !strings.Contains(body.Error.Message, "model limited on this egress IP") {
+		t.Errorf("message = %q, want limited-egress phrasing", body.Error.Message)
+	}
+
+	// Retry-After header: ceil seconds of RetryAfter, only when > 0.
+	s := &Server{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	s.writeError(w, r, err, "", nil)
+	if got := w.Header().Get("Retry-After"); got != "300" {
+		t.Errorf("Retry-After = %q, want 300", got)
+	}
+
+	// A zero RetryAfter must not emit the header.
+	w2 := httptest.NewRecorder()
+	r2 := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	s.writeError(w2, r2, &upstream.LimitedIpError{Body: "no window"}, "", nil)
+	if got := w2.Header().Get("Retry-After"); got != "" {
+		t.Errorf("Retry-After with zero RetryAfter = %q, want empty", got)
+	}
+}
+
+// TestWriteErrorBareModelIPLimitedSentinel pins the #74 P2 contract for the
+// bare sentinel (a registry entry stored without refusal detail): 409 +
+// code model_ip_limited, no Retry-After header.
+func TestWriteErrorBareModelIPLimitedSentinel(t *testing.T) {
+	status, _, body := errorResponse(t, upstream.ErrModelIPLimited)
+	if status != http.StatusConflict {
+		t.Errorf("status = %d, want 409", status)
+	}
+	if body.Error.Code != "model_ip_limited" {
+		t.Errorf("code = %q, want model_ip_limited", body.Error.Code)
+	}
+	s := &Server{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	s.writeError(w, r, upstream.ErrModelIPLimited, "", nil)
+	if got := w.Header().Get("Retry-After"); got != "" {
+		t.Errorf("Retry-After = %q, want none for bare sentinel", got)
+	}
+}
+
+// TestNewReqIDUUIDv4 pins the correlation-id mint (D1): RFC 4122 §4.4
+// shape — version nibble 4, variant bits 10 — and a fresh value per mint.
+func TestNewReqIDUUIDv4(t *testing.T) {
+	id := newReqID()
+	re := regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
+	if !re.MatchString(id) {
+		t.Errorf("newReqID() = %q, want UUIDv4 shape", id)
+	}
+	if id2 := newReqID(); id2 == id {
+		t.Error("two mints produced the same id")
+	}
+}
+
+// TestClientRequestIDSanitize pins the X-Request-Id sanitizer (D1): trimmed,
+// printable ASCII only, max 64 runes, else dropped ("").
+func TestClientRequestIDSanitize(t *testing.T) {
+	cases := []struct {
+		hdr  string
+		want string
+	}{
+		{"", ""},
+		{"abc", "abc"},
+		{"  abc  ", "abc"}, // trimmed
+		{"a b", "a b"},     // inner spaces kept
+		{strings.Repeat("x", 64), strings.Repeat("x", 64)},
+		{strings.Repeat("x", 65), ""}, // >64 runes dropped
+		{"héllo", ""},                 // non-ASCII dropped
+		{"line\nbreak", ""},           // control character dropped
+		{"tab\there", ""},             // control character dropped
+	}
+	for _, c := range cases {
+		r := httptest.NewRequest(http.MethodGet, "/", nil)
+		if c.hdr != "" {
+			r.Header.Set("X-Request-Id", c.hdr)
+		}
+		if got := clientRequestID(r); got != c.want {
+			t.Errorf("clientRequestID(%q) = %q, want %q", c.hdr, got, c.want)
+		}
+	}
+}
+
+// TestWriteErrorLoadSheddingAndPeakHours pins issue #133: load-saturation
+// and peak-hours 429s surface with honest codes and bounded Retry-After, so
+// routers show the right hint instead of "daily message cap or rate limit
+// reached".
+func TestWriteErrorLoadSheddingAndPeakHours(t *testing.T) {
+	tests := []struct {
+		name         string
+		err          error
+		wantCode     string
+		wantRetryMin time.Duration
+		wantRetryMax time.Duration
+	}{
+		{"load_shedding", &upstream.RateLimitError{Status: "load_shedding", RetryAfter: upstream.LoadShedCooldown, Body: "load saturated"}, "load_shedding", 60 * time.Second, 120 * time.Second},
+		{"peak_hours", &upstream.RateLimitError{Status: "peak_hours", RetryAfter: upstream.PeakHoursCooldown, Body: "peak hours"}, "peak_hours", 25 * time.Minute, 35 * time.Minute},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			status, _, body := errorResponse(t, tt.err)
+			if status != http.StatusTooManyRequests {
+				t.Errorf("status = %d, want 429", status)
+			}
+			if body.Error.Code != tt.wantCode {
+				t.Errorf("code = %q, want %q", body.Error.Code, tt.wantCode)
+			}
+			s := &Server{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+			w := httptest.NewRecorder()
+			r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+			s.writeError(w, r, tt.err, "", nil)
+			got, _ := time.ParseDuration(w.Header().Get("Retry-After") + "s")
+			if got < tt.wantRetryMin || got > tt.wantRetryMax {
+				t.Errorf("Retry-After = %v, want within [%v, %v] (bounded)", got, tt.wantRetryMin, tt.wantRetryMax)
+			}
+		})
+	}
 }

@@ -557,6 +557,36 @@ func TestE2EDoctorBrokenConfig(t *testing.T) {
 	}
 }
 
+// TestE2EDoctorProbesDefault pins that -doctor probes tokens by default: a
+// plain -doctor run (no extra flags) probes every configured token with a
+// zero-cost GET /api/v1/freebuff/session probe ("Probing N token(s)"
+// warning, "validity probe succeeded" row) and never creates an upstream
+// session (SessionCreates stays 0 — the GET probe claims no session slot).
+// The mock serves plain HTTP so the doctor's TLS check fails and the
+// process exits 1; the assertions target the probe behavior, not the exit
+// code.
+func TestE2EDoctorProbesDefault(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	dir := t.TempDir()
+	writeDotenv(t, dir, map[string]string{
+		"AUTH_TOKENS":       "cb_e2e",
+		"UPSTREAM_BASE_URL": mock.URL(),
+	})
+	bin := proxyInDir(t, dir)
+	_, stdout, stderr := runSimple(t, dir, bin, []string{"-doctor"}, e2eEnv(t, "AUTO_DISCOVER_TOKEN=false"), 60*time.Second)
+	combined := stdout + "\n" + stderr
+	if !strings.Contains(combined, "Probing 1 token") {
+		t.Errorf("plain -doctor missing 'Probing 1 token' warning:\n%s", combined)
+	}
+	if !strings.Contains(combined, "validity probe succeeded") {
+		t.Errorf("plain -doctor missing probe-success row:\n%s", combined)
+	}
+	if got := mock.SessionCreatesSnapshot(); got != 0 {
+		t.Errorf("plain -doctor created %d upstream session(s), want 0 (zero-cost probes)", got)
+	}
+}
+
 // --- 7. -test-token ---
 
 func TestE2ETestToken(t *testing.T) {
@@ -575,6 +605,9 @@ func TestE2ETestToken(t *testing.T) {
 		}
 		if !strings.Contains(stdout, "token OK") {
 			t.Errorf("-test-token stdout missing 'token OK':\n%s", stdout)
+		}
+		if got := mock.SessionCreatesSnapshot(); got != 0 {
+			t.Errorf("-test-token created %d upstream session(s), want 0 (zero-cost GET probe)", got)
 		}
 	})
 

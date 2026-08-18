@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"flag"
 	"log/slog"
 	"os"
@@ -12,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"freebuff-proxy/internal/config"
 	"freebuff-proxy/internal/egress"
+	"freebuff-proxy/internal/telemetry"
 )
 
 // TestHoldForExitIfConsolePipedStderrNoHang guards the console hold: with
@@ -163,75 +162,6 @@ func TestEgressCacheTTL(t *testing.T) {
 	}
 }
 
-// TestEgressPaths pins the probe-path construction (the cmd package's
-// highest-value pure function): index 0 is ALWAYS the direct connection,
-// each parseable SOCKS5_PROXIES entry gets a "proxy-<index>" key with its
-// ORIGINAL index (gaps after skipped entries stay visible), and
-// unparseable proxies are skipped with a warning (fail-open) — never
-// killing the direct probe.
-func TestEgressPaths(t *testing.T) {
-	newLogger := func() (*bytes.Buffer, *slog.Logger) {
-		var buf bytes.Buffer
-		h := slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})
-		return &buf, slog.New(h)
-	}
-
-	t.Run("no proxies: direct only", func(t *testing.T) {
-		_, logger := newLogger()
-		paths := egressPaths(&config.Config{}, logger)
-		if len(paths) != 1 {
-			t.Fatalf("paths = %d, want 1 (direct only)", len(paths))
-		}
-		if paths[0].Key != "direct" {
-			t.Errorf("paths[0].Key = %q, want direct", paths[0].Key)
-		}
-	})
-
-	t.Run("direct always first, proxies in order", func(t *testing.T) {
-		_, logger := newLogger()
-		cfg := &config.Config{SOCKS5Proxies: []string{"127.0.0.1:9050", "127.0.0.1:9051"}}
-		paths := egressPaths(cfg, logger)
-		if len(paths) != 3 {
-			t.Fatalf("paths = %d, want 3 (direct + 2 proxies)", len(paths))
-		}
-		for i, want := range []string{"direct", "proxy-0", "proxy-1"} {
-			if paths[i].Key != want {
-				t.Errorf("paths[%d].Key = %q, want %q", i, paths[i].Key, want)
-			}
-		}
-	})
-
-	t.Run("invalid SOCKS5 skipped with warning, direct survives", func(t *testing.T) {
-		buf, logger := newLogger()
-		cfg := &config.Config{SOCKS5Proxies: []string{"", "socks5://", "127.0.0.1:9050"}}
-		paths := egressPaths(cfg, logger)
-		if len(paths) != 2 {
-			t.Fatalf("paths = %d, want 2 (direct + one valid proxy)", len(paths))
-		}
-		if paths[0].Key != "direct" || paths[1].Key != "proxy-2" {
-			t.Errorf("keys = [%q, %q], want [direct proxy-2] (original index kept)", paths[0].Key, paths[1].Key)
-		}
-		out := buf.String()
-		if !strings.Contains(out, "skipping invalid SOCKS5 proxy") {
-			t.Errorf("no skip warning logged: %q", out)
-		}
-		for _, idx := range []string{"index=0", "index=1"} {
-			if !strings.Contains(out, idx) {
-				t.Errorf("warning missing %s: %q", idx, out)
-			}
-		}
-	})
-
-	t.Run("valid socks5:// URL accepted", func(t *testing.T) {
-		_, logger := newLogger()
-		cfg := &config.Config{SOCKS5Proxies: []string{"socks5://user:pass@127.0.0.1:1080"}}
-		paths := egressPaths(cfg, logger)
-		if len(paths) != 2 || paths[1].Key != "proxy-0" {
-			t.Fatalf("paths = %+v, want direct + proxy-0", paths)
-		}
-	})
-}
-
 // TestVersionFlagPrintsVersion re-executes the test binary with -version
 // (main() os.Exit's, so it cannot run in-process) and pins the output:
 // "freebuff-proxy <version>" on stdout, exit 0.
@@ -256,23 +186,27 @@ func TestVersionFlagPrintsVersion(t *testing.T) {
 }
 
 // TestModeFlagsExclusiveWarning pins the mutually-exclusive-mode warning:
-// 2+ of -doctor/-update/-setup/-test-token prints the warning (only the
-// first flag then runs), at most one set prints nothing.
+// 2+ of -doctor/-update/-setup/-test-token/-install-service/
+// -uninstall-service/-service-status prints the warning (only the first
+// flag then runs), at most one set prints nothing.
 func TestModeFlagsExclusiveWarning(t *testing.T) {
 	cases := []struct {
-		name                             string
-		doctor, update, setup, testToken bool
-		want                             string
+		name                                            string
+		doctor, update, setup, testToken                bool
+		installService, uninstallService, serviceStatus bool
+		want                                            string
 	}{
-		{"none", false, false, false, false, ""},
-		{"single", false, false, true, false, ""},
-		{"two", true, false, true, false, "mutually exclusive"},
-		{"three", true, true, false, true, "mutually exclusive"},
-		{"all four", true, true, true, true, "mutually exclusive"},
+		{"none", false, false, false, false, false, false, false, ""},
+		{"single", false, false, true, false, false, false, false, ""},
+		{"single service", false, false, false, false, true, false, false, ""},
+		{"two", true, false, true, false, false, false, false, "mutually exclusive"},
+		{"three", true, true, false, true, false, false, false, "mutually exclusive"},
+		{"service pair", false, false, false, false, true, true, false, "mutually exclusive"},
+		{"all seven", true, true, true, true, true, true, true, "mutually exclusive"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := modeFlagsExclusiveWarning(tc.doctor, tc.update, tc.setup, tc.testToken)
+			got := modeFlagsExclusiveWarning(tc.doctor, tc.update, tc.setup, tc.testToken, tc.installService, tc.uninstallService, tc.serviceStatus)
 			if tc.want == "" {
 				if got != "" {
 					t.Errorf("modeFlagsExclusiveWarning = %q, want empty", got)
@@ -301,6 +235,8 @@ func TestResolveLogLevel(t *testing.T) {
 		{"config wins", "warn", false, slog.LevelWarn},
 		{"config beats verbose", "error", true, slog.LevelError},
 		{"config case-insensitive", "DEBUG", false, slog.LevelDebug},
+		{"trace level", "trace", false, telemetry.LevelTrace},
+		{"trace case-insensitive", "TRACE", true, telemetry.LevelTrace},
 		{"unparseable falls back to info", "bogus", true, slog.LevelInfo},
 	}
 	for _, tc := range cases {
@@ -309,6 +245,26 @@ func TestResolveLogLevel(t *testing.T) {
 				t.Errorf("resolveLogLevel(%q, %v) = %v, want %v", tc.logLevel, tc.verbose, got, tc.want)
 			}
 		})
+	}
+}
+
+// TestLogLevelDisplay pins the startup-summary level rendering: trace shows
+// as TRACE (not slog's "DEBUG-4"), every other level keeps slog's name.
+func TestLogLevelDisplay(t *testing.T) {
+	cases := []struct {
+		level slog.Level
+		want  string
+	}{
+		{telemetry.LevelTrace, "TRACE"},
+		{slog.LevelDebug, "DEBUG"},
+		{slog.LevelInfo, "INFO"},
+		{slog.LevelWarn, "WARN"},
+		{slog.LevelError, "ERROR"},
+	}
+	for _, tc := range cases {
+		if got := logLevelDisplay(tc.level); got != tc.want {
+			t.Errorf("logLevelDisplay(%v) = %q, want %q", tc.level, got, tc.want)
+		}
 	}
 }
 

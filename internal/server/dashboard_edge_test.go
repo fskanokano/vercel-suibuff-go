@@ -66,8 +66,8 @@ func TestDashboardTokenTestAllBridgeNoTokens(t *testing.T) {
 	}
 }
 
-// TestDashboardTokenTestAllTwoTokens: every pooled token gets a real session
-// handshake and one appended result fragment.
+// TestDashboardTokenTestAllTwoTokens: every pooled token gets a zero-cost
+// validity probe and one appended result fragment.
 func TestDashboardTokenTestAllTwoTokens(t *testing.T) {
 	mock0 := testutil.NewMock()
 	defer mock0.Close()
@@ -86,9 +86,9 @@ func TestDashboardTokenTestAllTwoTokens(t *testing.T) {
 	}
 }
 
-// TestDashboardTokenTestAllEmptyRegistry: with no registry models there is
-// nothing to probe with — the loop breaks and reports no tokens (the
-// registry-empty branch of handleTokenTestAll).
+// TestDashboardTokenTestAllEmptyRegistry: the zero-cost probe needs no
+// registry models (the upstream GET carries no model), so test-all succeeds
+// even with an empty catalog — the old registry-dependent guard is gone.
 func TestDashboardTokenTestAllEmptyRegistry(t *testing.T) {
 	mock := testutil.NewMock()
 	defer mock.Close()
@@ -119,8 +119,8 @@ func TestDashboardTokenTestAllEmptyRegistry(t *testing.T) {
 	cookie := authedCookie(t, ts)
 
 	resp := doTokenAction(t, ts.URL, cookie, "/admin/tokens/test-all")
-	if body := bodyOf(t, resp); !strings.Contains(body, "No tokens to test") {
-		t.Errorf("empty-registry test-all response = %q, want no-tokens message", body)
+	if body := bodyOf(t, resp); !strings.Contains(body, "Token 0: ok") {
+		t.Errorf("empty-registry test-all response = %q, want probe success row", body)
 	}
 }
 
@@ -650,8 +650,8 @@ func TestDashboardSmokeEmptyRegistry(t *testing.T) {
 
 // --- diag ---
 
-// TestDashboardDiagBridgeMode: in bridge mode diag skips the per-token
-// probes and reports the no-pooled-tokens warning.
+// TestDashboardDiagBridgeMode: in bridge mode diag has no pooled tokens to
+// probe — it reports the no-pooled-tokens warning instead of running probes.
 func TestDashboardDiagBridgeMode(t *testing.T) {
 	ts := bridgeDashboardServer(t, "secret")
 	cookie := authedCookie(t, ts)
@@ -663,10 +663,14 @@ func TestDashboardDiagBridgeMode(t *testing.T) {
 	if !strings.Contains(body, "Configuration: bridge mode") {
 		t.Errorf("bridge diag missing mode line: %s", body)
 	}
+	if strings.Contains(body, "validity probe") {
+		t.Errorf("bridge diag must not run probes:\n%s", body)
+	}
 }
 
 // TestDashboardDiagTokenProbeFailure: an auth-rejecting token produces a
-// failed validity-probe row in the diag fragment.
+// failed validity-probe row in the diag fragment (probes run unconditionally;
+// the old probe_tokens opt-in is gone).
 func TestDashboardDiagTokenProbeFailure(t *testing.T) {
 	bad := testutil.NewMock()
 	defer bad.Close()
@@ -679,6 +683,52 @@ func TestDashboardDiagTokenProbeFailure(t *testing.T) {
 	if !strings.Contains(body, "Token #1 validity probe failed") {
 		t.Errorf("diag response = %q, want probe-failure row", body)
 	}
+}
+
+// TestDashboardDiagProbesRunUnconditionally: per-token validity probes are
+// zero-cost upstream GETs (no session claim), so plain diag runs them by
+// default and the stale probe_tokens opt-in param is ignored. Success is
+// asserted without any upstream session create.
+func TestDashboardDiagProbesRunUnconditionally(t *testing.T) {
+	t.Run("runs by default", func(t *testing.T) {
+		mock := testutil.NewMock()
+		defer mock.Close()
+		ts, _ := newTestServerCfg(t, nil, func(c *config.Config) { c.AdminToken = "secret" }, mock)
+		cookie := authedCookie(t, ts)
+
+		resp := postJSON(t, ts.URL, cookie, "/admin/diag", "{}")
+		body := bodyOf(t, resp)
+		if !strings.Contains(body, "Token #1 validity probe succeeded") {
+			t.Errorf("diag missing probe-success row:\n%s", body)
+		}
+		if strings.Contains(body, "probes skipped") {
+			t.Errorf("diag still reports probes skipped:\n%s", body)
+		}
+		if got := mock.SessionCreatesSnapshot(); got != 0 {
+			t.Errorf("diag created %d upstream session(s), want 0 (zero-cost probe)", got)
+		}
+	})
+
+	t.Run("probe_tokens param ignored", func(t *testing.T) {
+		mock := testutil.NewMock()
+		defer mock.Close()
+		ts, _ := newTestServerCfg(t, nil, func(c *config.Config) { c.AdminToken = "secret" }, mock)
+		cookie := authedCookie(t, ts)
+
+		// The stale probe_tokens=true opt-in must not change behavior: probes
+		// run unconditionally either way.
+		resp := postForm(t, ts.URL, cookie, "/admin/diag", url.Values{"probe_tokens": {"true"}})
+		body := bodyOf(t, resp)
+		if !strings.Contains(body, "Token #1 validity probe succeeded") {
+			t.Errorf("diag with probe_tokens=true missing probe-success row:\n%s", body)
+		}
+		if strings.Contains(body, "probes skipped") {
+			t.Errorf("diag with probe_tokens=true still reports probes skipped:\n%s", body)
+		}
+		if got := mock.SessionCreatesSnapshot(); got != 0 {
+			t.Errorf("diag created %d upstream session(s), want 0 (zero-cost probe)", got)
+		}
+	})
 }
 
 // --- CSRF ---
@@ -758,6 +808,33 @@ func TestDashboardCSRFSecFetchSiteCombos(t *testing.T) {
 				t.Errorf("status = %d, want %d (body %q, host %q)", status, tc.want, body, host)
 			}
 		})
+	}
+}
+
+// TestDashboardCSRFLoginGate: the login POST consumes the per-IP attempt
+// budget, so it must carry the same CSRF gate as the other mutating admin
+// routes — a cross-origin POST is rejected before it can burn a victim's
+// login attempts (repeatable cross-site lockout DoS). Header-less clients
+// (curl, API clients, tests) still pass through and can log in.
+func TestDashboardCSRFLoginGate(t *testing.T) {
+	ts := dashboardServer(t, "secret", nil)
+
+	status, body := csrfPost(t, ts.URL, "", "/admin/login", "token=secret", map[string]string{"Origin": "http://evil.example"})
+	if status != http.StatusForbidden {
+		t.Fatalf("cross-origin login POST status = %d, want 403", status)
+	}
+	if !strings.Contains(body, "Cross-origin request rejected.") {
+		t.Errorf("cross-origin login body = %q, want rejection message", body)
+	}
+
+	// Header-less POST (curl/legacy clients) must still authenticate.
+	resp := postLogin(t, ts.URL+"/admin/login", "secret")
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusFound {
+		t.Errorf("header-less login POST status = %d, want 302", resp.StatusCode)
+	}
+	if cookies := resp.Cookies(); len(cookies) != 1 {
+		t.Errorf("header-less login cookies = %d, want 1", len(cookies))
 	}
 }
 

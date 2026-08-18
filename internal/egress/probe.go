@@ -1,24 +1,22 @@
-// Package egress probes the proxy's outbound network path — the public IP
-// and country code seen by a remote service — per egress route (direct or
-// per configured SOCKS5 proxy). Results back the doctor's region row and
-// give operators a fast ban-avoidance signal (requests unexpectedly
-// appearing to originate from another country).
+// Package egress probes the gateway's outbound network path — the public IP
+// and country code seen by a remote service — over the direct egress route.
+// Results back the doctor's region row and give operators a fast
+// ban-avoidance signal (requests unexpectedly appearing to originate from
+// another country).
 package egress
 
 import (
 	"bufio"
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
-	"net/url"
 	"strings"
 	"sync"
 	"time"
 
-	"golang.org/x/net/proxy"
+	"freebuff-proxy/internal/stealth"
 )
 
 // ProbeURL is the Cloudflare trace endpoint that reports the caller's
@@ -102,54 +100,8 @@ func DirectDialer(timeout time.Duration) func(ctx context.Context, network, addr
 	return (&net.Dialer{Timeout: timeout}).DialContext
 }
 
-// Socks5Dialer builds a SOCKS5 proxy dialer for addr, which may be a bare
-// host:port or a socks5:// URL (userinfo allowed). The returned dial
-// function routes every connection through the proxy. The userinfo is
-// carried through to the SOCKS5 handshake so authenticated proxies actually
-// authenticate (previously it was dropped and the handshake failed —
-// Audit B2). x/net/proxy's Dial is not context-aware, so a wedged proxy is
-// bounded by the probe's client timeout rather than ctx cancellation.
-func Socks5Dialer(addr string) (func(ctx context.Context, network, addr string) (net.Conn, error), error) {
-	host, auth, err := parseSocks5(addr)
-	if err != nil {
-		return nil, err
-	}
-	d, err := proxy.SOCKS5("tcp", host, auth, proxy.Direct)
-	if err != nil {
-		return nil, fmt.Errorf("egress: SOCKS5 dialer for %s: %w", host, err)
-	}
-	return func(ctx context.Context, network, addr string) (net.Conn, error) {
-		return d.Dial(network, addr)
-	}, nil
-}
-
-// parseSocks5 normalizes a configured proxy address to host:port plus its
-// credentials. A bare host:port or a socks5:// URL (with optional userinfo)
-// are accepted; the userinfo becomes the SOCKS5 auth.
-func parseSocks5(raw string) (addr string, auth *proxy.Auth, err error) {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return "", nil, errors.New("egress: empty proxy address")
-	}
-	if !strings.Contains(raw, "://") {
-		return raw, nil, nil
-	}
-	u, err := url.Parse(raw)
-	if err != nil {
-		return "", nil, fmt.Errorf("egress: invalid proxy address %q: %w", raw, err)
-	}
-	if u.Host == "" {
-		return "", nil, fmt.Errorf("egress: proxy address %q has no host", raw)
-	}
-	if u.User != nil {
-		pass, _ := u.User.Password()
-		auth = &proxy.Auth{User: u.User.Username(), Password: pass}
-	}
-	return u.Host, auth, nil
-}
-
-// Path identifies one egress path to probe: the cache key ("direct",
-// "proxy-0", ...) and the dialer that routes the probe connection.
+// Path identifies one egress path to probe: the cache key ("direct") and
+// the dialer that routes the probe connection.
 type Path struct {
 	Key    string
 	Dialer func(ctx context.Context, network, addr string) (net.Conn, error)
@@ -178,6 +130,14 @@ func RunLoop(ctx context.Context, logger *slog.Logger, cache *Cache, paths []Pat
 				logger.Warn("egress probe failed", "path", key, "err", r.Err)
 			} else {
 				logger.Debug("egress probe", "path", key, "ip", r.IP, "country", r.Country)
+				// Passive ban-risk feed (#64): every successful probe
+				// contributes an egress-geo sample to the shared risk
+				// engine. Read-only; the engine only warns.
+				stealth.DefaultRiskEngine.Observe(stealth.RiskSample{
+					At:       time.Now(),
+					EgressIP: r.IP,
+					Country:  r.Country,
+				})
 			}
 		}
 	}

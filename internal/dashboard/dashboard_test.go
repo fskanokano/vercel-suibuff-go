@@ -193,6 +193,74 @@ func TestLogsPageWithoutRing(t *testing.T) {
 	}
 }
 
+// TestLogsPageFilters pins the T19 filter row: ?level and ?msg (substring,
+// case-insensitive) render only matching rows, the empty state switches to
+// the filtered copy when a filter matches nothing, and the filter controls
+// are present for the hx-get wiring.
+func TestLogsPageFilters(t *testing.T) {
+	ts := newDashboardForPages(t, true) // seeds one INFO "hello ring" record
+
+	get := func(path string) string {
+		t.Helper()
+		resp, err := http.Get(ts.URL + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+		return string(mustReadAll(t, resp))
+	}
+
+	// The filter row renders: level select + msg input.
+	page := get("/logs")
+	for _, want := range []string{`name="level"`, `id="logs-msg"`, "all levels", "hx-get=\"/admin/logs\""} {
+		if !strings.Contains(page, want) {
+			t.Errorf("logs page missing filter control %q", want)
+		}
+	}
+
+	// level=warn excludes the INFO record and shows the filtered empty state.
+	page = get("/logs?level=warn")
+	if strings.Contains(page, "hello ring") {
+		t.Error("level=warn filter rendered an info record")
+	}
+	if !strings.Contains(page, "No matching log records") {
+		t.Error("level=warn filter should show the filtered empty state")
+	}
+
+	// level=info keeps the INFO record.
+	page = get("/logs?level=info")
+	if !strings.Contains(page, "hello ring") {
+		t.Error("level=info filter dropped the info record")
+	}
+
+	// msg is a case-insensitive substring.
+	for _, q := range []string{"?msg=ring", "?msg=RING", "?msg=hello"} {
+		page = get("/logs" + q)
+		if !strings.Contains(page, "hello ring") {
+			t.Errorf("msg filter %q dropped the matching record", q)
+		}
+	}
+
+	// A msg matching nothing flips to the filtered empty state.
+	page = get("/logs?msg=zzz-none")
+	if strings.Contains(page, "hello ring") {
+		t.Error("msg=zzz-none filter rendered a non-matching record")
+	}
+	if !strings.Contains(page, "No matching log records") {
+		t.Error("msg=zzz-none filter should show the filtered empty state")
+	}
+
+	// Combined level+msg filter.
+	page = get("/logs?level=info&msg=ring")
+	if !strings.Contains(page, "hello ring") {
+		t.Error("combined info+ring filter dropped the matching record")
+	}
+	page = get("/logs?level=warn&msg=ring")
+	if strings.Contains(page, "hello ring") {
+		t.Error("combined warn+ring filter rendered a non-matching record")
+	}
+}
+
 func TestMetricsPageRendersSparklines(t *testing.T) {
 	cfg := &config.Config{
 		UpstreamBaseURL: "https://www.codebuff.com",
@@ -652,14 +720,82 @@ func TestRenderSmokeResultFragment(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/admin/smoke", nil)
 	req.Header.Set("HX-Request", "true")
 	rec := httptest.NewRecorder()
-	d.RenderSmokeResult(rec, req, dashModel, "bridge", 123, []byte("preview bytes"))
+	d.RenderSmokeResult(rec, req, dashModel, "bridge", 123, []byte("preview bytes"), []dashboard.PhaseKV{{Name: "acquire_ms", Ms: 5}, {Name: "total_ms", Ms: 123}})
 	frag := rec.Body.String()
 	if strings.Contains(frag, "<html") {
 		t.Error("HX-Request smoke result rendered a full page")
 	}
-	for _, want := range []string{"Smoke test OK", dashModel, "bridge", "123ms", "preview bytes"} {
+	for _, want := range []string{"Smoke test OK", dashModel, "bridge", "123ms", "preview bytes", "acquire_ms=5ms", "total_ms=123ms"} {
 		if !strings.Contains(frag, want) {
 			t.Errorf("smoke fragment missing %q: %s", want, frag)
+		}
+	}
+}
+
+// TestTokensPageStanding renders the #96 account-standing block end-to-end:
+// a session admission carrying the upstream "standing" field surfaces the
+// access level/label/score/next-level pill on the tokens page.
+func TestTokensPageStanding(t *testing.T) {
+	mock := testutil.NewMock()
+	t.Cleanup(mock.Close)
+	mock.Standing = map[string]any{
+		"level":       "established",
+		"label":       "Established",
+		"score":       62,
+		"nextLevelAt": "2026-08-20T12:00:00Z",
+		"nextLevel":   "core",
+	}
+	mock.ChatBody = testutil.SSEEvent(`{"id":"c1","object":"chat.completion.chunk","created":1,"model":"`+dashModel+`","choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}`) +
+		testutil.SSEEvent(`{"id":"c1","object":"chat.completion.chunk","created":1,"model":"`+dashModel+`","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`)
+	cfg := &config.Config{
+		AuthTokens:         []string{"tok-0"},
+		ListenAddr:         "127.0.0.1:3457",
+		RotationInterval:   time.Hour,
+		RequestTimeout:     15 * time.Minute,
+		SessionCallTimeout: 5 * time.Second,
+		RegistryRefresh:    6 * time.Hour,
+		UpstreamBaseURL:    mock.URL(),
+	}
+	client, err := upstream.New("tok-0", cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sess := session.NewManager(client)
+	reg := registry.New(cfg, nil)
+	reg.LoadFallback()
+	p, err := pool.New(cfg, []*upstream.Client{client}, []*session.Manager{sess}, reg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := dashboard.New(func() *config.Config { return cfg }, p, reg, nil, nil)
+
+	// Admit a real session so the standing block is cached, then render.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	lease, err := p.Acquire(ctx, dashModel)
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	up, err := p.Chat(ctx, lease, upstream.ChatOptions{Model: dashModel, RunID: lease.Run.RunID, SessionInstanceID: lease.SessionInstanceID},
+		[]byte(`{"model":"`+dashModel+`","messages":[{"role":"user","content":"ping"}]}`))
+	if err != nil {
+		t.Fatalf("chat: %v", err)
+	}
+	_, _ = io.Copy(io.Discard, up)
+	_ = up.Close()
+	p.LeaseRelease(lease)
+
+	ts := httptest.NewServer(d.Page("tokens"))
+	t.Cleanup(ts.Close)
+	resp, err := http.Get(ts.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	page := string(mustReadAll(t, resp))
+	for _, want := range []string{"trust Established", "62/100", "2026-08-20T12:00:00Z", "core"} {
+		if !strings.Contains(page, want) {
+			t.Errorf("tokens page missing standing %q", want)
 		}
 	}
 }

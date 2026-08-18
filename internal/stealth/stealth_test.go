@@ -11,9 +11,11 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"io"
+	"log/slog"
 	"math/big"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"reflect"
 	"strings"
 	"sync"
@@ -122,6 +124,24 @@ func TestApplyProfileHeaders(t *testing.T) {
 			t.Errorf("Sec-Fetch-Site = %q, want cross-site", got)
 		}
 	})
+
+	t.Run("no-hint profile deletes stale Chromium hints", func(t *testing.T) {
+		// Rotation path: a Chrome request retried under Safari/Firefox must
+		// not keep the Chromium client-hint headers (they would mismatch the
+		// new TLS fingerprint).
+		h := http.Header{}
+		ApplyProfileHeaders(h, ProfileChrome120)
+		ApplyProfileHeaders(h, ProfileFirefox120)
+
+		for _, hdr := range []string{"Sec-CH-UA", "Sec-CH-UA-Mobile", "Sec-CH-UA-Platform"} {
+			if v := h.Get(hdr); v != "" {
+				t.Errorf("%s = %q after Firefox apply, want deleted", hdr, v)
+			}
+		}
+		if got := h.Get("User-Agent"); got != ProfileFirefox120.UserAgent {
+			t.Errorf("User-Agent = %q, want Firefox UA", got)
+		}
+	})
 }
 
 func TestSanitizeAndApply(t *testing.T) {
@@ -184,7 +204,7 @@ func TestDialerTLS(t *testing.T) {
 
 	addr := ln.Addr().String()
 
-	dialFN := Dialer(ProfileChrome120, nil, true)
+	dialFN := Dialer(ProfileChrome120, nil, true, nil)
 	tr := &http.Transport{
 		DialTLSContext: dialFN,
 	}
@@ -220,6 +240,44 @@ func TestGetProfileForConnection(t *testing.T) {
 			t.Errorf("GetProfileForConnection(ProfileRandom) returned empty User-Agent")
 		}
 	})
+}
+
+func TestProfileRandomClientHints(t *testing.T) {
+	for i := 0; i < 50; i++ {
+		p := GetProfileForConnection(ProfileRandom)
+		if p.UserAgent == "" {
+			t.Fatal("GetProfileForConnection(ProfileRandom) returned empty User-Agent")
+		}
+		h := http.Header{}
+		ApplyProfileHeaders(h, p)
+		if strings.Contains(p.UserAgent, "Chrome/") || strings.Contains(p.UserAgent, "Edg/") {
+			if p.SecChUA == "" {
+				t.Fatalf("Chromium UA %q had empty SecChUA", p.UserAgent)
+			}
+			if !strings.Contains(p.SecChUA, "Chromium") {
+				t.Fatalf("Chromium UA %q SecChUA = %q, want Chromium brand", p.UserAgent, p.SecChUA)
+			}
+			if p.SecChUAPlatform == "" {
+				t.Fatalf("Chromium UA %q had empty SecChUAPlatform", p.UserAgent)
+			}
+			if got := h.Get("Sec-CH-UA"); got != p.SecChUA {
+				t.Fatalf("header Sec-CH-UA = %q, want %q", got, p.SecChUA)
+			}
+			if got := h.Get("Sec-CH-UA-Mobile"); got != "?0" {
+				t.Fatalf("header Sec-CH-UA-Mobile = %q, want ?0", got)
+			}
+			if got := h.Get("Sec-CH-UA-Platform"); got != p.SecChUAPlatform {
+				t.Fatalf("header Sec-CH-UA-Platform = %q, want %q", got, p.SecChUAPlatform)
+			}
+		} else {
+			if p.SecChUA != "" || p.SecChUAPlatform != "" {
+				t.Fatalf("non-Chromium UA %q has non-empty client hints: %q, %q", p.UserAgent, p.SecChUA, p.SecChUAPlatform)
+			}
+			if got := h.Get("Sec-CH-UA"); got != "" {
+				t.Fatalf("non-Chromium header Sec-CH-UA = %q, want empty", got)
+			}
+		}
+	}
 }
 
 // startTLSStub starts a local TLS server that completes any handshake and
@@ -293,7 +351,7 @@ func TestDialerSafariCustomSpec(t *testing.T) {
 	addr := startTLSStub(t)
 	for _, prof := range []*Profile{freshSafariProfile(ProfileIDSafari17), freshSafariProfile(ProfileIDSafari18)} {
 		t.Run(string(prof.ID), func(t *testing.T) {
-			dialFN := Dialer(prof, nil, true)
+			dialFN := Dialer(prof, nil, true, nil)
 			conn, err := dialFN(context.Background(), "tcp", addr)
 			if err != nil {
 				t.Fatalf("handshake with custom spec failed: %v", err)
@@ -313,7 +371,7 @@ func TestDialerDoesNotMutateSharedSpec(t *testing.T) {
 	specBefore := cloneSpec(ProfileSafari18.CustomSpec)
 
 	addr := startTLSStub(t)
-	dialFN := Dialer(ProfileSafari18, nil, true) // REAL shared singleton, not a fresh copy
+	dialFN := Dialer(ProfileSafari18, nil, true, nil) // REAL shared singleton, not a fresh copy
 	for range 5 {
 		conn, err := dialFN(context.Background(), "tcp", addr)
 		if err != nil {
@@ -505,7 +563,7 @@ func TestDialerInvalidAddr(t *testing.T) {
 	baseDial := func(ctx context.Context, network, addr string) (net.Conn, error) {
 		return &closingConn{closed: closed}, nil
 	}
-	dialFN := Dialer(ProfileChrome120, baseDial, true)
+	dialFN := Dialer(ProfileChrome120, baseDial, true, nil)
 	_, err := dialFN(context.Background(), "tcp", "missing-port")
 	if err == nil {
 		t.Fatal("dial with an invalid address succeeded")
@@ -611,7 +669,7 @@ func TestDialerProfileSwapChangesClientHello(t *testing.T) {
 			}
 			return &writeCaptureConn{Conn: c, first: &first}, nil
 		}
-		conn, err := Dialer(prof, baseDial, true)(context.Background(), "tcp", addr)
+		conn, err := Dialer(prof, baseDial, true, nil)(context.Background(), "tcp", addr)
 		if err != nil {
 			t.Fatalf("%s handshake failed: %v", prof.ID, err)
 		}
@@ -628,5 +686,79 @@ func TestDialerProfileSwapChangesClientHello(t *testing.T) {
 	safari := capture(freshSafariProfile(ProfileIDSafari18))
 	if bytes.Equal(chrome, safari) {
 		t.Error("rotated profile emitted an identical ClientHello")
+	}
+}
+
+// TestDialerALPNNegotiation guards the ALPN knob (issue #51): with
+// ["h2","http/1.1"] (a real browser's ALPN) the dialer negotiates h2
+// against an h2-capable server; with ["http/1.1"] it stays h1. The
+// negotiated protocol MUST match the transport the caller wires up — h2
+// ALPN with Go's h1 transport chokes on server SETTINGS frames.
+func TestDialerALPNNegotiation(t *testing.T) {
+	// A TLS server advertising h2 + http/1.1 (like a Cloudflare front).
+	ts := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+	}))
+	ts.TLS = &tls.Config{NextProtos: []string{"h2", "http/1.1"}}
+	ts.StartTLS()
+	defer ts.Close()
+
+	negotiated := func(alpn []string) string {
+		t.Helper()
+		dialFN := Dialer(ProfileChrome120, nil, true, alpn)
+		conn, err := dialFN(context.Background(), "tcp", ts.Listener.Addr().String())
+		if err != nil {
+			t.Fatalf("dial with ALPN %v failed: %v", alpn, err)
+		}
+		defer func() { _ = conn.Close() }()
+		u, ok := conn.(*utls.UConn)
+		if !ok {
+			t.Fatalf("dial returned %T, want *utls.UConn", conn)
+		}
+		return u.ConnectionState().NegotiatedProtocol
+	}
+
+	if got := negotiated([]string{"h2", "http/1.1"}); got != "h2" {
+		t.Errorf("h2 ALPN negotiated %q, want h2", got)
+	}
+	if got := negotiated([]string{"http/1.1"}); got != "http/1.1" {
+		t.Errorf("h1 ALPN negotiated %q, want http/1.1", got)
+	}
+	// nil falls back to the h1 default (pre-#51 behavior).
+	if got := negotiated(nil); got != "http/1.1" {
+		t.Errorf("nil ALPN negotiated %q, want http/1.1 (default)", got)
+	}
+}
+
+// TestProfileSelectionLogs verifies T18: every GetProfileForConnection
+// resolution logs a Debug line naming the selected profile — static,
+// auto-resolved, and random alike.
+func TestProfileSelectionLogs(t *testing.T) {
+	var sink bytes.Buffer
+	SetLogger(slog.New(slog.NewTextHandler(&sink, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { SetLogger(nil) })
+
+	if p := GetProfileForConnection(ProfileChrome120); p != ProfileChrome120 {
+		t.Fatalf("static selection = %v, want ProfileChrome120", p)
+	}
+	if !strings.Contains(sink.String(), "stealth profile selected") || !strings.Contains(sink.String(), "profile=chrome120") {
+		t.Errorf("static profile selection not logged: %s", sink.String())
+	}
+
+	before := sink.Len()
+	sel := GetProfileForConnection(ProfileAuto)
+	if sel == nil || sel.ID == ProfileIDAuto {
+		t.Fatal("auto profile not resolved to a concrete profile")
+	}
+	after := sink.String()[before:]
+	if !strings.Contains(after, "stealth profile selected") || !strings.Contains(after, "profile=") {
+		t.Errorf("auto profile selection not logged: %s", after)
+	}
+
+	before = sink.Len()
+	GetProfileForConnection(ProfileRandom)
+	after = sink.String()[before:]
+	if !strings.Contains(after, "stealth profile selected") || !strings.Contains(after, "profile=random") {
+		t.Errorf("random profile selection not logged: %s", after)
 	}
 }

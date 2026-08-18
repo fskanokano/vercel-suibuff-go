@@ -1,11 +1,14 @@
 package session
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -58,6 +61,29 @@ func TestCreateActive(t *testing.T) {
 	}
 	if mock.SessionCreates != 1 {
 		t.Errorf("creates = %d, want still 1", mock.SessionCreates)
+	}
+}
+
+func TestStatusErrorModelIPLimited(t *testing.T) {
+	limited := &upstream.SessionState{Message: "model kimi/kimi-k2-0725 is limited on this IP", RetryAfterMs: 30000}
+	for _, status := range []string{"session_model_mismatch", "limited_ip"} {
+		err := statusError(status, limited)
+		var lie *upstream.LimitedIpError
+		if !errors.As(err, &lie) {
+			t.Fatalf("statusError(%q) = %v, want *upstream.LimitedIpError", status, err)
+		}
+		if !errors.Is(err, upstream.ErrModelIPLimited) {
+			t.Errorf("errors.Is(upstream.ErrModelIPLimited) = false, got %v", err)
+		}
+		if lie.RetryAfter != 30*time.Second {
+			t.Errorf("RetryAfter = %s, want 30s", lie.RetryAfter)
+		}
+	}
+
+	// Non-limited messages keep today's exact unknown-status error text.
+	err := statusError("session_model_mismatch", &upstream.SessionState{Message: "session model mismatch"})
+	if err == nil || err.Error() != `session: unknown upstream status "session_model_mismatch"` {
+		t.Errorf("non-limited statusError = %v, want unknown-status error", err)
 	}
 }
 
@@ -131,7 +157,10 @@ func TestEndedRecreates(t *testing.T) {
 func TestExpiredCacheRefreshes(t *testing.T) {
 	mock := testutil.NewMock()
 	defer mock.Close()
-	mock.ExpiresIn = -1 * time.Minute // already past expiry margin
+	// Expiry beyond the 30-min grace window (issue #115): a session that
+	// expired more than graceWindow ago must refresh. Expiries inside the
+	// window are reusable (TestEnsureSessionRidesGraceFastPath).
+	mock.ExpiresIn = -31 * time.Minute
 	mgr := newTestManager(t, mock)
 
 	// First call: no cache → one create, state trusted on return.
@@ -146,7 +175,7 @@ func TestExpiredCacheRefreshes(t *testing.T) {
 		t.Errorf("creates = %d, want 1", mock.SessionCreates)
 	}
 
-	// Second call: stale cache → refresh (create #2).
+	// Second call: stale cache past grace → refresh (create #2).
 	instance, err = mgr.EnsureSession(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -155,7 +184,7 @@ func TestExpiredCacheRefreshes(t *testing.T) {
 		t.Errorf("instance = %q", instance)
 	}
 	if mock.SessionCreates != 2 {
-		t.Errorf("creates = %d, want 2 (stale cache → refresh)", mock.SessionCreates)
+		t.Errorf("creates = %d, want 2 (stale cache past grace → refresh)", mock.SessionCreates)
 	}
 }
 
@@ -557,18 +586,18 @@ func TestSnapshotQuotaByModel(t *testing.T) {
 	}
 }
 
-func TestHeartbeat(t *testing.T) {
+func TestPoll(t *testing.T) {
 	t.Run("inactive session returns nil", func(t *testing.T) {
 		mock := testutil.NewMock()
 		defer mock.Close()
 		mgr := newTestManager(t, mock)
 
-		if err := mgr.Heartbeat(context.Background()); err != nil {
-			t.Fatalf("Heartbeat inactive: %v", err)
+		if err := mgr.Poll(context.Background()); err != nil {
+			t.Fatalf("Poll inactive: %v", err)
 		}
 	})
 
-	t.Run("active session sends heartbeat header", func(t *testing.T) {
+	t.Run("active session polls compact without heartbeat header", func(t *testing.T) {
 		mock := testutil.NewMock()
 		defer mock.Close()
 		mgr := newTestManager(t, mock)
@@ -578,20 +607,25 @@ func TestHeartbeat(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		heartbeatSeen := false
+		var gotCompact, gotHeartbeat string
 		mock.SessionHandler = func(w http.ResponseWriter, r *http.Request) {
-			if r.Header.Get("x-freebuff-heartbeat") == "1" {
-				heartbeatSeen = true
-			}
+			gotCompact = r.Header.Get("x-freebuff-compact-session")
+			gotHeartbeat = r.Header.Get("x-freebuff-heartbeat")
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = io.WriteString(w, `{"status":"active","instanceId":"inst-abc-123"}`)
 		}
 
-		if err := mgr.Heartbeat(context.Background()); err != nil {
-			t.Fatalf("Heartbeat: %v", err)
+		if err := mgr.Poll(context.Background()); err != nil {
+			t.Fatalf("Poll: %v", err)
 		}
-		if !heartbeatSeen {
-			t.Error("x-freebuff-heartbeat header not sent upstream")
+		// Gap #2: the CLI never beats — x-freebuff-heartbeat is
+		// Desktop-only (reference/freebuff freebuff-models.ts:1212-1215);
+		// liveness comes from the recurring compact GET.
+		if gotCompact != "1" {
+			t.Errorf("x-freebuff-compact-session = %q, want 1", gotCompact)
+		}
+		if gotHeartbeat != "" {
+			t.Errorf("x-freebuff-heartbeat = %q, want absent on polls", gotHeartbeat)
 		}
 		if snap := mgr.Snapshot(); snap.Status != "active" {
 			t.Errorf("status = %q, want active", snap.Status)
@@ -613,13 +647,137 @@ func TestHeartbeat(t *testing.T) {
 			_, _ = io.WriteString(w, `{"status":"ended","instanceId":"inst-abc-123"}`)
 		}
 
-		if err := mgr.Heartbeat(context.Background()); err != nil {
-			t.Fatalf("Heartbeat: %v", err)
+		if err := mgr.Poll(context.Background()); err != nil {
+			t.Fatalf("Poll: %v", err)
 		}
 		if snap := mgr.Snapshot(); snap.Status != "" {
 			t.Errorf("status = %q, want empty after invalidation", snap.Status)
 		}
 	})
+}
+
+// TestPollRidesGraceEndedWithInstance verifies gap #13 on the poll path: an
+// "ended" response that still carries the instance id (with a future grace
+// end) is kept as a usable ended-with-instance row — the fast path keeps
+// serving it until grace closes, with no fresh admission.
+func TestPollRidesGraceEndedWithInstance(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mgr := newTestManager(t, mock)
+
+	if _, err := mgr.EnsureSession(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	graceEnd := time.Now().Add(20 * time.Minute).UTC().Format(time.RFC3339)
+	mock.SessionHandler = func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"status":"ended","instanceId":"inst-abc-123","gracePeriodEndsAt":"`+graceEnd+`"}`)
+	}
+
+	if err := mgr.Poll(context.Background()); err != nil {
+		t.Fatalf("Poll: %v", err)
+	}
+	snap := mgr.Snapshot()
+	if snap.Status != "ended" || snap.InstanceID != "inst-abc-123" {
+		t.Fatalf("snapshot = %+v, want ended inst-abc-123 (in-grace row kept)", snap)
+	}
+
+	// The fast path reuses the in-grace slot: no upstream create.
+	creates := mock.SessionCreates
+	instance, err := mgr.EnsureSession(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if instance != "inst-abc-123" {
+		t.Errorf("instance = %q, want inst-abc-123 (ride through grace)", instance)
+	}
+	if mock.SessionCreates != creates {
+		t.Errorf("session creates = %d, want %d (no fresh admission inside grace)", mock.SessionCreates, creates)
+	}
+}
+
+// TestEnsureSessionRidesGraceFastPath verifies gap #13 on the fast path: an
+// active cache entry whose expiry margin has passed is still reusable while
+// its instance id survives the 30-minute grace drain, and once grace closes
+// the next EnsureSession re-admits.
+func TestEnsureSessionRidesGraceFastPath(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mgr := newTestManager(t, mock)
+
+	// Active-but-expired cache, still within the grace drain.
+	mgr.mu.Lock()
+	mgr.commit(&cachedState{
+		status:            "active",
+		instanceID:        "inst-grace",
+		model:             "deepseek/deepseek-v4-pro",
+		expiresAt:         time.Now().Add(-10 * time.Minute),
+		gracePeriodEndsAt: time.Now().Add(20 * time.Minute),
+	})
+	mgr.mu.Unlock()
+
+	creates := mock.SessionCreates
+	instance, err := mgr.EnsureSessionForModel(context.Background(), "deepseek/deepseek-v4-pro")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if instance != "inst-grace" {
+		t.Errorf("instance = %q, want inst-grace (ride through grace)", instance)
+	}
+	if mock.SessionCreates != creates {
+		t.Errorf("session creates = %d, want %d (no fresh admission inside grace)", mock.SessionCreates, creates)
+	}
+
+	// Past the grace window: the fast path falls through and re-admits.
+	mgr.mu.Lock()
+	mgr.commit(&cachedState{
+		status:            "active",
+		instanceID:        "inst-grace",
+		model:             "deepseek/deepseek-v4-pro",
+		expiresAt:         time.Now().Add(-45 * time.Minute),
+		gracePeriodEndsAt: time.Now().Add(-10 * time.Minute),
+	})
+	mgr.mu.Unlock()
+
+	if _, err := mgr.EnsureSessionForModel(context.Background(), "deepseek/deepseek-v4-pro"); err != nil {
+		t.Fatal(err)
+	}
+	if mock.SessionCreates != creates+1 {
+		t.Errorf("session creates = %d, want %d (re-admit after grace closes)", mock.SessionCreates, creates+1)
+	}
+}
+
+// TestPollEndedPastGraceInvalidates verifies an "ended" poll response whose
+// grace window has already closed (or that carries no instance id) drops the
+// cached slot so the next EnsureSession re-creates fresh.
+func TestPollEndedPastGraceInvalidates(t *testing.T) {
+	for name, body := range map[string]string{
+		"past grace":  `{"status":"ended","instanceId":"inst-abc-123","gracePeriodEndsAt":"2020-01-01T00:00:00Z"}`,
+		"no instance": `{"status":"ended"}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			mock := testutil.NewMock()
+			defer mock.Close()
+			mgr := newTestManager(t, mock)
+
+			if _, err := mgr.EnsureSession(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+
+			mock.SessionHandler = func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, body)
+			}
+
+			if err := mgr.Poll(context.Background()); err != nil {
+				t.Fatalf("Poll: %v", err)
+			}
+			if snap := mgr.Snapshot(); snap.Status != "" {
+				t.Errorf("status = %q, want empty after %s ended poll", snap.Status, name)
+			}
+		})
+	}
 }
 
 // TestRecreateStatusesRecreates pins status-matrix parity for the
@@ -648,10 +806,10 @@ func TestRecreateStatusesRecreates(t *testing.T) {
 	}
 }
 
-// TestHeartbeatInvalidatesRecreateStatuses verifies Heartbeat invalidates
-// the cached admission for "superseded"/"none" polls exactly like "ended"
-// (status parity for the heartbeat path).
-func TestHeartbeatInvalidatesRecreateStatuses(t *testing.T) {
+// TestPollInvalidatesRecreateStatuses verifies Poll invalidates the cached
+// admission for "superseded"/"none" polls exactly like "ended" (status
+// parity for the poll path).
+func TestPollInvalidatesRecreateStatuses(t *testing.T) {
 	for _, status := range []string{"superseded", "none"} {
 		t.Run(status, func(t *testing.T) {
 			mock := testutil.NewMock()
@@ -667,13 +825,59 @@ func TestHeartbeatInvalidatesRecreateStatuses(t *testing.T) {
 				_, _ = io.WriteString(w, `{"status":"`+status+`","instanceId":"inst-abc-123"}`)
 			}
 
-			if err := mgr.Heartbeat(context.Background()); err != nil {
-				t.Fatalf("Heartbeat: %v", err)
+			if err := mgr.Poll(context.Background()); err != nil {
+				t.Fatalf("Poll: %v", err)
 			}
 			if snap := mgr.Snapshot(); snap.Status != "" {
 				t.Errorf("status = %q, want empty after %s invalidation", snap.Status, status)
 			}
 		})
+	}
+}
+
+// TestPollDropsRowOnWaitingRoomRequired verifies #116: a 428
+// waiting_room_required poll response is session-ENDING
+// (endsTheSession:true) — Poll drops the cached admission so the next
+// EnsureSession re-admits fresh, and surfaces the typed error for the
+// pool's failure backoff.
+func TestPollDropsRowOnWaitingRoomRequired(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mgr := newTestManager(t, mock)
+
+	if _, err := mgr.EnsureSession(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	var reAdmits atomic.Int32
+	mock.SessionHandler = func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			// 428 on the poll GET (the compact session poll).
+			w.WriteHeader(http.StatusTooEarly) // 428
+			_, _ = io.WriteString(w, `{"error":"waiting_room_required"}`)
+			return
+		}
+		// POST (re-admit after the 428 drop): a fresh active slot.
+		reAdmits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"status":"active","instanceId":"inst-abc-123","expiresAt":"2030-01-01T00:00:00Z"}`)
+	}
+
+	err := mgr.Poll(context.Background())
+	if !errors.Is(err, upstream.ErrWaitingRoomRequired) {
+		t.Fatalf("Poll error = %v, want ErrWaitingRoomRequired", err)
+	}
+	if snap := mgr.Snapshot(); snap.Status != "" {
+		t.Errorf("status = %q, want empty (cached row dropped on 428)", snap.Status)
+	}
+
+	// The next EnsureSession re-admits fresh (the pool fires the
+	// WAITING_ROOM_CHAIN before the create).
+	if _, err := mgr.EnsureSession(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := reAdmits.Load(); got != 1 {
+		t.Errorf("re-admit session creates = %d, want 1 (fresh admission after 428 drop)", got)
 	}
 }
 
@@ -815,11 +1019,11 @@ func TestQueuedZeroPollAtClamp(t *testing.T) {
 	}
 }
 
-// TestHeartbeatTransportErrorKeepsCachedState verifies a transport error on
-// the heartbeat poll surfaces as an error (pool cooldown path) while the
-// cached active admission stays intact — the transport failure did not prove
-// the session dead.
-func TestHeartbeatTransportErrorKeepsCachedState(t *testing.T) {
+// TestPollTransportErrorKeepsCachedState verifies a transport error on the
+// session poll surfaces as an error (pool backoff path) while the cached
+// active admission stays intact — the transport failure did not prove the
+// session dead.
+func TestPollTransportErrorKeepsCachedState(t *testing.T) {
 	mock := testutil.NewMock()
 	defer mock.Close()
 	mgr := newTestManager(t, mock)
@@ -828,7 +1032,7 @@ func TestHeartbeatTransportErrorKeepsCachedState(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Subsequent heartbeat GET hangs up the connection (transport error).
+	// Subsequent poll GET hangs up the connection (transport error).
 	mock.SessionHandler = func(w http.ResponseWriter, r *http.Request) {
 		hj, ok := w.(http.Hijacker)
 		if !ok {
@@ -843,8 +1047,8 @@ func TestHeartbeatTransportErrorKeepsCachedState(t *testing.T) {
 		_ = conn.Close()
 	}
 
-	if err := mgr.Heartbeat(context.Background()); err == nil {
-		t.Fatal("heartbeat transport error must surface, got nil")
+	if err := mgr.Poll(context.Background()); err == nil {
+		t.Fatal("poll transport error must surface, got nil")
 	}
 	snap := mgr.Snapshot()
 	if snap.Status != "active" {
@@ -856,28 +1060,39 @@ func TestHeartbeatTransportErrorKeepsCachedState(t *testing.T) {
 }
 
 // TestEndSessionSwallowsSessionInvalid verifies EndSession returns nil when
-// the upstream DELETE fails with a 400 session_superseded (ErrSessionInvalid
-// — the slot is already gone, nothing to do).
+// the upstream DELETE fails with a "slot already gone" rejection — 400
+// session_expired (ErrSessionInvalid) and 400 session_superseded
+// (ErrSessionSuperseded, #119) — nothing to do either way.
 func TestEndSessionSwallowsSessionInvalid(t *testing.T) {
-	mock := testutil.NewMock()
-	defer mock.Close()
-	mgr := newTestManager(t, mock)
+	for _, tc := range []struct {
+		body string
+		want error
+	}{
+		{`{"error":"session_expired"}`, upstream.ErrSessionInvalid},
+		{`{"error":"session_superseded"}`, upstream.ErrSessionSuperseded},
+	} {
+		t.Run(tc.body, func(t *testing.T) {
+			mock := testutil.NewMock()
+			defer mock.Close()
+			mgr := newTestManager(t, mock)
 
-	if _, err := mgr.EnsureSession(context.Background()); err != nil {
-		t.Fatal(err)
-	}
+			if _, err := mgr.EnsureSession(context.Background()); err != nil {
+				t.Fatal(err)
+			}
 
-	mock.SessionHandler = func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodDelete {
-			w.WriteHeader(http.StatusBadRequest)
-			_, _ = io.WriteString(w, `{"error":"session_superseded"}`)
-			return
-		}
-		http.NotFound(w, r)
-	}
+			mock.SessionHandler = func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodDelete {
+					w.WriteHeader(http.StatusBadRequest)
+					_, _ = io.WriteString(w, tc.body)
+					return
+				}
+				http.NotFound(w, r)
+			}
 
-	if err := mgr.EndSession(context.Background()); err != nil {
-		t.Fatalf("EndSession with 400 session_superseded = %v, want nil (ErrSessionInvalid swallowed)", err)
+			if err := mgr.EndSession(context.Background()); err != nil {
+				t.Fatalf("EndSession with 400 %s = %v, want nil (%v swallowed)", tc.body, err, tc.want)
+			}
+		})
 	}
 }
 
@@ -989,7 +1204,7 @@ func TestActiveSessionWithoutModelServesAnyModel(t *testing.T) {
 		t.Errorf("creates = %d, want 1 (model-less session reused for any model)", mock.SessionCreates)
 	}
 }
-func TestHeartbeatStatusErrors(t *testing.T) {
+func TestPollStatusErrors(t *testing.T) {
 	t.Run("banned returns BanError and clears cached admission", func(t *testing.T) {
 		mock := testutil.NewMock()
 		defer mock.Close()
@@ -1004,7 +1219,7 @@ func TestHeartbeatStatusErrors(t *testing.T) {
 			_, _ = io.WriteString(w, `{"status":"banned","resumes_at":"2026-08-16T12:00:00Z"}`)
 		}
 
-		err := mgr.Heartbeat(context.Background())
+		err := mgr.Poll(context.Background())
 		var be *upstream.BanError
 		if !errors.As(err, &be) {
 			t.Fatalf("want *upstream.BanError, got %v", err)
@@ -1034,7 +1249,7 @@ func TestHeartbeatStatusErrors(t *testing.T) {
 			_, _ = io.WriteString(w, `{"status":"country_blocked","countryCode":"US","countryBlockReason":"region restricted","ipPrivacySignals":["proxy"]}`)
 		}
 
-		err := mgr.Heartbeat(context.Background())
+		err := mgr.Poll(context.Background())
 		var cbe *upstream.CountryBlockedError
 		if !errors.As(err, &cbe) {
 			t.Fatalf("want *upstream.CountryBlockedError, got %v", err)
@@ -1061,7 +1276,7 @@ func TestHeartbeatStatusErrors(t *testing.T) {
 			_, _ = io.WriteString(w, `{"status":"rate_limited","retryAfterMs":45000,"limit":5,"recentCount":5}`)
 		}
 
-		err := mgr.Heartbeat(context.Background())
+		err := mgr.Poll(context.Background())
 		var rle *upstream.RateLimitError
 		if !errors.As(err, &rle) {
 			t.Fatalf("want *upstream.RateLimitError, got %v", err)
@@ -1073,4 +1288,596 @@ func TestHeartbeatStatusErrors(t *testing.T) {
 			t.Errorf("RetryAfter = %s, want 45s", rle.RetryAfter)
 		}
 	})
+}
+
+func TestLeaderCancellationDecoupling(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+
+	leaderBlockCh := make(chan struct{})
+	leaderStartedCh := make(chan struct{})
+	var createCount atomic.Int32
+
+	mock.SessionHandler = func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			count := createCount.Add(1)
+			if count == 1 {
+				close(leaderStartedCh)
+				<-leaderBlockCh
+				// The leader's create must deterministically observe the
+				// cancellation: wait for the request context to be done
+				// before returning, so the mock's response cannot race the
+				// cancel and let the leader "succeed" (a -race timing
+				// flake). A bounded fallback prevents a hang if the cancel
+				// never arrives.
+				select {
+				case <-r.Context().Done():
+					return // canceled: no response, client sees context.Canceled
+				case <-time.After(2 * time.Second):
+				}
+				w.WriteHeader(http.StatusOK)
+				_, _ = io.WriteString(w, `{"status":"active","instanceId":"leader-inst","model":"model/A"}`)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, `{"status":"active","instanceId":"waiter-inst","model":"model/A"}`)
+			return
+		}
+	}
+
+	mgr := newTestManager(t, mock)
+
+	leaderCtx, leaderCancel := context.WithCancel(context.Background())
+	leaderDone := make(chan error, 1)
+	go func() {
+		_, err := mgr.EnsureSessionForModel(leaderCtx, "model/A")
+		leaderDone <- err
+	}()
+
+	// Wait until leader starts refresh
+	<-leaderStartedCh
+
+	// Waiter starts with active context
+	waiterDone := make(chan struct {
+		inst string
+		err  error
+	}, 1)
+	go func() {
+		inst, err := mgr.EnsureSessionForModel(context.Background(), "model/A")
+		waiterDone <- struct {
+			inst string
+			err  error
+		}{inst, err}
+	}()
+
+	// Give waiter time to park on leader's refreshCh
+	time.Sleep(50 * time.Millisecond)
+
+	// Cancel leader context and unblock mock handler
+	leaderCancel()
+	close(leaderBlockCh)
+
+	leaderErr := <-leaderDone
+	if !errors.Is(leaderErr, context.Canceled) {
+		t.Fatalf("leader err = %v, want context.Canceled", leaderErr)
+	}
+
+	// Waiter should recover, become candidate leader, and succeed
+	select {
+	case res := <-waiterDone:
+		if res.err != nil {
+			t.Fatalf("waiter err = %v, want nil", res.err)
+		}
+		if res.inst != "waiter-inst" {
+			t.Errorf("waiter inst = %q, want waiter-inst", res.inst)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for waiter to complete")
+	}
+}
+
+func TestModelLockedFallbackInstance(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+
+	var deleteInstanceIDs []string
+	var mu sync.Mutex
+	var callCount atomic.Int32
+
+	mock.SessionHandler = func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost:
+			count := callCount.Add(1)
+			if count == 1 {
+				// Return model_locked with instanceId
+				w.WriteHeader(http.StatusOK)
+				_, _ = io.WriteString(w, `{"status":"model_locked","currentModel":"model/old","instanceId":"locked-inst-123"}`)
+				return
+			}
+			// Second call succeeds
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, `{"status":"active","instanceId":"active-inst-456","model":"model/new"}`)
+		case http.MethodDelete:
+			mu.Lock()
+			// #120: the CLI DELETEs with Bearer only — no instance header
+			// (reference/freebuff freebuff-session-api.ts releaseFreebuffSlot).
+			deleteInstanceIDs = append(deleteInstanceIDs, r.Header.Get("x-freebuff-instance-id"))
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, `{"status":"ended"}`)
+		}
+	}
+
+	mgr := newTestManager(t, mock)
+
+	// Initial ensure with model/new when mgr has no cached state
+	instance, err := mgr.EnsureSessionForModel(context.Background(), "model/new")
+	if err != nil {
+		t.Fatalf("EnsureSessionForModel failed: %v", err)
+	}
+	if instance != "active-inst-456" {
+		t.Errorf("instance = %q, want active-inst-456", instance)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(deleteInstanceIDs) != 1 {
+		t.Fatalf("EndSession calls = %d, want 1", len(deleteInstanceIDs))
+	}
+	if deleteInstanceIDs[0] != "" {
+		t.Errorf("DELETE x-freebuff-instance-id = %q, want absent (#120: session DELETE is Bearer-only)", deleteInstanceIDs[0])
+	}
+}
+
+// ── Wave 1 issue tests (#81) ─────────────────────────────────────────────
+
+// TestPollIpCapped verifies #81: an ip_capped session status maps to
+// the distinct upstream.IpCappedError (admission-only, bounded to
+// retryAfterMs — never the Pacific-midnight quota lock), NOT a
+// RateLimitError.
+func TestPollIpCapped(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mgr := newTestManager(t, mock)
+
+	if _, err := mgr.EnsureSession(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	mock.SessionHandler = func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"status":"ip_capped","activeUsersForIp":5,"limit":4,"retryAfterMs":30000}`)
+	}
+
+	err := mgr.Poll(context.Background())
+	if errors.Is(err, upstream.ErrRateLimited) {
+		t.Fatal("ip_capped mapped to ErrRateLimited, want distinct ErrIpCapped")
+	}
+	var ice *upstream.IpCappedError
+	if !errors.As(err, &ice) {
+		t.Fatalf("want *upstream.IpCappedError, got %v", err)
+	}
+	if !errors.Is(err, upstream.ErrIpCapped) {
+		t.Error("not unwrap-able to ErrIpCapped")
+	}
+	if ice.ActiveUsersForIP != 5 || ice.Limit != 4 {
+		t.Errorf("IpCappedError = %+v, want ActiveUsersForIP 5 limit 4", ice)
+	}
+	if ice.RetryAfter != 30*time.Second {
+		t.Errorf("RetryAfter = %s, want 30s (bounded to retryAfterMs only)", ice.RetryAfter)
+	}
+}
+
+// TestSnapshotActiveUsersForIP verifies the admission response's
+// activeUsersForIp is cached and exposed through SessionSnapshot for the
+// pool snapshot (issue #81 "if cheap").
+func TestSnapshotActiveUsersForIP(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mgr := newTestManager(t, mock)
+
+	mock.SessionHandler = func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"status":"active","instanceId":"inst-abc-123","activeUsersForIp":3}`)
+	}
+
+	if _, err := mgr.EnsureSession(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	snap := mgr.Snapshot()
+	if snap.ActiveUsersForIP != 3 {
+		t.Errorf("Snapshot.ActiveUsersForIP = %d, want 3", snap.ActiveUsersForIP)
+	}
+	if snap.Status != "active" {
+		t.Errorf("Status = %q, want active", snap.Status)
+	}
+}
+
+// — T9/T10/T11: session lifecycle telemetry (wave 2). —
+
+// captureLogs swaps slog's default handler for a buffer-backed text handler
+// at Debug level and returns the restore function. Session tests run
+// sequentially (no t.Parallel), so swapping the process default is safe.
+func captureLogs(buf *bytes.Buffer) func() {
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	return func() { slog.SetDefault(prev) }
+}
+
+// TestTerminalEventReasons pins T9: every terminal session event carries a
+// reason from the vocabulary (ended|superseded|shutdown|model_lock|expired|
+// 409|poll|store), and session invalidated gains the triggering HTTP status
+// when known.
+func TestTerminalEventReasons(t *testing.T) {
+	t.Run("invalidated carries caller reason and status", func(t *testing.T) {
+		mock := testutil.NewMock()
+		defer mock.Close()
+		mgr := newTestManager(t, mock)
+		if _, err := mgr.EnsureSession(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		var buf bytes.Buffer
+		restore := captureLogs(&buf)
+		defer restore()
+		mgr.InvalidateWithReason("expired", 400)
+		got := buf.String()
+		if !strings.Contains(got, `msg="session invalidated"`) ||
+			!strings.Contains(got, "reason=expired") ||
+			!strings.Contains(got, "status=400") {
+			t.Errorf("invalidated log missing reason/status:\n%s", got)
+		}
+	})
+
+	t.Run("bare invalidate defaults to 409 reason", func(t *testing.T) {
+		mock := testutil.NewMock()
+		defer mock.Close()
+		mgr := newTestManager(t, mock)
+		if _, err := mgr.EnsureSession(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		var buf bytes.Buffer
+		restore := captureLogs(&buf)
+		defer restore()
+		mgr.Invalidate()
+		got := buf.String()
+		if !strings.Contains(got, `msg="session invalidated"`) || !strings.Contains(got, "reason=409") {
+			t.Errorf("bare Invalidate log missing default reason=409:\n%s", got)
+		}
+	})
+
+	t.Run("ended carries reason ended", func(t *testing.T) {
+		mock := testutil.NewMock()
+		defer mock.Close()
+		mgr := newTestManager(t, mock)
+		if _, err := mgr.EnsureSession(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		var buf bytes.Buffer
+		restore := captureLogs(&buf)
+		defer restore()
+		if err := mgr.EndSession(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		got := buf.String()
+		if !strings.Contains(got, `msg="session ended"`) || !strings.Contains(got, "reason=ended") {
+			t.Errorf("ended log missing reason=ended:\n%s", got)
+		}
+	})
+
+	t.Run("shutdown carries reason shutdown", func(t *testing.T) {
+		mock := testutil.NewMock()
+		defer mock.Close()
+		store := NewStore(filepath.Join(t.TempDir(), "state.json"))
+		mgr := newTestManagerWithStore(t, mock, store)
+		if _, err := mgr.EnsureSession(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		var buf bytes.Buffer
+		restore := captureLogs(&buf)
+		defer restore()
+		if err := mgr.Shutdown(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		got := buf.String()
+		if !strings.Contains(got, `msg="session ended on shutdown"`) || !strings.Contains(got, "reason=shutdown") {
+			t.Errorf("shutdown log missing reason=shutdown:\n%s", got)
+		}
+	})
+
+	t.Run("dropped during poll carries poll reason and status", func(t *testing.T) {
+		mock := testutil.NewMock()
+		defer mock.Close()
+		mgr := newTestManager(t, mock)
+		if _, err := mgr.EnsureSession(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		mock.SessionHandler = func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusTooEarly) // 428 waiting_room_required
+			_, _ = io.WriteString(w, `{"error":"waiting_room_required"}`)
+		}
+		var buf bytes.Buffer
+		restore := captureLogs(&buf)
+		defer restore()
+		_ = mgr.Poll(context.Background())
+		got := buf.String()
+		if !strings.Contains(got, `msg="session dropped during poll"`) ||
+			!strings.Contains(got, "reason=poll") ||
+			!strings.Contains(got, "status=waiting_room_required") {
+			t.Errorf("poll drop log missing reason=poll/status:\n%s", got)
+		}
+	})
+
+	t.Run("ended during poll maps superseded reason", func(t *testing.T) {
+		mock := testutil.NewMock()
+		defer mock.Close()
+		mgr := newTestManager(t, mock)
+		if _, err := mgr.EnsureSession(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		mock.SessionHandler = func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"status":"superseded","instanceId":"inst-abc-123"}`)
+		}
+		var buf bytes.Buffer
+		restore := captureLogs(&buf)
+		defer restore()
+		if err := mgr.Poll(context.Background()); err != nil {
+			t.Fatalf("Poll: %v", err)
+		}
+		got := buf.String()
+		if !strings.Contains(got, `msg="session ended during poll"`) ||
+			!strings.Contains(got, "reason=superseded") ||
+			!strings.Contains(got, "status=superseded") {
+			t.Errorf("poll end log missing reason=superseded/status:\n%s", got)
+		}
+	})
+
+	t.Run("recreated maps upstream status to table reason", func(t *testing.T) {
+		mock := testutil.NewMock()
+		defer mock.Close()
+		mock.SessionSequence = []string{"none", "active"}
+		mgr := newTestManager(t, mock)
+		var buf bytes.Buffer
+		restore := captureLogs(&buf)
+		defer restore()
+		if _, err := mgr.EnsureSession(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		got := buf.String()
+		if !strings.Contains(got, `msg="session recreated"`) ||
+			!strings.Contains(got, "reason=ended") ||
+			!strings.Contains(got, "status=none") {
+			t.Errorf("recreated log missing table reason/status:\n%s", got)
+		}
+	})
+}
+
+// TestReAdmitStormDetector pins T10: more than 3 invalidations within 60s
+// emit exactly ONE "session re-admit storm" summary with the count,
+// duration_ms, superseded, and burned_slots fields; isolated invalidations
+// stay quiet; the detector re-arms only after a full quiet window.
+func TestReAdmitStormDetector(t *testing.T) {
+	base := time.Date(2026, 8, 18, 12, 0, 0, 0, time.UTC)
+
+	t.Run("isolated and three-in-window stay quiet", func(t *testing.T) {
+		now := base
+		m := &Manager{now: func() time.Time { return now }}
+		var buf bytes.Buffer
+		restore := captureLogs(&buf)
+		defer restore()
+
+		m.InvalidateWithReason("expired", 400)
+		now = now.Add(30 * time.Second)
+		m.InvalidateWithReason("expired", 400)
+		now = now.Add(29 * time.Second)
+		m.InvalidateWithReason("expired", 400) // 3 within 59s: not >3
+		if got := buf.String(); strings.Contains(got, "session re-admit storm") {
+			t.Fatalf("isolated/3-in-window invalidations emitted a storm summary:\n%s", got)
+		}
+	})
+
+	t.Run("burst fires one summary then suppresses until quiet", func(t *testing.T) {
+		now := base
+		m := &Manager{now: func() time.Time { return now }}
+		var buf bytes.Buffer
+		restore := captureLogs(&buf)
+		defer restore()
+
+		m.InvalidateWithReason("superseded", 409) // t+0s
+		now = now.Add(time.Second)
+		m.InvalidateWithReason("superseded", 409) // t+1s
+		now = now.Add(time.Second)
+		m.InvalidateWithReason("expired", 400) // t+2s
+		now = now.Add(time.Second)
+		m.recordReAdmitTrigger()               // pre-emptive re-admit in the window
+		m.InvalidateWithReason("expired", 400) // t+3s: 4th in window → storm
+
+		got := buf.String()
+		if n := strings.Count(got, "session re-admit storm"); n != 1 {
+			t.Fatalf("storm summaries = %d, want 1:\n%s", n, got)
+		}
+		for _, want := range []string{"count=4", "duration_ms=3000", "superseded=2", "burned_slots=1"} {
+			if !strings.Contains(got, want) {
+				t.Errorf("storm summary missing %s:\n%s", want, got)
+			}
+		}
+
+		// A 5th invalidation right after the burst is suppressed.
+		now = now.Add(time.Second)
+		m.InvalidateWithReason("expired", 400)
+		if n := strings.Count(buf.String(), "session re-admit storm"); n != 1 {
+			t.Fatalf("storm summaries after 5th invalidation = %d, want still 1 (suppressed):\n%s", n, buf.String())
+		}
+
+		// After a full quiet window the detector re-arms: a new burst of 4
+		// fires a second summary.
+		now = now.Add(70 * time.Second) // 70s past the last summary
+		m.InvalidateWithReason("expired", 400)
+		now = now.Add(time.Second)
+		m.InvalidateWithReason("expired", 400)
+		now = now.Add(time.Second)
+		m.InvalidateWithReason("expired", 400)
+		now = now.Add(time.Second)
+		m.InvalidateWithReason("expired", 400) // 4th in window, quiet passed
+		if n := strings.Count(buf.String(), "session re-admit storm"); n != 2 {
+			t.Fatalf("storm summaries after re-arm burst = %d, want 2:\n%s", n, buf.String())
+		}
+	})
+}
+
+// TestReAdmitStormTracksPreemptiveTriggers wires the burned_slots count to
+// the real pre-emptive re-admit path (issue #99): a triggered re-admit
+// whose session is then invalidated in a storm counts as a burned slot.
+func TestReAdmitStormTracksPreemptiveTriggers(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	var creates atomic.Int32
+	mock.SessionHandler = func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusOK, map[string]any{"status": "active", "instanceId": "inst-1", "expiresAt": time.Now().Add(30 * time.Minute).Format(time.RFC3339)})
+			return
+		}
+		n := creates.Add(1)
+		id := "inst-1"
+		if n >= 2 {
+			id = "inst-2"
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"status": "active", "instanceId": id, "expiresAt": time.Now().Add(10 * time.Second).Format(time.RFC3339)})
+	}
+	m := newTestSession(t, mock)
+	now := time.Date(2026, 8, 18, 12, 0, 0, 0, time.UTC)
+	m.now = func() time.Time { return now }
+	m.SetReAdmitLead(time.Minute)
+
+	if _, err := m.EnsureSession(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	// Second call: cached active with ~5s left (10s expiry, 60s lead) —
+	// triggers the pre-emptive re-admit and rides the old session.
+	if _, err := m.EnsureSession(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	restore := captureLogs(&buf)
+	defer restore()
+	for i := 0; i < 4; i++ {
+		now = now.Add(time.Second)
+		m.InvalidateWithReason("expired", 400)
+	}
+	got := buf.String()
+	if n := strings.Count(got, "session re-admit storm"); n != 1 {
+		t.Fatalf("storm summaries = %d, want 1:\n%s", n, got)
+	}
+	if !strings.Contains(got, "burned_slots=1") {
+		t.Errorf("burned_slots missing/inaccurate, want 1 pre-emptive trigger in window:\n%s", got)
+	}
+}
+
+// TestHeartbeatPollFields pins T11: the liveness poll's Debug line carries
+// instance/ms/status so ops can see each heartbeat beat and its latency.
+func TestHeartbeatPollFields(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mgr := newTestManager(t, mock)
+	if _, err := mgr.EnsureSession(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	restore := captureLogs(&buf)
+	defer restore()
+	if err := mgr.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	got := buf.String()
+	if !strings.Contains(got, `msg="session: heartbeat poll"`) ||
+		!strings.Contains(got, "instance_id=") ||
+		!strings.Contains(got, "ms=") ||
+		!strings.Contains(got, "status=active") {
+		t.Errorf("heartbeat poll log missing instance/ms/status:\n%s", got)
+	}
+}
+
+// TestPreemptiveReAdmitOncePerExpiry pins issue #132: a pre-emptive re-admit
+// fires at most ONCE per expiry window. Every request in the lead window
+// must ride the old session instead of re-triggering a fresh upstream
+// create — the observed 22-trigger / 30-create storm around a single
+// expiry.
+func TestPreemptiveReAdmitOncePerExpiry(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mgr := newTestManager(t, mock)
+	mgr.SetReAdmitLead(time.Minute)
+
+	// Land a session, then squeeze its expiry into the lead window.
+	if _, err := mgr.EnsureSession(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	mgr.mu.Lock()
+	if mgr.state != nil {
+		mgr.state.expiresAt = time.Now().Add(30 * time.Second)
+	}
+	mgr.mu.Unlock()
+
+	// First request in the window triggers the async re-admit (1 create).
+	instance, err := mgr.EnsureSession(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if instance != "inst-abc-123" {
+		t.Fatalf("triggered request instance = %q, want the old session being ridden", instance)
+	}
+	// Let the async create land.
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && mock.SessionCreatesSnapshot() < 2 {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := mock.SessionCreatesSnapshot(); got != 2 {
+		t.Fatalf("creates after first trigger = %d, want 2 (initial + one re-admit)", got)
+	}
+
+	// Every further request in the same expiry window must NOT re-trigger.
+	for i := 0; i < 5; i++ {
+		if _, err := mgr.EnsureSession(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	time.Sleep(200 * time.Millisecond)
+	if got := mock.SessionCreatesSnapshot(); got != 2 {
+		t.Errorf("creates after 5 rides = %d, want still 2 (once per expiry window)", got)
+	}
+}
+
+// TestInvalidateInstanceGuarded pins issue #132: invalidating a session by a
+// stale instance id (a chat that rode the old, superseded instance) must not
+// drop a newer cached session.
+func TestInvalidateInstanceGuarded(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mgr := newTestManager(t, mock)
+	if _, err := mgr.EnsureSession(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	// A stale instance id leaves the cache alone.
+	mgr.InvalidateInstance("inst-stale-999")
+	mgr.mu.Lock()
+	cur := ""
+	if mgr.state != nil {
+		cur = mgr.state.instanceID
+	}
+	alive := mgr.state != nil
+	mgr.mu.Unlock()
+	if !alive {
+		t.Fatal("cached session invalidated by a stale instance id")
+	}
+
+	// The matching instance id clears it.
+	mgr.InvalidateInstance(cur)
+	mgr.mu.Lock()
+	alive = mgr.state != nil
+	mgr.mu.Unlock()
+	if alive {
+		t.Fatal("cached session not invalidated by its own instance id")
+	}
 }

@@ -13,11 +13,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
 	"runtime"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -27,6 +29,22 @@ import (
 
 // RawBase is the upstream source of the Codebuff TS constant files.
 const RawBase = "https://raw.githubusercontent.com/CodebuffAI/codebuff/main/common/src/constants/"
+
+// JsDelivrBase mirrors RawBase through the jsDelivr CDN. Tried after the raw
+// source fails: raw.githubusercontent is throttled or blocked in some CI and
+// regions (mirrors freebuff2api-workers' DYNAMIC_MODELS_*_SOURCES pattern,
+// where every source carries a raw + jsDelivr pair).
+const JsDelivrBase = "https://cdn.jsdelivr.net/gh/CodebuffAI/codebuff@main/common/src/constants/"
+
+// mirrorFor returns the jsDelivr mirror for a raw source URL, or "" when the
+// URL is not a raw source (SetSources overrides are used as-is and never
+// mirrored).
+func mirrorFor(url string) string {
+	if strings.HasPrefix(url, RawBase) {
+		return JsDelivrBase + strings.TrimPrefix(url, RawBase)
+	}
+	return ""
+}
 
 // sourceFiles are fetched in order; the first file is the one the agent
 // blocks are parsed from (free-agents.ts), matching the JS.
@@ -46,47 +64,80 @@ const fetchTimeout = 30 * time.Second
 const maxFetchBytes = 2 << 20
 
 // LimitedTierModels is the model set available to 'limited' access-tier
-// accounts (egress region demotion, privacy-signal demotion). Mirrors the
-// upstream LIMITED_FREEBUFF_MODEL_IDS constant
-// (freebuff/common/src/constants/freebuff-models.ts): deepseek-v4-flash +
-// mimo-v2.5. Used to annotate /v1/models availability per token tier.
+// accounts (egress region demotion, privacy-signal demotion). DeepSeek Flash
+// was disabled for limited tier on 2026-08-18 due to upstream provider price
+// increases (mimo-v2.5 remains active for limited tier).
+// Used to annotate /v1/models availability per token tier.
 var LimitedTierModels = map[string]bool{
-	"deepseek/deepseek-v4-flash": true,
-	"mimo/mimo-v2.5":             true,
+	"mimo/mimo-v2.5": true,
 }
 
 // fallbackAgents is the hardcoded model→agent fallback used when the sources
-// are unreachable. Ported verbatim from registry.js (lines 14-41), entry
-// order preserved: first-seen assignment decides which agent owns models that
-// appear in several entries (e.g. the gemini helpers all list the same two
-// models; file-picker-max comes first).
+// are unreachable. It mirrors the CURRENT upstream FREE_MODE_AGENT_MODELS
+// exactly: the rows below are the verbatim parse of the pinned snapshot
+// (testdata/upstream/free-agents.ts, copied from
+// reference/freebuff/common/src/constants — the RE-verified installed CLI
+// binary), entry order preserved. Rows upstream retired (laguna-s-2.1,
+// ling-3.0-flash, greg-2-ultra, greg-2-super) are absent: advertising a dead
+// model id in the offline fallback surfaces it via /v1/models and trips
+// upstream 403 free_mode_invalid_agent_model (issue #121). Upstream changes
+// update BOTH the pinned snapshot and this table together; the parity test
+// (TestFallbackParityWithPinnedUpstream) fails on drift.
 var fallbackAgents = []agentModels{
 	{agent: "base2-free", models: []string{
-		"deepseek/deepseek-v4-pro",
-		"deepseek/deepseek-v4-flash",
 		"minimax/minimax-m3",
 		"openai/gpt-5.6-luna",
+		"deepseek/deepseek-v4-pro",
+		"deepseek/deepseek-v4-flash",
 		"mimo/mimo-v2.5",
 	}},
-	{agent: "base2-free-minimax-m3", models: []string{"minimax/minimax-m3"}},
-	{agent: "base2-free-luna", models: []string{"openai/gpt-5.6-luna"}},
 	{agent: "base2-free-deepseek", models: []string{"deepseek/deepseek-v4-pro"}},
 	{agent: "base2-free-deepseek-flash", models: []string{"deepseek/deepseek-v4-flash"}},
 	{agent: "base2-free-mimo", models: []string{"mimo/mimo-v2.5"}},
+	{agent: "base2-free-minimax-m3", models: []string{"minimax/minimax-m3"}},
+	{agent: "base2-free-luna", models: []string{"openai/gpt-5.6-luna"}},
 	{agent: "base2-free-glm", models: []string{"z-ai/glm-5.2"}},
-	{agent: "base2-free-laguna-s-2-1", models: []string{"poolside/laguna-s-2.1"}},
-	{agent: "base2-free-laguna-s-2-1-openrouter", models: []string{"openrouter/poolside/laguna-s-2.1"}},
-	{agent: "base2-free-ling-3-flash", models: []string{"inclusionai/ling-3.0-flash:free"}},
-	{agent: "base2-free-greg-2-ultra", models: []string{"crof/greg-2-ultra"}},
-	{agent: "base2-free-greg-2-super", models: []string{"crof/greg-2-super"}},
+	{agent: "base2-free-kimi-k3-eco", models: []string{"crof/kimi-k3-eco"}},
+	{agent: "base2-free-deepseek-pro-max", models: []string{"deepseek/deepseek-v4-pro-max"}},
+	{agent: "base2-free-deepseek-flash-max", models: []string{"deepseek/deepseek-v4-flash-max"}},
+	{agent: "base2-free-luna-max", models: []string{"openai/gpt-5.6-luna-max"}},
+	{agent: "base2-free-muse-spark", models: []string{"meta/muse-spark-1.2-contributor"}},
 	{agent: "base2-free-fable", models: []string{"anthropic/claude-fable-5"}},
+	{agent: "base2-free-cloud-planner", models: []string{"deepseek/deepseek-v4-flash"}},
+	{agent: "base2-free-cloud-planner-limited", models: []string{"deepseek/deepseek-v4-flash"}},
 	{agent: "file-picker", models: []string{"google/gemini-2.5-flash-lite"}},
-	{agent: "file-picker-max", models: []string{"google/gemini-3.1-flash-lite", "google/gemini-3.5-flash-lite"}},
-	{agent: "file-lister", models: []string{"google/gemini-3.1-flash-lite", "google/gemini-3.5-flash-lite"}},
-	{agent: "researcher-web", models: []string{"google/gemini-3.1-flash-lite", "google/gemini-3.5-flash-lite"}},
-	{agent: "researcher-docs", models: []string{"google/gemini-3.1-flash-lite", "google/gemini-3.5-flash-lite"}},
-	{agent: "basher", models: []string{"google/gemini-3.1-flash-lite", "google/gemini-3.5-flash-lite"}},
+	{agent: "file-picker-max", models: []string{"google/gemini-3.5-flash-lite", "google/gemini-3.1-flash-lite"}},
+	{agent: "file-lister", models: []string{"google/gemini-3.5-flash-lite", "google/gemini-3.1-flash-lite"}},
+	{agent: "researcher-web", models: []string{"google/gemini-3.5-flash-lite", "google/gemini-3.1-flash-lite"}},
+	{agent: "researcher-docs", models: []string{"google/gemini-3.5-flash-lite", "google/gemini-3.1-flash-lite"}},
+	{agent: "browser-use", models: []string{"google/gemini-3.5-flash-lite", "google/gemini-3.1-flash-lite"}},
+	{agent: "tmux-cli", models: []string{"deepseek/deepseek-v4-flash"}},
+	{agent: "code-reviewer-minimax-m3", models: []string{"minimax/minimax-m3"}},
+	{agent: "code-reviewer-luna", models: []string{"openai/gpt-5.6-luna"}},
+	{agent: "code-reviewer-deepseek", models: []string{"deepseek/deepseek-v4-pro"}},
+	{agent: "code-reviewer-deepseek-flash", models: []string{"deepseek/deepseek-v4-flash"}},
+	{agent: "code-reviewer-mimo", models: []string{"mimo/mimo-v2.5"}},
+	{agent: "code-reviewer-glm", models: []string{"z-ai/glm-5.2"}},
+	{agent: "code-reviewer-fable", models: []string{"anthropic/claude-fable-5"}},
 	{agent: "code-reviewer-lite", models: []string{"deepseek/deepseek-v4-pro", "deepseek/deepseek-v4-flash", "mimo/mimo-v2.5"}},
+}
+
+// fallbackRootByModel mirrors upstream FREEBUFF_ROOT_AGENT_ID_BY_MODEL (pinned
+// free-agents.ts): the per-model roots win over first-seen assignment, exactly
+// like a live refresh (parseRootAgentMap + buildModelMapping). Without it the
+// fallback collapses the five base models onto the generic base2-free agent,
+// so a fallback-state request for a second base model would reuse a session
+// admitted for another model and trip upstream session_model_mismatch.
+var fallbackRootByModel = map[string]string{
+	"mimo/mimo-v2.5":                  "base2-free-mimo",
+	"minimax/minimax-m3":              "base2-free-minimax-m3",
+	"openai/gpt-5.6-luna":             "base2-free-luna",
+	"deepseek/deepseek-v4-pro":        "base2-free-deepseek",
+	"deepseek/deepseek-v4-flash":      "base2-free-deepseek-flash",
+	"z-ai/glm-5.2":                    "base2-free-glm",
+	"crof/kimi-k3-eco":                "base2-free-kimi-k3-eco",
+	"anthropic/claude-fable-5":        "base2-free-fable",
+	"meta/muse-spark-1.2-contributor": "base2-free-muse-spark",
 }
 
 // ErrModelNotFound is returned by AgentForModel for models absent from the
@@ -98,11 +149,13 @@ type Registry struct {
 	mu     sync.RWMutex
 	cfg    atomic.Pointer[config.Config] // swapped atomically on reload (SetConfig)
 	client *http.Client                  // fetch client; redirects followed, fetchTimeout applied
+	logger *slog.Logger                  // success-refresh INFO sink (nil = slog.Default())
 
-	sources      []string // override of the default 5 source URLs (tests)
-	modelToAgent map[string]string
-	allModels    []string // sorted
-	agentModels  []agentModels
+	sources       []string // override of the default 5 source URLs (tests)
+	lastAttempted []string // URLs tried during the most recent Refresh, in order
+	modelToAgent  map[string]string
+	allModels     []string // sorted
+	agentModels   []agentModels
 }
 
 // New returns a Registry that fetches from the default Codebuff sources.
@@ -114,11 +167,20 @@ func New(cfg *config.Config, client *http.Client) *Registry {
 	if client == nil {
 		client = &http.Client{Timeout: fetchTimeout}
 	}
-	r := &Registry{client: client}
+	r := &Registry{client: client, logger: slog.Default()}
 	if cfg != nil {
 		r.cfg.Store(cfg)
 	}
 	return r
+}
+
+// SetLogger replaces the registry's log sink (nil restores slog.Default).
+// Used by tests and by hosts that want the refresh INFO on a custom logger.
+func (r *Registry) SetLogger(l *slog.Logger) {
+	if l == nil {
+		l = slog.Default()
+	}
+	r.logger = l
 }
 
 // SetConfig atomically replaces the config the registry reads, so alias
@@ -142,26 +204,38 @@ func (r *Registry) SetSources(urls []string) {
 }
 
 // Refresh fetches the sources in parallel and atomically replaces the
-// registry state. On any fetch or parse failure the previous state is kept
-// and the error returned.
+// registry state. Each source file is tried against its raw URL first and its
+// jsDelivr mirror second; on any fetch or parse failure the previous state is
+// kept and the error returned. Every URL actually attempted is recorded for
+// LastAttemptedSources (-doctor output).
 func (r *Registry) Refresh(ctx context.Context) error {
-	sources := r.sourceURLs()
+	start := time.Now()
+	candidates := r.sourceCandidates()
 
-	texts := make([]string, len(sources))
-	errs := make([]error, len(sources))
+	texts := make([]string, len(candidates))
+	errs := make([]error, len(candidates))
+	attempted := make([][]string, len(candidates))
 	var wg sync.WaitGroup
-	for i, src := range sources {
+	for i, urls := range candidates {
 		wg.Add(1)
-		go func(i int, src string) {
+		go func(i int, urls []string) {
 			defer wg.Done()
-			texts[i], errs[i] = fetchText(ctx, r.client, src)
-		}(i, src)
+			texts[i], attempted[i], errs[i] = fetchSource(ctx, r.client, urls)
+		}(i, urls)
 	}
 	wg.Wait()
 
+	tried := make([]string, 0, len(candidates)*2)
+	for _, a := range attempted {
+		tried = append(tried, a...)
+	}
+	r.mu.Lock()
+	r.lastAttempted = tried
+	r.mu.Unlock()
+
 	for i, err := range errs {
 		if err != nil {
-			return fmt.Errorf("registry refresh: fetch %s: %w", sources[i], err)
+			return fmt.Errorf("registry refresh: fetch %s: %w", attempted[i][len(attempted[i])-1], err)
 		}
 	}
 
@@ -181,15 +255,49 @@ func (r *Registry) Refresh(ctx context.Context) error {
 	r.agentModels = agentModels
 	r.modelToAgent = modelToAgent
 	r.allModels = allModels
+	agents, models := len(agentModels), len(allModels)
 	r.mu.Unlock()
+	// T18: the success path was silent (the failure path logs in main.go) —
+	// surface the refresh outcome with agents/models counts and duration.
+	r.logger.Info("registry refreshed", "agents", agents, "models", models, "ms", time.Since(start).Milliseconds())
 	return nil
+}
+
+// fetchSource tries each candidate URL in order until one succeeds, recording
+// every attempted URL. The last error is returned when all fail. This is the
+// raw-then-mirror fallback: the jsDelivr mirror is only attempted after the
+// raw source fails.
+func fetchSource(ctx context.Context, client *http.Client, urls []string) (string, []string, error) {
+	attempted := make([]string, 0, len(urls))
+	var lastErr error
+	for _, u := range urls {
+		attempted = append(attempted, u)
+		text, err := fetchText(ctx, client, u)
+		if err == nil {
+			return text, attempted, nil
+		}
+		lastErr = err
+	}
+	return "", attempted, lastErr
+}
+
+// LastAttemptedSources returns the URLs tried during the most recent Refresh
+// (primary raw source plus any jsDelivr mirrors attempted after a failure),
+// in fetch order. Intended for -doctor output; empty before the first
+// refresh and after LoadFallback.
+func (r *Registry) LastAttemptedSources() []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return slices.Clone(r.lastAttempted)
 }
 
 // LoadFallback replaces the registry state with the hardcoded fallback map,
 // giving an offline-first model list at boot (and after every failed refresh
-// the previous state — initially the fallback — is retained).
+// the previous state — initially the fallback — is retained). The root map is
+// applied exactly like a live refresh, so fallback routing matches live
+// routing model-for-model.
 func (r *Registry) LoadFallback() {
-	modelToAgent, allModels := buildModelMapping(fallbackAgents, map[string]string{})
+	modelToAgent, allModels := buildModelMapping(fallbackAgents, fallbackRootByModel)
 	agents := make([]agentModels, len(fallbackAgents))
 	for i, entry := range fallbackAgents {
 		agents[i] = agentModels{agent: entry.agent, models: slices.Clone(entry.models)}
@@ -266,6 +374,27 @@ func (r *Registry) sourceURLs() []string {
 		urls[i] = RawBase + f
 	}
 	return urls
+}
+
+// sourceCandidates returns the per-file URL lists tried by Refresh, in order:
+// the primary URL first, then its jsDelivr mirror for the default sources.
+// SetSources overrides are used as-is (one URL per entry — mirrors belong to
+// the default raw sources).
+func (r *Registry) sourceCandidates() [][]string {
+	r.mu.RLock()
+	custom := len(r.sources) > 0
+	r.mu.RUnlock()
+	primaries := r.sourceURLs()
+	out := make([][]string, len(primaries))
+	for i, u := range primaries {
+		out[i] = []string{u}
+		if !custom {
+			if m := mirrorFor(u); m != "" {
+				out[i] = append(out[i], m)
+			}
+		}
+	}
+	return out
 }
 
 // fetchText GETs url with the Accept/UA headers of the JS port. Redirects are

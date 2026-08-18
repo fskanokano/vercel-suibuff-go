@@ -11,7 +11,7 @@ Any OpenAI-compatible client works: OpenCode, pi, 9router, LiteLLM, or your own 
 
 ## Bridge Mode vs Pooled Mode
 
-+ **Pooled Mode (Default):** Set `AUTH_TOKENS=token1,token2` in the proxy's `.env`. The proxy drains keys one at a time: it prefers the token with a live session and only moves on when one is rate-limited, never aggressively rotating healthy keys. Clients can use any placeholder API key.
++ **Pooled Mode:** Set `AUTH_TOKENS=token1,token2` in the proxy's `.env`. The proxy drains keys one at a time: it prefers the token with a live session and only moves on when one is rate-limited, never aggressively rotating healthy keys. Clients can use any placeholder API key. (Not the out-of-the-box default: with `AUTH_TOKENS` unset the proxy starts in bridge mode — unless a CLI token is auto-discovered.)
 + **Bridge Mode (Routers & Multi-User):** Leave `AUTH_TOKENS=` empty in `.env`. The proxy acts as a zero-storage relay. **API Routers ([9router](9router-integration.md), OmniRouter, One API, LiteLLM) send actual FreeBuff tokens in `Authorization: Bearer <freebuff-token>`.** The proxy lazily creates sessions per client token with LRU caching, rate limits, and health tracking; cached bridge entries are visible in `GET /healthz`.
 ---
 
@@ -165,14 +165,28 @@ For multi-account management or multi-user API routing:
 
 ---
 
+## Access Tiers
+
+FreeBuff assigns access tiers at the Cloudflare edge based on TCP source IP GeoIP (not HTTP headers):
+
+- **Full tier** (`accessTier: "full"`): Tier-1 countries (US, UK, DE, JP, CA, etc.) with residential ASN. All models available. 5 concurrent sessions per model.
+- **Limited tier** (`accessTier: "limited"`): Non-Tier-1 countries. All model requests coerced to `mimo/mimo-v2.5` server-side. 3 concurrent sessions per model.
+
+Check your tier: the `/healthz` response includes access tier info when the last session admission carried it. The dashboard Overview page also shows it.
+
+See [Getting Started — Access Tiers & Workarounds](getting-started.md#access-tiers--workarounds) for how to reach full tier from a limited-tier location.
+
+---
+
 ## Default model
 
-`deepseek/deepseek-v4-flash` is the default. It is the most open model across all regions and tiers, which is why every example in this guide uses it.
+`deepseek/deepseek-v4-flash` is the default for full-tier accounts. As of 2026-08-18, it is restricted to full-tier only (upstream announcement).
 
-Only request models your account's tier and region actually offers: out-of-tier picks are refused or silently downgraded to `deepseek/deepseek-v4-flash`, and the requested model id is correlated with your egress IP's region.
+For limited-tier accounts, **all model requests are coerced to `mimo/mimo-v2.5` by the upstream server** regardless of the model ID sent in `x-freebuff-model`. The proxy passes your requested model through unchanged — the coercion happens at FreeBuff's server layer, not in the proxy. The CLI exhibits identical behavior: it sends `deepseek/deepseek-v4-flash` and receives `model: mimo/mimo-v2.5` in the admission response (verified via MITM TLS interception).
+
+Only request models your account's tier and region actually offers: out-of-tier picks are refused or downgraded (`model_unavailable`, `session_model_mismatch`), and the requested model id is correlated with your egress IP's region.
 
 Query `http://localhost:3457/v1/models` for the full live catalog.
-
 ---
 
 ## Related docs

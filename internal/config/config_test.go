@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -13,23 +14,26 @@ import (
 )
 
 // envKeys lists every environment variable the package reads. Tests clear
-// them all first so machine-level env (e.g. a corporate HTTP_PROXY) can never
-// leak into assertions.
+// them all first so machine-level env can never leak into assertions.
 var envKeys = []string{
 	"LISTEN_ADDR", "UPSTREAM_BASE_URL", "AUTH_TOKENS", "ROTATION_INTERVAL",
-	"REQUEST_TIMEOUT", "SESSION_CALL_TIMEOUT", "API_KEYS", "HTTP_PROXY",
-	"SOCKS5_PROXY", "SOCKS5_PROXIES", "PROXY_ROTATION", "COST_MODE",
-	"TLS_FINGERPRINT", "REGISTRY_REFRESH", "DEBUG_DUMP", "LOG_FILE", "LOG_LEVEL",
+	"REQUEST_TIMEOUT", "SESSION_CALL_TIMEOUT", "API_KEYS", "COST_MODE", "ACTING_USER_ID", "USER_ID",
+	"TLS_FINGERPRINT", "REGISTRY_REFRESH", "DEBUG_DUMP", "LOG_FILE", "LOG_LEVEL", "LOG_FORMAT", "LOG_ACCESS", "LOG_RING_SIZE",
 	"MAX_MESSAGES_PER_DAY", "IDLE_ROTATION_TIMEOUT", "SAFE_MODE", "HYBRID_MODE",
-	"MODELS_HIDE_UNAVAILABLE", "REQUEST_JITTER", "CLI_VERSION", "MODEL_ALIASES",
+	"MODELS_HIDE_UNAVAILABLE", "CORS_ALLOWED_ORIGIN", "REQUEST_JITTER", "CLI_VERSION", "MODEL_ALIASES",
 	"AUTO_DISCOVER_TOKEN", "TRANSIENT_RETRIES", "ADMIN_TOKEN",
 	"SESSION_PERSIST", "SESSION_STATE_FILE",
+	"HTTP2_UPSTREAM",
+	"MAX_SPEND_PER_DAY", "SESSION_RE_ADMIT_LEAD", "SESSION_PROBE_CACHE_TTL",
+	"SESSION_CREATE_MAX_PARALLEL_GLOBAL", "SESSION_CREATE_MAX_PARALLEL_PER_MODEL",
+	"RUN_FINISH_QUEUE_SIZE", "RUN_FINISH_INLINE_TIMEOUT", "RUNS_DRAIN_QUEUE_CAP", "RUNS_DRAIN_TTL",
+	"WEBHOOK_URL", "FALLBACK_AFTER_MS", "FALLBACK_MODEL", "ADOPT_CLI_SESSION", "WAITING_ROOM_CHAIN",
 }
 
 // TestMain strips ambient freebuff-proxy config env vars for the whole test
 // binary (testutil.UnsetConfigEnvForTestMain). clearEnv in each test covers
 // the per-test isolation, but a developer's exported SESSION_PERSIST /
-// PROXY_ROTATION / MODELS_HIDE_UNAVAILABLE / SESSION_STATE_FILE would
+// MODELS_HIDE_UNAVAILABLE / SESSION_STATE_FILE would
 // otherwise leak into package-level behavior before the first clearEnv runs
 // (e.g. TestDefaults / TestSessionPersist assert on those defaults).
 func TestMain(m *testing.M) {
@@ -96,6 +100,9 @@ func TestDefaults(t *testing.T) {
 	if cfg.HybridMode {
 		t.Error("HybridMode = true, want false (default)")
 	}
+	if cfg.CORSAllowedOrigin != "*" {
+		t.Errorf("CORSAllowedOrigin = %q, want %q (default)", cfg.CORSAllowedOrigin, "*")
+	}
 	if got := cfg.EffectiveMode(); got != "pooled" {
 		t.Errorf("EffectiveMode = %q, want pooled", got)
 	}
@@ -105,9 +112,6 @@ func TestDefaults(t *testing.T) {
 	if cfg.LogLevel != "" {
 		t.Errorf("LogLevel = %q, want empty", cfg.LogLevel)
 	}
-	if cfg.HTTPProxy != "" || cfg.SOCKS5Proxy != "" {
-		t.Errorf("proxies = %q/%q, want empty", cfg.HTTPProxy, cfg.SOCKS5Proxy)
-	}
 	if cfg.CostMode != "free" {
 		t.Errorf("CostMode = %q, want free (default: omission routes requests as paid -> 402)", cfg.CostMode)
 	}
@@ -116,6 +120,35 @@ func TestDefaults(t *testing.T) {
 	}
 	if cfg.SessionStateFile != ".freebuff-session-state.json" {
 		t.Errorf("SessionStateFile = %q, want %q", cfg.SessionStateFile, ".freebuff-session-state.json")
+	}
+}
+
+// TestCORSAllowedOrigin pins the CORS_ALLOWED_ORIGIN env parsing: the env
+// value (or a JSON/.env value) overrides the "*" default, and a whitespace-
+// only value is skipped (overrideStringFrom convention) so the "*" default
+// stays — an empty/whitespace .env line cannot disable CORS.
+func TestCORSAllowedOrigin(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("AUTH_TOKENS", "tok-1")
+	t.Setenv("CORS_ALLOWED_ORIGIN", "https://app.example.com")
+
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.CORSAllowedOrigin != "https://app.example.com" {
+		t.Errorf("CORSAllowedOrigin = %q, want env override", cfg.CORSAllowedOrigin)
+	}
+
+	clearEnv(t)
+	t.Setenv("AUTH_TOKENS", "tok-1")
+	t.Setenv("CORS_ALLOWED_ORIGIN", "   ")
+	cfg, err = Load("")
+	if err != nil {
+		t.Fatalf("Load(blank): %v", err)
+	}
+	if cfg.CORSAllowedOrigin != "*" {
+		t.Errorf("CORSAllowedOrigin = %q, want retained default %q (whitespace-only env is skipped)", cfg.CORSAllowedOrigin, "*")
 	}
 }
 
@@ -187,6 +220,83 @@ func TestTransientRetries(t *testing.T) {
 		t.Fatalf("Load (negative): err = %v, want error mentioning TRANSIENT_RETRIES", err)
 	}
 	t.Setenv("TRANSIENT_RETRIES", "")
+}
+
+// TestLogRingSize pins the T19 LOG_RING_SIZE knob: default 500 when unset,
+// an empty value keeps the default, explicit values must stay within
+// 50..5000 (below the floor / above the cap fail validation), and the JSON
+// and .env sources both apply.
+func TestLogRingSize(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("AUTH_TOKENS", "tok")
+
+	// default: 500 when unset
+	if cfg, err := Load(""); err != nil {
+		t.Fatalf("Load (default): %v", err)
+	} else if cfg.LogRingSize != 500 {
+		t.Errorf("LogRingSize default = %d, want 500", cfg.LogRingSize)
+	}
+
+	// explicit empty value keeps the default
+	t.Setenv("LOG_RING_SIZE", "")
+	if cfg, err := Load(""); err != nil {
+		t.Fatalf("Load (empty): %v", err)
+	} else if cfg.LogRingSize != 500 {
+		t.Errorf("LogRingSize (empty) = %d, want 500", cfg.LogRingSize)
+	}
+
+	// env source: a valid value loads
+	t.Setenv("LOG_RING_SIZE", "2000")
+	if cfg, err := Load(""); err != nil {
+		t.Fatalf("Load (env 2000): %v", err)
+	} else if cfg.LogRingSize != 2000 {
+		t.Errorf("LogRingSize (env) = %d, want 2000", cfg.LogRingSize)
+	}
+
+	// boundary values are accepted
+	for _, v := range []string{"50", "5000"} {
+		t.Setenv("LOG_RING_SIZE", v)
+		n, _ := strconv.Atoi(v)
+		if cfg, err := Load(""); err != nil {
+			t.Fatalf("Load (LOG_RING_SIZE=%s): %v", v, err)
+		} else if cfg.LogRingSize != n {
+			t.Errorf("LogRingSize (LOG_RING_SIZE=%s) = %d, want %d", v, cfg.LogRingSize, n)
+		}
+	}
+
+	// below the floor fails validation
+	t.Setenv("LOG_RING_SIZE", "49")
+	if _, err := Load(""); err == nil || !strings.Contains(err.Error(), "LOG_RING_SIZE") {
+		t.Fatalf("Load (49): err = %v, want validation error mentioning LOG_RING_SIZE", err)
+	}
+
+	// above the cap fails validation
+	t.Setenv("LOG_RING_SIZE", "5001")
+	if _, err := Load(""); err == nil || !strings.Contains(err.Error(), "LOG_RING_SIZE") {
+		t.Fatalf("Load (5001): err = %v, want validation error mentioning LOG_RING_SIZE", err)
+	}
+	t.Setenv("LOG_RING_SIZE", "")
+
+	// JSON file source
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(`{"LOG_RING_SIZE": 750}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if cfg, err := Load(path); err != nil {
+		t.Fatalf("Load (file): %v", err)
+	} else if cfg.LogRingSize != 750 {
+		t.Errorf("LogRingSize (file) = %d, want 750", cfg.LogRingSize)
+	}
+
+	// .env source (applyDotenv)
+	if err := os.WriteFile(".env", []byte("AUTH_TOKENS=tok\nLOG_RING_SIZE=900\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if cfg, err := Load(""); err != nil {
+		t.Fatalf("Load (.env): %v", err)
+	} else if cfg.LogRingSize != 900 {
+		t.Errorf("LogRingSize (.env) = %d, want 900", cfg.LogRingSize)
+	}
 }
 
 func TestSafeMode(t *testing.T) {
@@ -337,8 +447,6 @@ func TestLoadFromFile(t *testing.T) {
 		"REQUEST_TIMEOUT": "5m",
 		"SESSION_CALL_TIMEOUT": "10s",
 		"API_KEYS": ["k1"],
-		"HTTP_PROXY": "http://proxy.example:3128",
-		"SOCKS5_PROXY": "socks5://socks.example:1080",
 		"COST_MODE": "free",
 		"REGISTRY_REFRESH": "2h",
 		"DEBUG_DUMP": true,
@@ -374,12 +482,6 @@ func TestLoadFromFile(t *testing.T) {
 	}
 	if want := []string{"k1"}; !equalStrings(cfg.APIKeys, want) {
 		t.Errorf("APIKeys = %v, want %v", cfg.APIKeys, want)
-	}
-	if cfg.HTTPProxy != "http://proxy.example:3128" {
-		t.Errorf("HTTPProxy = %q", cfg.HTTPProxy)
-	}
-	if cfg.SOCKS5Proxy != "socks5://socks.example:1080" {
-		t.Errorf("SOCKS5Proxy = %q", cfg.SOCKS5Proxy)
 	}
 	if cfg.CostMode != "free" {
 		t.Errorf("CostMode = %q, want free", cfg.CostMode)
@@ -456,44 +558,6 @@ func TestEnvOnly(t *testing.T) {
 	}
 	if cfg.DebugDump {
 		t.Error("DebugDump = true, want false (off)")
-	}
-}
-
-// TestSOCKS5ProxiesEnv verifies the comma-separated SOCKS5_PROXIES env var
-// lands in cfg.SOCKS5Proxies. Regression: only the JSON config file
-// populated the field, so per-token proxy binding silently fell back to
-// SOCKS5Proxy despite the README documenting SOCKS5_PROXIES as env-settable.
-func TestSOCKS5ProxiesEnv(t *testing.T) {
-	clearEnv(t)
-	t.Setenv("AUTH_TOKENS", "tok-1")
-	t.Setenv("SOCKS5_PROXIES", "host1:9050,host2:9050")
-
-	cfg, err := Load("")
-	if err != nil {
-		t.Fatalf("Load: %v", err)
-	}
-	want := []string{"host1:9050", "host2:9050"}
-	if !equalStrings(cfg.SOCKS5Proxies, want) {
-		t.Errorf("SOCKS5Proxies = %v, want %v (from env)", cfg.SOCKS5Proxies, want)
-	}
-}
-
-// TestDotenvSOCKS5Proxies verifies SOCKS5_PROXIES in ./.env lands in
-// cfg.SOCKS5Proxies, mirroring the env override.
-func TestDotenvSOCKS5Proxies(t *testing.T) {
-	clearEnv(t)
-
-	if err := os.WriteFile(".env", []byte("SOCKS5_PROXIES=host1:9050,host2:9050\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	cfg, err := Load("")
-	if err != nil {
-		t.Fatalf("Load: %v", err)
-	}
-	want := []string{"host1:9050", "host2:9050"}
-	if !equalStrings(cfg.SOCKS5Proxies, want) {
-		t.Errorf("SOCKS5Proxies = %v, want %v (from .env)", cfg.SOCKS5Proxies, want)
 	}
 }
 
@@ -580,9 +644,14 @@ func TestValidate(t *testing.T) {
 		{"zero session timeout", func(c *Config) { c.SessionCallTimeout = 0 }},
 		{"zero registry refresh", func(c *Config) { c.RegistryRefresh = 0 }},
 		{"bad cost mode", func(c *Config) { c.CostMode = "Free" }},
-		{"bad proxy rotation", func(c *Config) { c.ProxyRotation = "round robin" }},
 		{"negative max messages", func(c *Config) { c.MaxMessagesPerDay = -1 }},
+		{"negative max spend", func(c *Config) { c.MaxSpendPerDay = -1 }},
+		{"negative rate limit per ip", func(c *Config) { c.RateLimitPerIP = -1 }},
+		{"negative rate limit burst", func(c *Config) { c.RateLimitBurst = -1 }},
 		{"session persist with empty state file", func(c *Config) { c.SessionPersist = true; c.SessionStateFile = "" }},
+		{"invalid listen port non-int", func(c *Config) { c.ListenAddr = "127.0.0.1:abc" }},
+		{"invalid listen port overflow", func(c *Config) { c.ListenAddr = "127.0.0.1:99999" }},
+		{"invalid listen port zero", func(c *Config) { c.ListenAddr = "127.0.0.1:0" }},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -595,9 +664,46 @@ func TestValidate(t *testing.T) {
 	}
 }
 
+// TestValidateListenAddr verifies rejection of invalid listen addresses and acceptance of valid ones.
+func TestValidateListenAddr(t *testing.T) {
+	good := Config{
+		ListenAddr:         "127.0.0.1:3457",
+		UpstreamBaseURL:    "https://www.codebuff.com",
+		AuthTokens:         []string{"tok"},
+		RotationInterval:   6 * time.Hour,
+		RequestTimeout:     15 * time.Minute,
+		SessionCallTimeout: 30 * time.Second,
+		RegistryRefresh:    6 * time.Hour,
+	}
+
+	for _, addr := range []string{"127.0.0.1:3457", ":3457", "0.0.0.0:8080", "[::1]:3457", "localhost:1", "127.0.0.1:65535"} {
+		c := good
+		c.ListenAddr = addr
+		if err := c.Validate(); err != nil {
+			t.Errorf("Validate(ListenAddr=%q) = %v, want nil", addr, err)
+		}
+	}
+
+	for _, bad := range []string{
+		"127.0.0.1:abc",
+		"127.0.0.1:99999",
+		"127.0.0.1:0",
+		"127.0.0.1:-1",
+		"127.0.0.1:",
+		"3457",
+		"",
+	} {
+		c := good
+		c.ListenAddr = bad
+		if err := c.Validate(); err == nil {
+			t.Errorf("Validate(ListenAddr=%q) succeeded, want error", bad)
+		}
+	}
+}
+
 // TestValidateModeKnobs pins the accepted values for the routing knobs that
 // otherwise silently change behavior (a COST_MODE typo routes requests as
-// PAID → 402; an unknown PROXY_ROTATION silently falls back).
+// PAID → 402).
 func TestValidateModeKnobs(t *testing.T) {
 	good := Config{
 		ListenAddr:         ":3457",
@@ -609,13 +715,11 @@ func TestValidateModeKnobs(t *testing.T) {
 		RegistryRefresh:    6 * time.Hour,
 	}
 	for _, cost := range []string{"", "free"} {
-		for _, rot := range []string{"", "per-token", "round-robin", "random"} {
-			for _, mmd := range []int{0, 1} {
-				c := good
-				c.CostMode, c.ProxyRotation, c.MaxMessagesPerDay = cost, rot, mmd
-				if err := c.Validate(); err != nil {
-					t.Errorf("Validate(COST_MODE=%q PROXY_ROTATION=%q MAX=%d) = %v, want nil", cost, rot, mmd, err)
-				}
+		for _, mmd := range []int{0, 1} {
+			c := good
+			c.CostMode, c.MaxMessagesPerDay = cost, mmd
+			if err := c.Validate(); err != nil {
+				t.Errorf("Validate(COST_MODE=%q MAX=%d) = %v, want nil", cost, mmd, err)
 			}
 		}
 	}
@@ -987,10 +1091,21 @@ func TestLogLevel(t *testing.T) {
 		t.Errorf("LogLevel = %q, want debug", cfg.LogLevel)
 	}
 
+	// trace is accepted (case-insensitive), matching telemetry.ParseLevel
+	t.Setenv("LOG_LEVEL", "trace")
+	if cfg, err := Load(""); err != nil {
+		t.Fatalf("Load (env trace): %v", err)
+	} else if cfg.LogLevel != "trace" {
+		t.Errorf("LogLevel = %q, want trace", cfg.LogLevel)
+	}
+
 	// invalid level fails validation
 	t.Setenv("LOG_LEVEL", "bogus")
 	if _, err := Load(""); err == nil || !strings.Contains(err.Error(), "LOG_LEVEL") {
 		t.Fatalf("Load (invalid level): err = %v, want error mentioning LOG_LEVEL", err)
+	}
+	if _, err := Load(""); err == nil || !strings.Contains(err.Error(), "debug, info, warn, error, trace") {
+		t.Fatalf("Load (invalid level): err = %v, want error listing trace", err)
 	}
 
 	// .env source
@@ -1002,6 +1117,112 @@ func TestLogLevel(t *testing.T) {
 		t.Fatalf("Load (.env): %v", err)
 	} else if cfg.LogLevel != "warn" {
 		t.Errorf("LogLevel = %q, want warn (from .env)", cfg.LogLevel)
+	}
+}
+
+func TestLogFormat(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("AUTH_TOKENS", "tok")
+
+	// default: "text" when unset (the historic output shape)
+	if cfg, err := Load(""); err != nil {
+		t.Fatalf("Load (default): %v", err)
+	} else if cfg.LogFormat != "text" {
+		t.Errorf("LogFormat = %q, want text by default", cfg.LogFormat)
+	}
+
+	// env source
+	t.Setenv("LOG_FORMAT", "json")
+	if cfg, err := Load(""); err != nil {
+		t.Fatalf("Load (env json): %v", err)
+	} else if cfg.LogFormat != "json" {
+		t.Errorf("LogFormat = %q, want json", cfg.LogFormat)
+	}
+
+	// explicit empty resets to the default
+	t.Setenv("LOG_FORMAT", "")
+	if cfg, err := Load(""); err != nil {
+		t.Fatalf("Load (empty format): %v", err)
+	} else if cfg.LogFormat != "text" {
+		t.Errorf("LogFormat = %q, want text for empty value", cfg.LogFormat)
+	}
+
+	// invalid format fails validation
+	t.Setenv("LOG_FORMAT", "xml")
+	if _, err := Load(""); err == nil || !strings.Contains(err.Error(), "LOG_FORMAT") {
+		t.Fatalf("Load (invalid format): err = %v, want error mentioning LOG_FORMAT", err)
+	}
+
+	// JSON file source (weakest): env wins over it
+	t.Setenv("LOG_FORMAT", "text")
+	json := `{"AUTH_TOKENS":["tok"],"LOG_FORMAT":"json"}`
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(json), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if cfg, err := Load(path); err != nil {
+		t.Fatalf("Load (json file): %v", err)
+	} else if cfg.LogFormat != "text" {
+		t.Errorf("LogFormat = %q, want text (env beats JSON file)", cfg.LogFormat)
+	}
+	t.Setenv("LOG_FORMAT", "")
+	if cfg, err := Load(path); err != nil {
+		t.Fatalf("Load (json file, no env): %v", err)
+	} else if cfg.LogFormat != "json" {
+		t.Errorf("LogFormat = %q, want json from JSON file", cfg.LogFormat)
+	}
+}
+
+// TestLogAccess pins T17: LOG_ACCESS defaults to true, an empty .env line
+// keeps it enabled (the access gate must never flip off from an unset or
+// blank value), and only an explicit false disables the access lines.
+func TestLogAccess(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("AUTH_TOKENS", "tok")
+
+	if cfg, err := Load(""); err != nil {
+		t.Fatalf("Load (default): %v", err)
+	} else if !cfg.LogAccess {
+		t.Error("LogAccess = false by default, want true")
+	}
+
+	// env source: explicit false disables.
+	t.Setenv("LOG_ACCESS", "false")
+	if cfg, err := Load(""); err != nil {
+		t.Fatalf("Load (env false): %v", err)
+	} else if cfg.LogAccess {
+		t.Error("LogAccess = true for LOG_ACCESS=false, want false")
+	}
+
+	// Explicit true re-enables.
+	t.Setenv("LOG_ACCESS", "true")
+	if cfg, err := Load(""); err != nil {
+		t.Fatalf("Load (env true): %v", err)
+	} else if !cfg.LogAccess {
+		t.Error("LogAccess = false for LOG_ACCESS=true, want true")
+	}
+
+	// An empty .env line must not disable access logging: the empty value
+	// leaves the default (true) untouched.
+	t.Setenv("LOG_ACCESS", "")
+	if err := os.WriteFile(".env", []byte("AUTH_TOKENS=tok\nLOG_ACCESS=\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if cfg, err := Load(""); err != nil {
+		t.Fatalf("Load (empty .env line): %v", err)
+	} else if !cfg.LogAccess {
+		t.Error("LogAccess = false for an empty LOG_ACCESS=.env line, want true")
+	}
+
+	// The .env source: LOG_ACCESS=false in .env disables (env wins).
+	t.Setenv("LOG_ACCESS", "")
+	if err := os.WriteFile(".env", []byte("AUTH_TOKENS=tok\nLOG_ACCESS=false\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if cfg, err := Load(""); err != nil {
+		t.Fatalf("Load (.env false): %v", err)
+	} else if cfg.LogAccess {
+		t.Error("LogAccess = true for .env LOG_ACCESS=false, want false")
 	}
 }
 
@@ -1089,6 +1310,86 @@ func TestMaxMessagesPerDay(t *testing.T) {
 		t.Fatalf("Load (file): %v", err)
 	} else if cfg.MaxMessagesPerDay != 3 {
 		t.Errorf("MaxMessagesPerDay = %d, want 3 (file)", cfg.MaxMessagesPerDay)
+	}
+}
+func TestRateLimitConfig(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("AUTH_TOKENS", "tok")
+
+	// Default is disabled (0, 0)
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("Load default: %v", err)
+	}
+	if cfg.RateLimitPerIP != 0 || cfg.RateLimitBurst != 0 {
+		t.Errorf("default RateLimit = (%v, %v), want (0, 0)", cfg.RateLimitPerIP, cfg.RateLimitBurst)
+	}
+
+	// Override via environment variables
+	t.Setenv("RATE_LIMIT_PER_IP", "25.5")
+	t.Setenv("RATE_LIMIT_BURST", "50")
+	cfg, err = Load("")
+	if err != nil {
+		t.Fatalf("Load with env: %v", err)
+	}
+	if cfg.RateLimitPerIP != 25.5 || cfg.RateLimitBurst != 50 {
+		t.Errorf("RateLimit from env = (%v, %v), want (25.5, 50)", cfg.RateLimitPerIP, cfg.RateLimitBurst)
+	}
+}
+
+// TestMaxSpendPerDay pins the advisory spend-ceiling knob (issue #122):
+// default 0 (unlimited), env override, unparseable env ignored, JSON file
+// value, and .env value. The knob is advisory-only — the upstream $ ceilings
+// are server-enforced and the pool never blocks on it.
+func TestMaxSpendPerDay(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("AUTH_TOKENS", "tok")
+
+	// default: 0 (unlimited)
+	if cfg, err := Load(""); err != nil {
+		t.Fatalf("Load: %v", err)
+	} else if cfg.MaxSpendPerDay != 0 {
+		t.Errorf("MaxSpendPerDay = %d, want 0 (unlimited default)", cfg.MaxSpendPerDay)
+	}
+
+	// env override
+	t.Setenv("MAX_SPEND_PER_DAY", "1000")
+	if cfg, err := Load(""); err != nil {
+		t.Fatalf("Load (env): %v", err)
+	} else if cfg.MaxSpendPerDay != 1000 {
+		t.Errorf("MaxSpendPerDay = %d, want 1000 (env)", cfg.MaxSpendPerDay)
+	}
+
+	// unparseable env value is ignored (keeps the file value)
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(`{"MAX_SPEND_PER_DAY": 250}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("MAX_SPEND_PER_DAY", "soon")
+	if cfg, err := Load(path); err != nil {
+		t.Fatalf("Load (bad env + file): %v", err)
+	} else if cfg.MaxSpendPerDay != 250 {
+		t.Errorf("MaxSpendPerDay = %d, want 250 (bad env ignored, file kept)", cfg.MaxSpendPerDay)
+	}
+
+	// JSON file value
+	t.Setenv("MAX_SPEND_PER_DAY", "")
+	if cfg, err := Load(path); err != nil {
+		t.Fatalf("Load (file): %v", err)
+	} else if cfg.MaxSpendPerDay != 250 {
+		t.Errorf("MaxSpendPerDay = %d, want 250 (file)", cfg.MaxSpendPerDay)
+	}
+
+	// .env value (clearEnv chdirs to a fresh temp dir, so ./.env is the
+	// file ResolveEnvFile reads)
+	t.Setenv("MAX_SPEND_PER_DAY", "")
+	if err := os.WriteFile(".env", []byte("AUTH_TOKENS=tok\nMAX_SPEND_PER_DAY=75\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if cfg, err := Load(""); err != nil {
+		t.Fatalf("Load (.env): %v", err)
+	} else if cfg.MaxSpendPerDay != 75 {
+		t.Errorf("MaxSpendPerDay = %d, want 75 (from .env)", cfg.MaxSpendPerDay)
 	}
 }
 
@@ -1380,14 +1681,13 @@ func TestSessionPersistEmptyStateFileEnv(t *testing.T) {
 	}
 }
 
-// TestDedupeAPIKeysSOCKS5Proxies asserts the dedupeStrings pass for API_KEYS
-// and SOCKS5_PROXIES (only AUTH_TOKENS dedupe was previously asserted) when
-// the same value appears multiple times in one env value.
-func TestDedupeAPIKeysSOCKS5Proxies(t *testing.T) {
+// TestDedupeAPIKeys asserts the dedupeStrings pass for API_KEYS (only
+// AUTH_TOKENS dedupe was previously asserted) when the same value appears
+// multiple times in one env value.
+func TestDedupeAPIKeys(t *testing.T) {
 	clearEnv(t)
 	t.Setenv("AUTH_TOKENS", "tok-1")
 	t.Setenv("API_KEYS", "k1,k2,k1, k1")
-	t.Setenv("SOCKS5_PROXIES", "p1:9050,p2:9050,p1:9050")
 
 	cfg, err := Load("")
 	if err != nil {
@@ -1395,9 +1695,6 @@ func TestDedupeAPIKeysSOCKS5Proxies(t *testing.T) {
 	}
 	if want := []string{"k1", "k2"}; !equalStrings(cfg.APIKeys, want) {
 		t.Errorf("APIKeys = %v, want %v (deduped)", cfg.APIKeys, want)
-	}
-	if want := []string{"p1:9050", "p2:9050"}; !equalStrings(cfg.SOCKS5Proxies, want) {
-		t.Errorf("SOCKS5Proxies = %v, want %v (deduped)", cfg.SOCKS5Proxies, want)
 	}
 }
 
@@ -1528,8 +1825,7 @@ func TestModelAliasesConfig(t *testing.T) {
 
 // TestDotenvFullKeySet verifies every env-overridable key also lands in cfg
 // when set in ./.env. Regression: SAFE_MODE, REQUEST_JITTER, CLI_VERSION,
-// MODEL_ALIASES, TRANSIENT_RETRIES and PROXY_ROTATION were silently ignored
-// in .env (SOCKS5_PROXIES was already covered by TestDotenvSOCKS5Proxies).
+// MODEL_ALIASES and TRANSIENT_RETRIES were silently ignored in .env.
 func TestDotenvFullKeySet(t *testing.T) {
 	clearEnv(t)
 
@@ -1540,7 +1836,7 @@ func TestDotenvFullKeySet(t *testing.T) {
 		"CLI_VERSION=9.9.9",
 		"MODEL_ALIASES=gpt-4o:deepseek/deepseek-v4-flash,glm:z-ai/glm-5.2",
 		"TRANSIENT_RETRIES=2",
-		"PROXY_ROTATION=round-robin",
+		"MAX_SPEND_PER_DAY=500",
 	}, "\n")
 	if err := os.WriteFile(".env", []byte(content), 0o644); err != nil {
 		t.Fatal(err)
@@ -1568,8 +1864,8 @@ func TestDotenvFullKeySet(t *testing.T) {
 	if cfg.TransientRetries != 2 {
 		t.Errorf("TransientRetries = %d, want 2 (from .env)", cfg.TransientRetries)
 	}
-	if cfg.ProxyRotation != "round-robin" {
-		t.Errorf("ProxyRotation = %q, want round-robin (from .env)", cfg.ProxyRotation)
+	if cfg.MaxSpendPerDay != 500 {
+		t.Errorf("MaxSpendPerDay = %d, want 500 (from .env)", cfg.MaxSpendPerDay)
 	}
 }
 
@@ -1578,14 +1874,13 @@ func TestDotenvFullKeySet(t *testing.T) {
 func TestDotenvFullKeySetEnvWins(t *testing.T) {
 	clearEnv(t)
 
-	if err := os.WriteFile(".env", []byte("SAFE_MODE=false\nHYBRID_MODE=true\nCLI_VERSION=9.9.9\nTRANSIENT_RETRIES=2\nPROXY_ROTATION=round-robin\n"), 0o644); err != nil {
+	if err := os.WriteFile(".env", []byte("SAFE_MODE=false\nHYBRID_MODE=true\nCLI_VERSION=9.9.9\nTRANSIENT_RETRIES=2\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("SAFE_MODE", "true")
 	t.Setenv("HYBRID_MODE", "false")
 	t.Setenv("CLI_VERSION", "1.2.3")
 	t.Setenv("TRANSIENT_RETRIES", "5")
-	t.Setenv("PROXY_ROTATION", "random")
 
 	cfg, err := Load("")
 	if err != nil {
@@ -1602,9 +1897,6 @@ func TestDotenvFullKeySetEnvWins(t *testing.T) {
 	}
 	if cfg.TransientRetries != 5 {
 		t.Errorf("TransientRetries = %d, want 5 (env wins)", cfg.TransientRetries)
-	}
-	if cfg.ProxyRotation != "random" {
-		t.Errorf("ProxyRotation = %q, want random (env wins)", cfg.ProxyRotation)
 	}
 }
 
@@ -1760,4 +2052,113 @@ func TestReadDotenvQuotingAndComments(t *testing.T) {
 	if len(got) != len(want) {
 		t.Errorf("readDotenv returned %d keys, want %d", len(got), len(want))
 	}
+}
+
+// ── Wave 1 issue tests (#79: ACTING_USER_ID) ─────────────────────────────
+
+// TestActingUserID verifies ACTING_USER_ID resolves from the environment,
+// the .env file, and the JSON config (optional key; empty default), issue
+// #79, and that the pre-rename USER_ID knob still works as a backward-compat
+// alias (#126; the new name always wins when both are set).
+func TestActingUserID(t *testing.T) {
+	t.Run("default empty", func(t *testing.T) {
+		clearEnv(t)
+		t.Setenv("AUTH_TOKENS", "tok-1")
+		cfg, err := Load("")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.ActingUserID != "" {
+			t.Errorf("ActingUserID = %q, want empty default", cfg.ActingUserID)
+		}
+	})
+	t.Run("env override", func(t *testing.T) {
+		clearEnv(t)
+		t.Setenv("AUTH_TOKENS", "tok-1")
+		t.Setenv("ACTING_USER_ID", "user-abc")
+		cfg, err := Load("")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.ActingUserID != "user-abc" {
+			t.Errorf("ActingUserID = %q, want user-abc", cfg.ActingUserID)
+		}
+	})
+	t.Run("env legacy alias", func(t *testing.T) {
+		clearEnv(t)
+		t.Setenv("AUTH_TOKENS", "tok-1")
+		t.Setenv("USER_ID", "user-legacy")
+		cfg, err := Load("")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.ActingUserID != "user-legacy" {
+			t.Errorf("ActingUserID = %q, want user-legacy (USER_ID alias)", cfg.ActingUserID)
+		}
+	})
+	t.Run("new name wins over legacy", func(t *testing.T) {
+		clearEnv(t)
+		t.Setenv("AUTH_TOKENS", "tok-1")
+		t.Setenv("ACTING_USER_ID", "user-new")
+		t.Setenv("USER_ID", "user-legacy")
+		cfg, err := Load("")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.ActingUserID != "user-new" {
+			t.Errorf("ActingUserID = %q, want user-new (ACTING_USER_ID wins)", cfg.ActingUserID)
+		}
+	})
+	t.Run("dotenv", func(t *testing.T) {
+		clearEnv(t)
+		if err := os.WriteFile(".env", []byte("AUTH_TOKENS=tok-1\nACTING_USER_ID=user-dotenv\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := Load("")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.ActingUserID != "user-dotenv" {
+			t.Errorf("ActingUserID = %q, want user-dotenv (from .env)", cfg.ActingUserID)
+		}
+	})
+	t.Run("dotenv legacy alias", func(t *testing.T) {
+		clearEnv(t)
+		if err := os.WriteFile(".env", []byte("AUTH_TOKENS=tok-1\nUSER_ID=user-dotenv-legacy\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := Load("")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.ActingUserID != "user-dotenv-legacy" {
+			t.Errorf("ActingUserID = %q, want user-dotenv-legacy (USER_ID alias in .env)", cfg.ActingUserID)
+		}
+	})
+	t.Run("JSON config", func(t *testing.T) {
+		clearEnv(t)
+		if err := os.WriteFile("cfg.json", []byte(`{"AUTH_TOKENS":["tok-1"],"ACTING_USER_ID":"user-json"}`), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := Load("cfg.json")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.ActingUserID != "user-json" {
+			t.Errorf("ActingUserID = %q, want user-json (from JSON config)", cfg.ActingUserID)
+		}
+	})
+	t.Run("JSON legacy key", func(t *testing.T) {
+		clearEnv(t)
+		if err := os.WriteFile("cfg.json", []byte(`{"AUTH_TOKENS":["tok-1"],"USER_ID":"user-json-legacy"}`), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := Load("cfg.json")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.ActingUserID != "user-json-legacy" {
+			t.Errorf("ActingUserID = %q, want user-json-legacy (legacy USER_ID JSON key)", cfg.ActingUserID)
+		}
+	})
 }
