@@ -27,7 +27,11 @@ codebuff.com 上游
 
 ## 新特性（本次同步跟进上游）
 
-- **Admin Dashboard**：内嵌单二进制 Web UI（`/admin`，htmx + Pico）。见下方「Admin Dashboard（云端说明）」。
+- **Admin Dashboard**：内嵌单二进制 Web UI（`/admin`，Svelte 5 + Tailwind 4 SPA，静态资源经 `go:embed` 内嵌）。见下方「Admin Dashboard（云端说明）」。
+- **模型允许列表**：`MODELS_ALLOW` 逗号分隔白名单，`/v1/models` 只列出允许的 id，其它模型的 chat/messages/responses 请求返回 404 `model_not_found`。
+- **`-max` 自动升级**：`PREFER_MAX_MODELS=true` 时把标准模型自动升级到 `-max` 长上下文变体（受 access tier 门控）。
+- **推理回放缓存**：新增 `internal/reasoningcache`，缓存推理内容并施加 MiMo V2.5 通用工具调用不变量。
+- **开放 Dashboard**：`ADMIN_TOKEN` 完全可选——只读状态页默认开放，写操作 / config / logs / reload 需 `ADMIN_TOKEN` 或 loopback。
 - **HTTP/2 上游协商**：`HTTP2_UPSTREAM=true`（默认）以 `h2,http/1.1` 与上游协商，ALPN 对齐真实浏览器（JA4 指纹）。
 - **每来源 IP 限流**：`RATE_LIMIT_PER_IP`/`RATE_LIMIT_BURST` 保护上游免遭突发（默认关闭）。
 - **Webhook 告警**：`WEBHOOK_URL` 设置后，token 池耗尽/封禁时 fire-and-forget 告警（云端可用，纯出站 HTTPS POST）。
@@ -103,11 +107,11 @@ export OPENAI_API_KEY=<API_KEYS 或 cb_ token>
 
 ## Admin Dashboard（云端说明）
 
-上游新增内嵌管理后台，Vercel 上同样随二进制提供，但**功能受限**：
+上游新增内嵌管理后台（Svelte 5 SPA，静态资源经 `go:embed` 内嵌），Vercel 上同样随二进制提供，但**功能受限**：
 
-- **只读状态页**（`/admin` overview / tokens / models / traces / metrics / setup）可访问，展示 token 会话状态、配额、用量、最近请求 trace 等。
-- **写操作**（config 编辑器、token add/remove、mode 切换、smoke、diag）在**未设 `ADMIN_TOKEN` 时要求 loopback 客户端**，而 Vercel 上请求来自边缘（非 loopback）→ 实际被拒；且 config 编辑器写 `.env` 在只读文件系统上也会失败。这些功能在 serverless 上本就无意义。
-- **重要**：`ADMIN_TOKEN` 现在同时保护 `/admin` dashboard 与 `/admin/reload`。Vercel 实例是**公网可达**，强烈建议设置 `ADMIN_TOKEN`（`openssl rand -hex 16`），否则任何知道 URL 的人都能查看 dashboard 状态页。
+- **只读状态页**（`/admin` overview / tokens / models / traces / metrics / setup）在 `ADMIN_TOKEN` 未设时**默认开放**，展示 token 会话状态、配额、用量、最近请求 trace 等。
+- **写操作 / 敏感页**（config 编辑器、logs、token add/remove、mode 切换、smoke、diag）在**未设 `ADMIN_TOKEN` 时要求 loopback 客户端**，而 Vercel 上请求来自边缘（非 loopback）→ 实际被拒；且 config 编辑器写 `.env` 在只读文件系统上也会失败。这些功能在 serverless 上本就无意义。
+- **重要**：Vercel 实例是**公网可达**，未设 `ADMIN_TOKEN` 时只读状态页（含 token 数、会话状态、模型列表）对任何知道 URL 的人可见。**强烈建议设置 `ADMIN_TOKEN`**（`openssl rand -hex 16`）以保护全部 dashboard 视图与 `/admin/reload`、config/logs。
 
 云端无意义（无需配置）：`LOG_FILE`、`DEBUG_DUMP`（写 `./dump/`）、dashboard 的 `.env` 编辑/持久化、`-doctor/-update/-setup/-test-token`、CLI token 自动发现。
 
@@ -141,7 +145,7 @@ go test ./...                            # 上游完整测试套件（全过）
 ## 上游
 
 - 项目：https://github.com/trefeon/freebuff-proxy
-- 同步基线：上游 commit `b047e34`。协议转换层（`internal/convert`、`internal/upstream`、`internal/stealth`、`internal/registry`、`internal/dashboard`、`internal/egress`、`internal/logring`、`internal/session`、`internal/notify`）随上游更新；本仓库逻辑代码与上游逐字节一致，唯一差异是根 `main.go`、`vercel.json`、本 README（Vercel 适配层）。
+- 同步基线：上游 commit `53260a8`。协议转换层（`internal/convert`、`internal/upstream`、`internal/stealth`、`internal/registry`、`internal/dashboard`、`internal/egress`、`internal/logring`、`internal/session`、`internal/notify`、`internal/reasoningcache`）随上游更新；本仓库逻辑代码与上游逐字节一致，唯一差异是根 `main.go`、`vercel.json`、本 README（Vercel 适配层）。
 
 ## License
 

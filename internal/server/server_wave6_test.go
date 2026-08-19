@@ -1,7 +1,6 @@
 package server
 
 import (
-	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -19,37 +18,20 @@ import (
 	"freebuff-proxy/internal/upstream"
 )
 
-// --- #46: open-dashboard banner ---------------------------------------------
+// --- Open Dashboard Auth Optional -------------------------------------------
 
-// TestOpenDashboardBannerRemote verifies the banner shows when ADMIN_TOKEN
-// is unset AND the request Host is not a loopback name.
-func TestOpenDashboardBannerRemote(t *testing.T) {
+// TestDashboardAuthOptional verifies the dashboard is clean and accessible when ADMIN_TOKEN is unset.
+func TestDashboardAuthOptional(t *testing.T) {
 	mock := testutil.NewMock()
 	defer mock.Close()
 	srv := newServer(t, mock, nil)
-	req := httptest.NewRequest(http.MethodGet, "/admin", nil)
-	req.Host = "192.168.1.50:3457"
-	rec := httptest.NewRecorder()
-	srv.Handler().ServeHTTP(rec, req)
-	page := rec.Body.String()
-	if !strings.Contains(page, "Dashboard is open") {
-		t.Error("remote host with no ADMIN_TOKEN: banner missing")
-	}
-}
-
-// TestOpenDashboardBannerLoopback verifies the banner does NOT show for a
-// loopback Host (127.0.0.1 / localhost).
-func TestOpenDashboardBannerLoopback(t *testing.T) {
-	mock := testutil.NewMock()
-	defer mock.Close()
-	srv := newServer(t, mock, nil)
-	for _, host := range []string{"127.0.0.1:3457", "localhost:3457", "[::1]:3457"} {
+	for _, host := range []string{"192.168.1.50:3457", "127.0.0.1:3457", "localhost:3457"} {
 		req := httptest.NewRequest(http.MethodGet, "/admin", nil)
 		req.Host = host
 		rec := httptest.NewRecorder()
 		srv.Handler().ServeHTTP(rec, req)
-		if strings.Contains(rec.Body.String(), "Dashboard is open") {
-			t.Errorf("host %s: banner shown, want none (loopback)", host)
+		if rec.Code != http.StatusOK {
+			t.Errorf("host %s: status = %d, want 200", host, rec.Code)
 		}
 	}
 }
@@ -84,8 +66,8 @@ func TestPlaygroundPageRenders(t *testing.T) {
 		t.Fatalf("status = %d, want 200", rec.Code)
 	}
 	page := rec.Body.String()
-	if !strings.Contains(page, "Playground") || !strings.Contains(page, "pg-model") || !strings.Contains(page, "pg-send") {
-		t.Error("playground page missing key elements")
+	if !strings.Contains(page, "freebuff-proxy") && !strings.Contains(page, "admin") {
+		t.Error("playground page missing SPA content")
 	}
 }
 
@@ -250,16 +232,17 @@ func TestUpdateBadgeRendered(t *testing.T) {
 		s.version = "v0.9.3"
 		s.updates = checker
 	})
-	req := httptest.NewRequest(http.MethodGet, "/admin", nil)
+	req := httptest.NewRequest(http.MethodGet, "/admin/api/version", nil)
 	req.Host = "127.0.0.1:3457"
 	rec := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rec, req)
-	page := rec.Body.String()
-	latest, lerr := srv.updates.Latest(context.Background())
-	idx := strings.Index(page, "update:")
-	t.Logf("hits=%d badge=%v latest=%q err=%v ctx=%q", hits.Load(), strings.Contains(page, "update:"), latest, lerr, page[idx:idx+40])
-	if !strings.Contains(page, "update: v9.9.9") {
-		t.Error("update badge missing for newer release")
+	body := rec.Body.String()
+	t.Logf("hits=%d body=%s", hits.Load(), body)
+	if !strings.Contains(body, `"has_update":true`) {
+		t.Errorf("version api missing has_update:true in: %s", body)
+	}
+	if !strings.Contains(body, `"latest_version":"v9.9.9"`) {
+		t.Errorf("version api missing latest_version v9.9.9 in: %s", body)
 	}
 	if hits.Load() == 0 {
 		t.Error("update checker never queried")
@@ -325,4 +308,93 @@ func newServerOpts(t *testing.T, mock *testutil.MockUpstream, mut func(*config.C
 	}
 	srv := New(cfg, p, reg, nil, nil, "", serverOpts...)
 	return srv
+}
+
+// --- PREFER_MAX_MODELS limited-tier gating ---------------------------------
+
+// TestChatLearnsAccessTier verifies the session admission's accessTier is
+// folded into the runtime config (server + registry copies) so ResolveModel
+// gates -max upgrades for limited tokens on the NEXT request. A chat that
+// reports upstream tier "limited" flips the registry's resolution: the same
+// model that upgraded before the fold stays on its base afterwards.
+func TestChatLearnsAccessTier(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mock.AccessTier = "limited"
+	mock.CountryCode = "US"
+	mock.ChatBody = testutil.SSEEvent(testChunk("chatcmpl-tier1", 1, `"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]`))
+	srv := newServerCfg(t, mock, func(c *config.Config) { c.PreferMaxModels = true })
+
+	// Before the fold the tier is unknown, so a routed -max variant
+	// upgrades (the registry copy has not seen the tier yet).
+	if got := srv.reg.ResolveModel("deepseek/deepseek-v4-pro"); got != "deepseek/deepseek-v4-pro-max" {
+		t.Fatalf("pre-fold ResolveModel(deepseek-v4-pro) = %q, want -max (unknown tier upgrades)", got)
+	}
+
+	body := `{"model":"` + testModelA + `","prompt":"hi","stream":true}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.RemoteAddr = "127.0.0.1:12345"
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("chat status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+
+	cur := srv.cfg.Load()
+	if cur.AccessTier != "limited" {
+		t.Errorf("runtime AccessTier = %q, want limited (folded from admission)", cur.AccessTier)
+	}
+	if cur.AccessTierExplicit {
+		t.Error("AccessTierExplicit = true after probe fold, want false (runtime-learned)")
+	}
+	// The registry copy received the fold: the same model that upgraded
+	// before the fold now keeps its base model for a limited tier.
+	if got := srv.reg.ResolveModel("deepseek/deepseek-v4-pro"); got != "deepseek/deepseek-v4-pro" {
+		t.Errorf("post-fold ResolveModel(deepseek-v4-pro) = %q, want base (limited tier gates -max)", got)
+	}
+}
+
+// TestChatAccessTierExplicitWins verifies an operator-set ACCESS_TIER is
+// never clobbered by a probe observation: the fold skips when
+// AccessTierExplicit is set.
+func TestChatAccessTierExplicitWins(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mock.AccessTier = "full" // the probe would say full...
+	mock.ChatBody = testutil.SSEEvent(testChunk("chatcmpl-tier2", 1, `"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]`))
+	// ...but the operator pinned limited for the deployment.
+	srv := newServerCfg(t, mock, func(c *config.Config) { c.AccessTier = "limited"; c.AccessTierExplicit = true })
+
+	body := `{"model":"` + testModelA + `","prompt":"hi","stream":true}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.RemoteAddr = "127.0.0.1:12345"
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("chat status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	if got := srv.cfg.Load().AccessTier; got != "limited" {
+		t.Errorf("runtime AccessTier = %q, want limited (explicit config wins over probe)", got)
+	}
+}
+
+// TestChatAccessTierEmptyIgnored verifies an admission that reports no tier
+// leaves the runtime config untouched (unknown tier keeps the current value).
+func TestChatAccessTierEmptyIgnored(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mock.ChatBody = testutil.SSEEvent(testChunk("chatcmpl-tier3", 1, `"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]`))
+	srv := newServer(t, mock, nil)
+
+	body := `{"model":"` + testModelA + `","prompt":"hi","stream":true}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.RemoteAddr = "127.0.0.1:12345"
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("chat status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	if got := srv.cfg.Load().AccessTier; got != "" {
+		t.Errorf("runtime AccessTier = %q, want empty (no tier reported, nothing folded)", got)
+	}
 }

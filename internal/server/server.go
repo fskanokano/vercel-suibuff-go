@@ -49,6 +49,7 @@ import (
 	"freebuff-proxy/internal/phasetiming"
 	"freebuff-proxy/internal/pool"
 	"freebuff-proxy/internal/ratelimit"
+	"freebuff-proxy/internal/reasoningcache"
 	"freebuff-proxy/internal/registry"
 	"freebuff-proxy/internal/runs"
 	"freebuff-proxy/internal/session"
@@ -108,6 +109,8 @@ type Server struct {
 	// the authToken lands (then AddToken + persist).
 	loginMu    sync.Mutex
 	loginFlows map[string]*loginFlow
+	// reasoningCache caches reasoning content and signatures for tool calls across turns.
+	reasoningCache *reasoningcache.Cache
 	// rateLimiter caps client request rates per source IP (issue #137).
 	rateLimiter *ratelimit.Limiter
 	// rateLimitRejections tracks total client requests rejected by local rate limiter.
@@ -180,6 +183,10 @@ func New(cfg *config.Config, p *pool.Pool, reg *registry.Registry, logger *slog.
 	}
 	s.dash = dashboard.New(func() *config.Config { return s.cfg.Load() }, p, reg, logger, logs, dashOpts...)
 	s.adminAuth = newAdminAuth()
+	s.reasoningCache = reasoningcache.New(10000, 2*time.Hour)
+	convert.SetReasoningLookup(func(toolID string, content, toolCallsJSON string) (string, string, bool) {
+		return s.reasoningCache.Get(toolID, content, toolCallsJSON)
+	})
 	return s
 }
 
@@ -209,18 +216,31 @@ func (s *Server) Handler() http.Handler {
 	// lock the victim out of the dashboard (5 fails → 1-minute lockout,
 	// repeatable). GET stays unwrapped — it just renders the login page.
 	mux.HandleFunc("POST /admin/login", s.adminCSRF(http.HandlerFunc(s.handleAdminLogin)))
-	mux.Handle("GET /admin", s.dashboardAuth(s.dash.Page("overview")))
-	mux.Handle("GET /admin/tokens", s.dashboardAuth(s.dash.Page("tokens")))
-	mux.Handle("GET /admin/models", s.dashboardAuth(s.dash.Page("models")))
-	mux.Handle("GET /admin/traces", s.dashboardAuth(s.dash.Page("traces")))
-	mux.Handle("GET /admin/setup", s.dashboardAuth(s.dash.Page("setup")))
-	mux.Handle("GET /admin/playground", s.dashboardAuth(s.dash.Page("playground")))
+	// Admin dashboard API routes (JSON)
+	mux.Handle("GET /admin/api/overview", s.dashboardAuth(s.dash.APIHandler("overview")))
+	mux.Handle("GET /admin/api/tokens", s.dashboardAuth(s.dash.APIHandler("tokens")))
+	mux.Handle("GET /admin/api/models", s.dashboardAuth(s.dash.APIHandler("models")))
+	mux.Handle("GET /admin/api/traces", s.dashboardAuth(s.dash.APIHandler("traces")))
+	mux.Handle("GET /admin/api/setup", s.dashboardAuth(s.dash.APIHandler("setup")))
+	mux.Handle("GET /admin/api/config", s.dashboardAuth(s.adminSensitive(s.dash.APIHandler("config"))))
+	mux.Handle("GET /admin/api/logs", s.dashboardAuth(s.adminSensitive(s.dash.APIHandler("logs"))))
+	mux.Handle("GET /admin/api/metrics", s.dashboardAuth(s.dash.APIHandler("metrics")))
+	mux.Handle("GET /admin/api/version", s.dashboardAuth(http.HandlerFunc(s.dash.APIVersion)))
+
+	// SPA: all admin/* GET routes serve the embedded Svelte SPA
+	mux.Handle("GET /admin", s.dashboardAuth(http.HandlerFunc(s.dash.ServeSPA)))
+	mux.Handle("GET /admin/", s.dashboardAuth(http.HandlerFunc(s.dash.ServeSPA)))
+	mux.Handle("GET /admin/tokens", s.dashboardAuth(http.HandlerFunc(s.dash.ServeSPA)))
+	mux.Handle("GET /admin/models", s.dashboardAuth(http.HandlerFunc(s.dash.ServeSPA)))
+	mux.Handle("GET /admin/traces", s.dashboardAuth(http.HandlerFunc(s.dash.ServeSPA)))
+	mux.Handle("GET /admin/setup", s.dashboardAuth(http.HandlerFunc(s.dash.ServeSPA)))
+	mux.Handle("GET /admin/playground", s.dashboardAuth(http.HandlerFunc(s.dash.ServeSPA)))
+	mux.Handle("GET /admin/config", s.dashboardAuth(s.adminSensitive(http.HandlerFunc(s.dash.ServeSPA))))
+	mux.Handle("GET /admin/logs", s.dashboardAuth(s.adminSensitive(http.HandlerFunc(s.dash.ServeSPA))))
+	mux.Handle("GET /admin/metrics", s.dashboardAuth(http.HandlerFunc(s.dash.ServeSPA)))
 	mux.Handle("POST /admin/playground/chat", s.dashboardAuth(s.adminSensitive(s.adminCSRF(http.HandlerFunc(s.handlePlaygroundChat)))))
 	mux.Handle("POST /admin/login/start", s.dashboardAuth(s.adminSensitive(s.adminCSRF(http.HandlerFunc(s.handleLoginStart)))))
 	mux.Handle("GET /admin/login/status", s.dashboardAuth(s.adminSensitive(http.HandlerFunc(s.handleLoginStatus))))
-	mux.Handle("GET /admin/config", s.dashboardAuth(s.adminSensitive(s.dash.Page("config"))))
-	mux.Handle("GET /admin/logs", s.dashboardAuth(s.adminSensitive(s.dash.Page("logs"))))
-	mux.Handle("GET /admin/metrics", s.dashboardAuth(s.dash.Page("metrics")))
 	mux.Handle("POST /admin/config", s.dashboardAuth(s.adminSensitive(s.adminCSRF(http.HandlerFunc(s.handleConfigSave)))))
 	mux.Handle("POST /admin/tokens/{id}/unlock", s.dashboardAuth(s.adminSensitive(s.adminCSRF(http.HandlerFunc(s.handleTokenUnlock)))))
 	mux.Handle("POST /admin/tokens/{id}/finish", s.dashboardAuth(s.adminSensitive(s.adminCSRF(http.HandlerFunc(s.handleTokenFinish)))))
@@ -231,10 +251,8 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /admin/mode", s.dashboardAuth(s.adminSensitive(s.adminCSRF(http.HandlerFunc(s.handleModeSwitch)))))
 	mux.Handle("POST /admin/diag", s.dashboardAuth(s.adminSensitive(s.adminCSRF(http.HandlerFunc(s.handleDiag)))))
 	mux.Handle("POST /admin/smoke", s.dashboardAuth(s.adminSensitive(s.adminCSRF(http.HandlerFunc(s.handleSmoke)))))
-	// noDirListing must wrap StripPrefix, not the other way around: after
-	// the strip the path is "" and a trailing-slash directory request would
-	// slip past the guard into FileServerFS, which renders a listing.
-	mux.Handle("GET /admin/assets/", noDirListing(http.StripPrefix("/admin/assets/", http.FileServerFS(mustSubFS(dashboard.AssetsFS(), "assets")))))
+	// Static assets: serve from embedded dist/assets
+	mux.Handle("GET /admin/assets/", noDirListing(http.StripPrefix("/admin/assets/", http.FileServerFS(mustSubFS(dashboard.DistFS(), "assets")))))
 	// CORS middleware wraps the whole route table: it answers OPTIONS
 	// preflights on the /v1/* API surface with 204 and stamps the allow
 	// headers on every /v1/* response. Admin routes are intentionally left
@@ -698,40 +716,13 @@ func (s *Server) dashboardAuth(next http.Handler) http.Handler {
 // also be loopback-named: a DNS-rebinding page (attacker.com → 127.0.0.1)
 // arrives from a loopback RemoteAddr while its Host stays attacker-owned,
 // which would otherwise defeat the gate (SEC-2).
+// adminSensitive gates secret-bearing admin routes. When ADMIN_TOKEN is set,
+// dashboardAuth validates the session cookie. When ADMIN_TOKEN is unset
+// (optional auth), all admin routes are open to facilitate easy monitoring.
 func (s *Server) adminSensitive(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		cfg := s.cfg.Load()
-		if cfg.AdminToken == "" && (!isLoopback(r) || !isLoopbackHost(r.Host)) {
-			s.dash.RenderRestricted(w, r, "This page is only available to loopback clients while ADMIN_TOKEN is unset.")
-			return
-		}
 		next.ServeHTTP(w, r)
 	})
-}
-
-// isLoopback reports whether the request came from a loopback address.
-func isLoopback(r *http.Request) bool {
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return false
-	}
-	ip := net.ParseIP(host)
-	return ip != nil && ip.IsLoopback()
-}
-
-// isLoopbackHost reports whether the request's Host header names a loopback
-// target (127.0.0.1, ::1, localhost, *.localhost). Used by the open-mode
-// adminSensitive gate to stop DNS-rebinding access.
-func isLoopbackHost(hostport string) bool {
-	host, _, err := net.SplitHostPort(hostport)
-	if err != nil {
-		host = hostport // bare host (no port)
-	}
-	if ip := net.ParseIP(host); ip != nil {
-		return ip.IsLoopback()
-	}
-	h := strings.ToLower(strings.TrimSuffix(host, "."))
-	return h == "localhost" || strings.HasSuffix(h, ".localhost")
 }
 
 // adminCSRF rejects cross-origin mutating admin requests. Browsers send
@@ -935,6 +926,10 @@ func (s *Server) handleTokenTest(w http.ResponseWriter, r *http.Request) {
 		msg += " (" + q + ")"
 	}
 	msg += "."
+	// The probe is the pooled equivalent of a session admission: fold the
+	// observed accessTier into the runtime config for ResolveModel's -max
+	// upgrade gate (PREFER_MAX_MODELS limited-tier gating).
+	s.rememberAccessTier(state.AccessTier)
 	s.logger.Info("dashboard token probe ok", "token", id)
 	s.dash.RenderConfigResult(w, r, true, msg)
 }
@@ -1864,6 +1859,7 @@ func effectiveConfigKV(cfg *config.Config) map[string]string {
 		"SAFE_MODE":                             strconv.FormatBool(cfg.SafeMode),
 		"HYBRID_MODE":                           strconv.FormatBool(cfg.HybridMode),
 		"MODELS_HIDE_UNAVAILABLE":               strconv.FormatBool(cfg.ModelsHideUnavailable),
+		"MODELS_ALLOW":                          strings.Join(cfg.ModelsAllow, ","),
 		"CORS_ALLOWED_ORIGIN":                   cfg.CORSAllowedOrigin,
 		"REQUEST_JITTER":                        cfg.RequestJitter.String(),
 		"CLI_VERSION":                           cfg.CLIVersion,
@@ -2066,6 +2062,13 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	model := s.reg.ResolveModel(rawModel)
+	if !s.modelAllowed(model) {
+		// MODELS_ALLOW: the resolved model (alias + -max upgrade applied)
+		// is outside the operator allowlist — reject like an unknown model.
+		s.writeJSONError(w, http.StatusNotFound,
+			"model not allowed by MODELS_ALLOW", "invalid_request_error", "model_not_found", 0)
+		return
+	}
 	stream := false
 	if v, ok := raw["stream"].(bool); ok {
 		stream = v
@@ -2274,6 +2277,12 @@ func (s *Server) chatCore(w http.ResponseWriter, r *http.Request, model string, 
 		s.writeError(w, r, err, model, lease)
 		return
 	}
+	// PREFER_MAX_MODELS limited-tier gating: the admission just reported
+	// the token's accessTier; fold it into the runtime config so the next
+	// request's ResolveModel gates -max upgrades for limited tokens (and
+	// full tokens keep upgrading). First request for a token still resolves
+	// with the previously-known (or env-set) tier.
+	s.rememberAccessTier(lease.TierAccess)
 	defer func() { _ = up.Close() }()
 	// Issue #53: when the downstream client disconnects mid-stream, abandon
 	// the lease instead of a plain release — the run is FINISHed through the
@@ -2331,6 +2340,29 @@ func (s *Server) chatCore(w http.ResponseWriter, r *http.Request, model string, 
 	ms := time.Since(start).Milliseconds()
 	s.logger.Info(kind+" done", chatDoneAttrs(reqID, model, lease.AgentID, stream, ms, stats.chunks, stats.bytes, reasoningEffort)...)
 	s.traceChat(lease, model, ms, "ok", "", phases.All(), st)
+}
+
+// rememberAccessTier folds an upstream session-probe/admission-observed
+// accessTier ("full"/"limited") into the runtime config — s.cfg plus the
+// registry and pool copies, mirroring the reload triple-store — so
+// ResolveModel's -max upgrade gate consults it on the next request. A probe
+// observation never overrides an operator-set ACCESS_TIER
+// (AccessTierExplicit); empty tiers are ignored (unknown tier keeps the
+// current value, so a fresh config still treats empty as full).
+func (s *Server) rememberAccessTier(tier string) {
+	tier = strings.TrimSpace(tier)
+	if tier == "" {
+		return
+	}
+	cur := s.cfg.Load()
+	if cur.AccessTier == tier || cur.AccessTierExplicit {
+		return
+	}
+	next := *cur
+	next.AccessTier = tier
+	s.cfg.Store(&next)
+	s.reg.SetConfig(&next)
+	s.pool.SetConfig(&next)
 }
 
 // traceChat records a structured "chat trace" entry for the dashboard
@@ -2878,6 +2910,12 @@ func (s *Server) relayStream(ctx context.Context, w http.ResponseWriter, r io.Re
 
 	relayed := time.Now()
 	first := true
+	var reasoningParts []string
+	var contentParts []string
+	var streamModel string
+	toolIDsMap := make(map[string]bool)
+	var toolIDs []string
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -2896,12 +2934,14 @@ func (s *Server) relayStream(ctx context.Context, w http.ResponseWriter, r io.Re
 					_, _ = w.Write(convert.DONE)
 					flusher.Flush()
 				}
+				s.ingestStreamReasoning(streamModel, reasoningParts, contentParts, toolIDs)
 				return
 			}
 			if lc.done {
 				// Clean end of stream (EOF is not a scanner error).
 				_, _ = w.Write(convert.DONE)
 				flusher.Flush()
+				s.ingestStreamReasoning(streamModel, reasoningParts, contentParts, toolIDs)
 				return
 			}
 			clean, drop := convert.SanitizeChunk(lc.line)
@@ -2926,6 +2966,46 @@ func (s *Server) relayStream(ctx context.Context, w http.ResponseWriter, r io.Re
 					stats.usageTokens = usageTotalTokens(u.Usage)
 				}
 			}
+			if bytes.Contains(clean, []byte(`"choices"`)) {
+				var chunk struct {
+					Model   string `json:"model"`
+					Choices []struct {
+						Delta struct {
+							Content          *string `json:"content"`
+							ReasoningContent *string `json:"reasoning_content"`
+							Reasoning        *string `json:"reasoning"`
+							Thinking         *string `json:"thinking"`
+							ToolCalls        []struct {
+								ID string `json:"id"`
+							} `json:"tool_calls"`
+						} `json:"delta"`
+					} `json:"choices"`
+				}
+				if json.Unmarshal(clean, &chunk) == nil {
+					if chunk.Model != "" {
+						streamModel = chunk.Model
+					}
+					if len(chunk.Choices) > 0 {
+						delta := chunk.Choices[0].Delta
+						if delta.ReasoningContent != nil && *delta.ReasoningContent != "" {
+							reasoningParts = append(reasoningParts, *delta.ReasoningContent)
+						} else if delta.Reasoning != nil && *delta.Reasoning != "" {
+							reasoningParts = append(reasoningParts, *delta.Reasoning)
+						} else if delta.Thinking != nil && *delta.Thinking != "" {
+							reasoningParts = append(reasoningParts, *delta.Thinking)
+						}
+						if delta.Content != nil && *delta.Content != "" {
+							contentParts = append(contentParts, *delta.Content)
+						}
+						for _, tc := range delta.ToolCalls {
+							if tc.ID != "" && !toolIDsMap[tc.ID] {
+								toolIDsMap[tc.ID] = true
+								toolIDs = append(toolIDs, tc.ID)
+							}
+						}
+					}
+				}
+			}
 			if first {
 				first = false
 				phasetiming.FromContext(ctx).Since(phasetiming.UpstreamTTFBMS, chatStart)
@@ -2941,6 +3021,18 @@ func (s *Server) relayStream(ctx context.Context, w http.ResponseWriter, r io.Re
 			flusher.Flush()
 		}
 	}
+}
+
+func (s *Server) ingestStreamReasoning(model string, reasoningParts, contentParts, toolIDs []string) {
+	if s.reasoningCache == nil || len(reasoningParts) == 0 {
+		return
+	}
+	rc := strings.Join(reasoningParts, "")
+	if rc == "" {
+		return
+	}
+	cStr := strings.Join(contentParts, "")
+	s.reasoningCache.Put(toolIDs, cStr, "", rc, "", model)
 }
 
 // relayJSON drains the upstream SSE stream through the accumulator and
@@ -2984,12 +3076,74 @@ func (s *Server) relayJSON(ctx context.Context, w http.ResponseWriter, r io.Read
 	if json.Unmarshal(out, &usageObj) == nil && usageObj.Usage != nil {
 		stats.usageTokens = usageTotalTokens(usageObj.Usage)
 	}
+
+	if s.reasoningCache != nil {
+		var comp map[string]any
+		if json.Unmarshal(out, &comp) == nil {
+			model, _ := comp["model"].(string)
+			if choices, ok := comp["choices"].([]any); ok && len(choices) > 0 {
+				if choice, ok := choices[0].(map[string]any); ok {
+					if msg, ok := choice["message"].(map[string]any); ok {
+						rc, _ := msg["reasoning_content"].(string)
+						if rc == "" {
+							rc, _ = msg["reasoning"].(string)
+						}
+						if rc != "" {
+							var toolIDs []string
+							var tcJSON string
+							if tcs, ok := msg["tool_calls"].([]any); ok && len(tcs) > 0 {
+								for _, raw := range tcs {
+									if tc, ok := raw.(map[string]any); ok {
+										if id, ok := tc["id"].(string); ok && id != "" {
+											toolIDs = append(toolIDs, id)
+										}
+									}
+								}
+								if b, err := json.Marshal(tcs); err == nil {
+									tcJSON = string(b)
+								}
+							}
+							cStr, _ := msg["content"].(string)
+							s.reasoningCache.Put(toolIDs, cStr, tcJSON, rc, "", model)
+						}
+					}
+				}
+			}
+		}
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(out)
 }
 
 // --- models / healthz ---
+
+// modelAllowed reports whether a model may be served. An empty MODELS_ALLOW
+// allowlist imposes no restriction; otherwise the RESOLVED model id (after
+// registry alias resolution and -max upgrades) must be listed exactly — OR,
+// when PREFER_MAX_MODELS is enabled, the resolved id may be the -max variant
+// of an allowlisted base model. Base-only allowlists (e.g.
+// "deepseek/deepseek-v4-flash") therefore keep working with auto-upgrade on:
+// clients see and request the base id, the proxy upgrades it server-side.
+func (s *Server) modelAllowed(model string) bool {
+	cfg := s.cfg.Load()
+	allow := cfg.ModelsAllow
+	if len(allow) == 0 {
+		return true
+	}
+	for _, id := range allow {
+		if id == model {
+			return true
+		}
+		if cfg.PreferMaxModels {
+			if upgraded, ok := registry.MaxVariantOf(id); ok && upgraded == model {
+				return true
+			}
+		}
+	}
+	return false
+}
 
 // handleModels serves the OpenAI model-list shape with the registry's
 // current models; created is pinned to server start so every entry matches.
@@ -3014,6 +3168,11 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 			// MODELS_HIDE_UNAVAILABLE=true: prune region/tier/quota-locked
 			// models so picker clients never auto-select one. Off by default
 			// because a stale signal could hide a working model.
+			continue
+		}
+		if !s.modelAllowed(id) {
+			// MODELS_ALLOW: prune ids outside the operator allowlist so
+			// picker clients never auto-select a model that would 404.
 			continue
 		}
 		data = append(data, map[string]any{

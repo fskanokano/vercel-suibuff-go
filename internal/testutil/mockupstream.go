@@ -416,15 +416,29 @@ func (m *MockUpstream) handleProbe(w http.ResponseWriter) {
 	m.mu.Lock()
 	instanceID := m.InstanceID
 	limits := m.RateLimitsByModel
+	tier, countryCode, countryBlockReason := m.AccessTier, m.CountryCode, m.CountryBlockReason
 	m.mu.Unlock()
 	if len(limits) == 0 {
 		limits = defaultProbeQuota
 	}
-	writeJSON(w, 200, map[string]any{
+	body := map[string]any{
 		"status":            "active",
 		"instanceId":        instanceID,
 		"rateLimitsByModel": limits,
-	})
+	}
+	// The real probe (x-freebuff-include-unused-rate-limits) carries the
+	// account tier/region state too; mirror that so probe tests can assert
+	// accessTier capture without a custom SessionHandler.
+	if tier != "" {
+		body["accessTier"] = tier
+	}
+	if countryCode != "" {
+		body["countryCode"] = countryCode
+	}
+	if countryBlockReason != "" {
+		body["countryBlockReason"] = countryBlockReason
+	}
+	writeJSON(w, 200, body)
 }
 
 func (m *MockUpstream) handleAgentRuns(w http.ResponseWriter, r *http.Request) {
@@ -677,4 +691,21 @@ func (m *MockUpstream) SessionProbesSnapshot() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.SessionProbes
+}
+
+// LastChatBody returns the most recently recorded chat request body, or "".
+func (m *MockUpstream) LastChatBody() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(m.RecordedChatBodies) == 0 {
+		return ""
+	}
+	return m.RecordedChatBodies[len(m.RecordedChatBodies)-1]
+}
+
+// RecordedChatBodiesSnapshot returns a locked copy of the recorded chat bodies.
+func (m *MockUpstream) RecordedChatBodiesSnapshot() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]string(nil), m.RecordedChatBodies...)
 }
