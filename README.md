@@ -40,6 +40,7 @@ codebuff.com 上游
 - **region/tier 模型可用性**：`MODELS_HIDE_UNAVAILABLE=true` 时 `/v1/models` 裁剪不可用模型。
 - **Session + Run 持久化**：`SESSION_PERSIST=true` 时把未过期会话与活动 run 写盘（`SESSION_STATE_FILE`，0600，按 token 的 SHA-256 哈希为键、原始 token 不落盘），重启后恢复而避免烧新的每日会话额度。⚠️ Vercel 只读/易失文件系统上**无法真正持久化**（冷启动即重置），此项在 Vercel 上仅作占位。
 - **egress 出口探测已移除**：上游 #123 不再随启动循环探测 Cloudflare trace（官方 CLI 从不请求该域名），改为 `-doctor` 按需探测；本仓库无交互子命令，云端不保留该探测。
+- **出口 IP 探测接口**：新增公开接口 `GET /egress/ip`，返回本实例出口公网 IP 及其所在地区（`country` 国家码 / `country_name` / `region` / `city`）。按顺序轮询多个免费 IP 归属地服务（ipwho.is、ipinfo.io、ip-api.com、ipapi.co、geojs.io），单个服务不可用或限流时自动切换下一个。逻辑隔离在 `internal/egressip`，不影响上游同步。
 
 ## 快速部署
 
@@ -60,6 +61,7 @@ codebuff.com 上游
 ```bash
 curl https://<your-project>.vercel.app/healthz
 curl -H "Authorization: Bearer <key>" https://<your-project>.vercel.app/v1/models
+curl https://<your-project>.vercel.app/egress/ip
 ```
 
 ### 方式二：Vercel CLI

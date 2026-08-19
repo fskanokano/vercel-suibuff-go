@@ -43,6 +43,7 @@ import (
 	_ "time/tzdata"
 
 	"freebuff-proxy/internal/config"
+	"freebuff-proxy/internal/egressip"
 	"freebuff-proxy/internal/logring"
 	"freebuff-proxy/internal/notify"
 	"freebuff-proxy/internal/pool"
@@ -153,9 +154,14 @@ func main() {
 	// subcommands on a container).
 
 	srv := server.New(&cfg, p, reg, logger, logringHandler, *configPath)
+	// Egress-IP endpoint (public GET /egress/ip): reports this instance's
+	// outbound public IP and its location by rotating through several free
+	// IP-geolocation services. Wired here — not in the server route table —
+	// so the feature stays fully isolated from upstream-synced code.
+	egressClient := egressip.NewClient(logger)
 	httpServer := &http.Server{
 		Addr:              cfg.ListenAddr,
-		Handler:           srv.Handler(),
+		Handler:           egressip.Wrap(srv.Handler(), egressClient),
 		ReadHeaderTimeout: 15 * time.Second,
 		ReadTimeout:       60 * time.Second,
 		// IdleTimeout closes keep-alive connections that have been idle for
